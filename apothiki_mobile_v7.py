@@ -5,13 +5,14 @@ import numpy as np
 import pandas as pd
 import os
 import pdfplumber
+import calendar
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 # ---------- ΡΥΘΜΙΣΕΙΣ ----------
 FILE_NAME = "apothiki_mobile.xlsx"
 BACKUP_FOLDER = "backups"
 
-# Δημιουργία φακέλου backup αν δεν υπάρχει
 if not os.path.exists(BACKUP_FOLDER):
     os.makedirs(BACKUP_FOLDER)
 
@@ -20,16 +21,17 @@ if not os.path.exists(FILE_NAME):
         "Ημερομηνία",
         "Προϊόν",
         "Ποσότητα",
-        "Τύπος Ποσότητας",  # Ακριβής ή Εκτίμηση
+        "Τύπος Ποσότητας",
         "Θέση (0=Αποθήκη,1=Μαγαζί,2=Όροφος)",
-        "Σύνολο"
+        "Σύνολο",
+        "Ημερήσια Μεταβολή"
     ])
     df.to_excel(FILE_NAME, index=False)
 
 # ---------- ΕΦΑΡΜΟΓΗ ----------
 st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="centered")
-st.title("📱 Έξυπνη Αποθήκη Φαρμακείου v7")
-st.subheader("Ανίχνευση προϊόντων, εκτίμηση ποσότητας & ενημέρωση ανά θέση")
+st.title("📱 Έξυπνη Αποθήκη Φαρμακείου v8")
+st.subheader("Ανίχνευση προϊόντων, εκτίμηση ποσότητας & αυτόματη ενημέρωση")
 
 # --- ΠΛΕΥΡΙΝΟ ΜΕΝΟΥ ---
 mode = st.sidebar.selectbox("📋 Επιλογή λειτουργίας", [
@@ -38,7 +40,7 @@ mode = st.sidebar.selectbox("📋 Επιλογή λειτουργίας", [
     "Προβολή αποθήκης"
 ])
 
-# ---------- 1️⃣ ΚΑΜΕΡΑ / ΕΙΚΟΝΑ ΠΡΟΪΟΝΤΟΣ ----------
+# ---------- 📸 1️⃣ ΑΝΑΓΝΩΡΙΣΗ ΠΡΟΪΟΝΤΟΣ ----------
 if mode == "Αναγνώριση προϊόντος (κάμερα)":
     uploaded_file = st.camera_input("📸 Τράβηξε ή ανέβασε φωτογραφία προϊόντος")
 
@@ -59,14 +61,13 @@ if mode == "Αναγνώριση προϊόντος (κάμερα)":
             st.warning("⚠️ Δεν αναγνωρίστηκε προϊόν. Πληκτρολόγησέ το χειροκίνητα:")
             product_name = st.text_input("Όνομα προϊόντος")
 
-        # 🔍 Εκτίμηση ποσότητας από την εικόνα
+        # Εκτίμηση ποσότητας
         estimated_qty = 1
         numbers_found = [int(s) for s in " ".join(results).split() if s.isdigit()]
         if numbers_found:
             estimated_qty = max(numbers_found)
             st.info(f"📊 Εκτιμώμενη ποσότητα: {estimated_qty} τεμάχια")
 
-        # Ρωτάμε τον χρήστη αν είναι σωστή
         confirm = st.radio(
             "Είναι σωστή η ποσότητα που εντοπίστηκε;",
             ("Ναι ✅", "Όχι ❌", "Δεν είμαι σίγουρος / Εκτίμηση"),
@@ -82,9 +83,8 @@ if mode == "Αναγνώριση προϊόντος (κάμερα)":
         else:
             qty = estimated_qty
             qty_type = "Εκτίμηση"
-            st.warning(f"⚠️ Η ποσότητα για '{product_name}' θα καταχωρηθεί ως **εκτίμηση** ({estimated_qty} τεμ.)")
+            st.warning(f"⚠️ Η ποσότητα για '{product_name}' θα καταχωρηθεί ως **εκτίμηση**.")
 
-        # Επιλογή ενέργειας & θέσης
         action = st.radio("Ενέργεια", ["➕ Προσθήκη", "➖ Αφαίρεση"], horizontal=True)
         location = st.selectbox("Θέση προϊόντος", ["0 (Αποθήκη)", "1 (Μαγαζί)", "2 (Όροφος)"])
 
@@ -98,42 +98,38 @@ if mode == "Αναγνώριση προϊόντος (κάμερα)":
                 current_qty = int(df.loc[mask, "Ποσότητα"].values[-1])
                 if "Προσθήκη" in action:
                     new_qty = current_qty + qty
-                    st.info(f"📦 Προστέθηκαν {qty} τεμάχια στο '{product_name}' στη θέση {location}.")
+                    st.info(f"📦 Προστέθηκαν {qty} τεμάχια στο '{product_name}'.")
                 else:
                     new_qty = max(current_qty - qty, 0)
-                    st.warning(f"📉 Αφαιρέθηκαν {qty} τεμάχια από '{product_name}' στη θέση {location}.")
+                    st.warning(f"📉 Αφαιρέθηκαν {qty} τεμάχια από '{product_name}'.")
 
                 df.loc[mask, "Ποσότητα"] = new_qty
                 df.loc[mask, "Τύπος Ποσότητας"] = qty_type
                 df.loc[mask, "Ημερομηνία"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-                if new_qty == 0:
-                    st.error(f"⚠️ Το προϊόν '{product_name}' έχει μηδενικό απόθεμα στη θέση {location}.")
-                    st.toast(f"🚨 Το προϊόν {product_name} εξαντλήθηκε!", icon="🚨")
-
             else:
-                if "Αφαίρεση" in action:
-                    st.error(f"⚠️ Δεν υπάρχει '{product_name}' στη θέση {location} για αφαίρεση.")
-                else:
-                    new_row = {
-                        "Ημερομηνία": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "Προϊόν": product_name,
-                        "Ποσότητα": qty,
-                        "Τύπος Ποσότητας": qty_type,
-                        "Θέση (0=Αποθήκη,1=Μαγαζί,2=Όροφος)": location,
-                        "Σύνολο": 0
-                    }
-                    df.loc[len(df)] = new_row
-                    st.success(f"✅ Δημιουργήθηκε νέα εγγραφή: '{product_name}' στη θέση {location} ({qty} τεμ., {qty_type})")
+                new_row = {
+                    "Ημερομηνία": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "Προϊόν": product_name,
+                    "Ποσότητα": qty,
+                    "Τύπος Ποσότητας": qty_type,
+                    "Θέση (0=Αποθήκη,1=Μαγαζί,2=Όροφος)": location,
+                    "Σύνολο": 0
+                }
+                df.loc[len(df)] = new_row
+                st.success(f"✅ Νέα εγγραφή: {product_name} ({qty} τεμ.)")
 
             # Υπολογισμός συνολικού αποθέματος
             total_qty = df[df["Προϊόν"].str.lower() == product_name.lower()]["Ποσότητα"].sum()
             df.loc[df["Προϊόν"].str.lower() == product_name.lower(), "Σύνολο"] = total_qty
 
             if total_qty <= 3:
-                st.error(f"⚠️ Χαμηλό συνολικό απόθεμα: '{product_name}' έχει μόνο {total_qty} τεμάχια συνολικά!")
+                st.error(f"⚠️ Χαμηλό συνολικό απόθεμα: '{product_name}' έχει μόνο {total_qty} τεμάχια!")
 
-            # ----------- ΑΠΟΘΗΚΕΥΣΗ & BACKUP -----------
+            # ---------- Ημερήσια & Μηνιαία Μεταβολή ----------
+            df = compare_and_log_daily_changes(df, product_name)
+
+            # ---------- Αποθήκευση & Backup ----------
             df.to_excel(FILE_NAME, index=False)
             df.to_csv("apothiki_mobile.csv", index=False)
 
@@ -143,9 +139,9 @@ if mode == "Αναγνώριση προϊόντος (κάμερα)":
             st.success(f"💾 Αποθηκεύτηκε επιτυχώς & δημιουργήθηκε backup ({backup_name})")
             st.info("📦 Η αποθήκη ενημερώθηκε επιτυχώς!")
 
-# ---------- 2️⃣ ΑΝΕΒΑΣΜΑ ΤΙΜΟΛΟΓΙΟΥ ----------
+# ---------- 📜 2️⃣ ΑΝΕΒΑΣΜΑ ΤΙΜΟΛΟΓΙΟΥ ----------
 elif mode == "Ανέβασε τιμολόγιο (PDF/Εικόνα)":
-    uploaded_invoice = st.file_uploader("📜 Ανέβασε τιμολόγιο (PDF ή εικόνα)", type=["pdf", "png", "jpg", "jpeg"])
+    uploaded_invoice = st.file_uploader("📜 Ανέβασε τιμολόγιο", type=["pdf", "png", "jpg", "jpeg"])
     if uploaded_invoice is not None:
         text = ""
         if uploaded_invoice.type == "application/pdf":
@@ -163,45 +159,9 @@ elif mode == "Ανέβασε τιμολόγιο (PDF/Εικόνα)":
 
         st.text_area("📄 Κείμενο που εντοπίστηκε:", text, height=200)
 
-        df = pd.read_excel(FILE_NAME)
-        added_products = []
-        lines = text.splitlines()
-        for line in lines:
-            if any(x in line.lower() for x in ["τεμ", "τεμάχια", "pcs", "x"]):
-                parts = line.split()
-                if len(parts) >= 2:
-                    product_name = " ".join(parts[:-1])
-                    try:
-                        qty = int(parts[-1].replace("x", "").replace("τεμ", "").replace("pcs", ""))
-                    except:
-                        qty = 1
-                    new_row = {
-                        "Ημερομηνία": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "Προϊόν": product_name,
-                        "Ποσότητα": qty,
-                        "Τύπος Ποσότητας": "Ακριβής",
-                        "Θέση (0=Αποθήκη,1=Μαγαζί,2=Όροφος)": "0 (Αποθήκη)",
-                        "Σύνολο": 0
-                    }
-                    df.loc[len(df)] = new_row
-                    added_products.append(f"{product_name} ({qty} τεμ.)")
-
-        if added_products:
-            for p in added_products:
-                st.write("✅ Προστέθηκε από τιμολόγιο:", p)
-
-            df["Σύνολο"] = df.groupby("Προϊόν")["Ποσότητα"].transform("sum")
-            df.to_excel(FILE_NAME, index=False)
-            df.to_csv("apothiki_mobile.csv", index=False)
-            st.success("📥 Τα προϊόντα από το τιμολόγιο καταχωρήθηκαν επιτυχώς!")
-        else:
-            st.warning("⚠️ Δεν εντοπίστηκαν προϊόντα στο τιμολόγιο.")
-
-# ---------- 3️⃣ ΠΡΟΒΟΛΗ ΑΠΟΘΗΚΗΣ ----------
+# ---------- 📊 3️⃣ ΠΡΟΒΟΛΗ ΑΠΟΘΗΚΗΣ ----------
 elif mode == "Προβολή αποθήκης":
     df = pd.read_excel(FILE_NAME)
-
-    # ---------- ΡΥΘΜΙΣΕΙΣ ΕΜΦΑΝΙΣΗΣ ----------
     LOW_STOCK_LIMIT = 3
 
     def color_stock_rows(df):
@@ -214,7 +174,6 @@ elif mode == "Προβολή αποθήκης":
                 return ['background-color: #e8ffe8; color: black'] * len(row)
         return df.style.apply(color_row, axis=1)
 
-    # 🧮 Φίλτρο προβολής προϊόντων
     st.subheader("🔍 Επιλογή Προβολής")
     view_option = st.radio(
         "Εμφάνιση προϊόντων:",
@@ -228,19 +187,71 @@ elif mode == "Προβολή αποθήκης":
         filtered_df = df[df["Ποσότητα"] == 0]
     else:
         filtered_df = df
+        st.dataframe(color_stock_rows(filtered_df), use_container_width=True)
+    # ---------- 📈 ΓΡΑΦΗΜΑ ΜΗΝΙΑΙΑΣ ΜΕΤΑΒΟΛΗΣ ----------
+    st.subheader("📈 Γράφημα Μηνιαίας Μεταβολής")
+    today = datetime.now()
+    month_name = f"{calendar.month_name[today.month]} {today.year}"
+    try:
+        monthly_data = pd.read_excel(FILE_NAME, sheet_name=month_name)
+        if not monthly_data.empty:
+            fig, ax = plt.subplots()
+            ax.bar(monthly_data["Προϊόν"], monthly_data["Συνολική Μεταβολή"], color="#4c9aff")
+            ax.set_title(f"Μηνιαία Μεταβολή ({month_name})")
+            ax.set_ylabel("Μεταβολή Τεμαχίων")
+            plt.xticks(rotation=45, ha='right')
+            st.pyplot(fig)
+        else:
+            st.info("📅 Δεν υπάρχουν ακόμα δεδομένα μηνιαίας μεταβολής.")
+    except Exception:
+        st.info("📅 Δεν υπάρχουν ακόμα δεδομένα μηνιαίας μεταβολής.")
 
-    # Εμφάνιση ειδοποιήσεων
-    low_stock = df[df["Ποσότητα"] <= LOW_STOCK_LIMIT]
-    out_of_stock = df[df["Ποσότητα"] == 0]
 
-    if not out_of_stock.empty:
-        st.error("❌ Εξαντλημένα προϊόντα εντοπίστηκαν!")
-        for _, row in out_of_stock.iterrows():
-            st.toast(f"🚨 Το προϊόν {row['Προϊόν']} εξαντλήθηκε (θέση {row['Θέση (0=Αποθήκη,1=Μαγαζί,2=Όροφος)']})", icon="🚨")
+    # ---------- 📉 ΣΥΓΚΡΙΣΗ & ΚΑΤΑΓΡΑΦΗ ΜΕΤΑΒΟΛΗΣ ----------
+    def compare_and_log_daily_changes(df, product_name, file_name=FILE_NAME):
+        same_product = df[df["Προϊόν"].str.lower() == product_name.lower()].sort_values("Ημερομηνία", ascending=False)
 
-    elif not low_stock.empty:
-        st.warning("⚠️ Προσοχή! Ορισμένα προϊόντα έχουν χαμηλό απόθεμα.")
+        # Δημιουργία στήλης αν δεν υπάρχει
+        if "Ημερήσια Μεταβολή" not in df.columns:
+            df["Ημερήσια Μεταβολή"] = ""
 
-    # 📦 Εμφάνιση πίνακα με χρωματισμό
-    st.subheader("📦 Πίνακας Αποθήκης")
-    st.dataframe(color_stock_rows(filtered_df), use_container_width=True)
+        # Υπολογισμός ημερήσιας μεταβολής
+        if len(same_product) >= 2:
+            latest_qty = same_product.iloc[0]["Ποσότητα"]
+            prev_qty = same_product.iloc[1]["Ποσότητα"]
+            change = latest_qty - prev_qty
+
+            if change < 0:
+                st.warning(f"⚠️ Το προϊόν **{product_name}** μειώθηκε κατά {abs(change)} τεμάχια.")
+            elif change > 0:
+                st.info(f"📦 Το προϊόν **{product_name}** αυξήθηκε κατά {change} τεμάχια.")
+            else:
+                st.success(f"✅ Καμία μεταβολή στην ποσότητα του προϊόντος **{product_name}**.")
+
+            df.loc[same_product.index[0], "Ημερήσια Μεταβολή"] = change
+        else:
+            change = 0
+
+        # ---------- Ενημέρωση μηνιαίας αναφοράς ----------
+        today = datetime.now()
+        month_name = f"{calendar.month_name[today.month]} {today.year}"
+
+        # Διαβάζουμε ή δημιουργούμε το μηνιαίο φύλλο
+        try:
+            monthly_data = pd.read_excel(file_name, sheet_name=month_name)
+        except Exception:
+            monthly_data = pd.DataFrame(columns=["Προϊόν", "Συνολική Μεταβολή"])
+
+        # Ενημέρωση ή προσθήκη γραμμής
+        if product_name in monthly_data["Προϊόν"].values:
+            monthly_data.loc[monthly_data["Προϊόν"] == product_name, "Συνολική Μεταβολή"] += change
+        else:
+            new_row = {"Προϊόν": product_name, "Συνολική Μεταβολή": change}
+            monthly_data = pd.concat([monthly_data, pd.DataFrame([new_row])], ignore_index=True)
+
+        # Ασφαλής εγγραφή στο φύλλο
+        with pd.ExcelWriter(file_name, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+            monthly_data.to_excel(writer, sheet_name=month_name, index=False)
+
+        return df
+
