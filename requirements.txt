@@ -1,8 +1,5 @@
 streamlit
-easyocr
-opencv-python-headless
-pdfplumber
 pandas
-numpy
-matplotlib
-rapidfuzz
+gspread
+google-auth
+openpyxl
