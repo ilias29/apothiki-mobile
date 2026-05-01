@@ -3,3 +3,6 @@ pandas
 gspread
 google-auth
 openpyxl
+easyocr
+opencv-python-headless
+numpy
