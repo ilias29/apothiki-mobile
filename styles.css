@@ -1,0 +1,368 @@
+:root {
+  color-scheme: dark;
+  --bg: #0d0f12;
+  --panel: #171b20;
+  --panel-strong: #20262d;
+  --line: rgba(255, 255, 255, 0.1);
+  --text: #f4f7fb;
+  --muted: #a8b2c1;
+  --red: #e5484d;
+  --gold: #f0b23f;
+  --green: #2fc889;
+  --blue: #5aa9ff;
+  --radius: 8px;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(229, 72, 77, 0.18), transparent 34rem),
+    linear-gradient(145deg, #0d0f12 0%, #171a1f 48%, #10161a 100%);
+  color: var(--text);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.app-shell {
+  width: min(1060px, 100%);
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 0 18px;
+}
+
+.eyebrow {
+  margin: 0 0 6px;
+  color: var(--gold);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  margin-bottom: 6px;
+  font-size: clamp(2rem, 8vw, 4.8rem);
+  line-height: 0.95;
+  letter-spacing: 0;
+}
+
+h2 {
+  margin-bottom: 0;
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.hero-copy,
+.walk-card p,
+.history-meta,
+.history-notes,
+.section-title span {
+  color: var(--muted);
+}
+
+.rank-badge,
+.stat-card,
+.xp-panel,
+.quest-card,
+.walk-card,
+.log-form,
+.install-panel,
+.history-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(23, 27, 32, 0.88);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.22);
+}
+
+.install-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+  padding: 14px;
+}
+
+.install-panel p {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+
+.rank-badge {
+  display: grid;
+  place-items: center;
+  min-width: 92px;
+  min-height: 92px;
+}
+
+.rank-badge span,
+.stat-card span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.rank-badge strong {
+  font-size: 2.3rem;
+}
+
+.stats-grid,
+.progress-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.stat-card {
+  padding: 14px;
+}
+
+.stat-card strong {
+  display: block;
+  margin-top: 5px;
+  font-size: 1.55rem;
+}
+
+.xp-panel,
+.quest-card,
+.walk-card,
+.log-form {
+  margin-top: 12px;
+  padding: 16px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.xp-track {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.xp-cell {
+  min-height: 16px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #2a3038;
+}
+
+.xp-cell.filled {
+  background: linear-gradient(90deg, var(--red), var(--gold));
+  border-color: rgba(240, 178, 63, 0.66);
+}
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.tab {
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #11151a;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.tab.active {
+  background: var(--panel-strong);
+  color: var(--text);
+  border-color: rgba(90, 169, 255, 0.55);
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+.feedback-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0f1318;
+  color: var(--text);
+  padding: 11px 12px;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--blue);
+}
+
+.generated-quest {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: var(--radius);
+  background: #101419;
+  border: 1px solid var(--line);
+}
+
+.generated-quest h3 {
+  margin: 0 0 8px;
+  font-size: 1.35rem;
+}
+
+.generated-quest ul {
+  padding-left: 20px;
+  margin-bottom: 0;
+}
+
+.primary-action,
+.secondary-action,
+.danger-action,
+.delete-button {
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--radius);
+  color: #111;
+  font-weight: 900;
+}
+
+.primary-action {
+  width: 100%;
+  margin-top: 14px;
+  background: linear-gradient(90deg, var(--red), var(--gold));
+}
+
+.secondary-action {
+  background: var(--green);
+  padding: 0 14px;
+}
+
+.danger-action,
+.delete-button {
+  background: #3a1518;
+  color: #ffb4b8;
+  border: 1px solid rgba(229, 72, 77, 0.38);
+  padding: 0 12px;
+}
+
+.walk-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.log-form {
+  display: grid;
+  gap: 12px;
+}
+
+.history-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px;
+}
+
+.history-title {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.history-meta,
+.history-notes {
+  margin-bottom: 0;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    padding: 16px;
+  }
+
+  .hero {
+    align-items: flex-start;
+  }
+
+  .rank-badge {
+    min-width: 72px;
+    min-height: 72px;
+  }
+
+  .rank-badge strong {
+    font-size: 1.8rem;
+  }
+
+  .stats-grid,
+  .progress-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .feedback-grid,
+  .walk-card,
+  .install-panel {
+    grid-template-columns: 1fr;
+    display: grid;
+  }
+
+  .secondary-action {
+    width: 100%;
+  }
+}

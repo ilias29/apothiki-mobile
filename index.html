@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="el">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0d0f12" />
+    <meta
+      name="description"
+      content="Solo Leveling style fitness tracker with quests, XP, streaks, and offline logs."
+    />
+    <title>Solo Leveling Fitness</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" />
+    <link rel="apple-touch-icon" href="./icon.svg" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Hunter System</p>
+          <h1>Solo Leveling Fitness</h1>
+          <p class="hero-copy">Κάνε το σημερινό quest, γράψε το log, συνέχισε αύριο.</p>
+        </div>
+        <div class="rank-badge">
+          <span>Rank</span>
+          <strong id="rankValue">E</strong>
+        </div>
+      </header>
+
+      <section class="install-panel" id="installPanel">
+        <div>
+          <strong>Mobile app mode</strong>
+          <p>Άνοιξέ το από κινητό και κάνε Add to Home Screen για να δουλεύει χωρίς PC.</p>
+        </div>
+        <button class="secondary-action" id="installButton" type="button">Install</button>
+      </section>
+
+      <section class="stats-grid" aria-label="Progress stats">
+        <article class="stat-card">
+          <span>Level</span>
+          <strong id="levelValue">1</strong>
+        </article>
+        <article class="stat-card">
+          <span>XP</span>
+          <strong id="xpValue">0 / 5</strong>
+        </article>
+        <article class="stat-card">
+          <span>Streak</span>
+          <strong id="streakValue">0</strong>
+        </article>
+        <article class="stat-card">
+          <span>Week</span>
+          <strong id="weekValue">0</strong>
+        </article>
+      </section>
+
+      <section class="xp-panel">
+        <div class="section-title">
+          <h2>XP Track</h2>
+          <span id="nextLevelText">5 Main Quests για level up</span>
+        </div>
+        <div class="xp-track" id="xpTrack" aria-label="XP progress"></div>
+      </section>
+
+      <nav class="tabs" aria-label="App sections">
+        <button class="tab active" data-tab="dashboard">Dashboard</button>
+        <button class="tab" data-tab="logger">Logger</button>
+        <button class="tab" data-tab="progress">Progress</button>
+      </nav>
+
+      <section class="tab-panel active" id="dashboardPanel">
+        <article class="quest-card">
+          <div class="section-title">
+            <h2>Quest Generator</h2>
+            <span id="questTypeHint">Main Quest</span>
+          </div>
+
+          <div class="feedback-grid">
+            <label>
+              Ώμος
+              <select id="shoulderInput">
+                <option value="ok">ΟΚ</option>
+                <option value="careful">Ελαφριά ενόχληση</option>
+                <option value="pain">Πόνος</option>
+              </select>
+            </label>
+            <label>
+              Γόνατο
+              <select id="kneeInput">
+                <option value="ok">ΟΚ</option>
+                <option value="careful">Ελαφριά πίεση</option>
+                <option value="pain">Πόνος</option>
+              </select>
+            </label>
+            <label>
+              Fatigue
+              <select id="fatigueInput">
+                <option value="low">Χαμηλό</option>
+                <option value="medium">Μέτριο</option>
+                <option value="high">Υψηλό</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="generated-quest" id="generatedQuest"></div>
+          <button class="primary-action" id="quickLogButton">Log προτεινόμενο quest</button>
+        </article>
+
+        <article class="walk-card">
+          <div>
+            <h2>Walk Quest</h2>
+            <p>Για off days ή μέρες χωρίς full session. Αν στη δουλειά είχες ήδη πολλά βήματα, κράτα το light.</p>
+          </div>
+          <button class="secondary-action" id="walkQuestButton">Log 20 λεπτά περπάτημα</button>
+        </article>
+      </section>
+
+      <section class="tab-panel" id="loggerPanel">
+        <form class="log-form" id="sessionForm">
+          <div class="section-title">
+            <h2>Session Logger</h2>
+            <span>Καθαρό log, χωρίς υπερανάλυση</span>
+          </div>
+
+          <label>
+            Ημερομηνία
+            <input id="dateInput" type="date" required />
+          </label>
+
+          <label>
+            Τύπος
+            <select id="typeInput">
+              <option>Main Quest</option>
+              <option>Side Quest</option>
+              <option>Walk Quest</option>
+            </select>
+          </label>
+
+          <label>
+            Άσκηση / Quest
+            <input id="exerciseInput" type="text" placeholder="π.χ. Legs + Core" required />
+          </label>
+
+          <label>
+            Βάρος
+            <input id="weightInput" type="text" placeholder="π.χ. 8kg, 16kg, bodyweight" />
+          </label>
+
+          <label>
+            Μέση
+            <input id="waistInput" type="text" placeholder="π.χ. 98 cm" />
+          </label>
+
+          <label>
+            Notes
+            <textarea id="notesInput" rows="3" placeholder="π.χ. ώμος ΟΚ, γόνατο λίγο tight"></textarea>
+          </label>
+
+          <button class="primary-action" type="submit">Save Session</button>
+        </form>
+      </section>
+
+      <section class="tab-panel" id="progressPanel">
+        <div class="section-title">
+          <h2>Progress</h2>
+          <button class="danger-action" id="resetButton">Reset</button>
+        </div>
+        <div class="progress-grid">
+          <article class="stat-card">
+            <span>Main Quests</span>
+            <strong id="mainCountValue">0</strong>
+          </article>
+          <article class="stat-card">
+            <span>Side Quests</span>
+            <strong id="sideCountValue">0</strong>
+          </article>
+          <article class="stat-card">
+            <span>Walk Quests</span>
+            <strong id="walkCountValue">0</strong>
+          </article>
+        </div>
+
+        <div class="history-list" id="historyList"></div>
+      </section>
+    </main>
+
+    <template id="historyItemTemplate">
+      <article class="history-item">
+        <div>
+          <strong class="history-title"></strong>
+          <p class="history-meta"></p>
+          <p class="history-notes"></p>
+        </div>
+        <button class="delete-button" type="button">Delete</button>
+      </article>
+    </template>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
