@@ -1,35 +1,26 @@
 import re
 import uuid
 from datetime import datetime
+from typing import Any
 
 import cv2
-import easyocr
 import gspread
 import numpy as np
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
-SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
+try:
+    import easyocr
+except Exception:
+    easyocr = None
+
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_NAME = "Apothiki_Cloud"
 WS_NAME = "Transactions"
 
-LOCATIONS = {
-    0: "Αποθήκη",
-    1: "Κύριο Κτήριο",
-    2: "Πρώτος Όροφος",
-}
-
-CATEGORIES = [
-    "Φάρμακο",
-    "Συμπλήρωμα",
-    "Καλλυντικό",
-    "Αναλώσιμο",
-    "Άλλο",
-]
+LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
+CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
 
 COLUMNS = [
     "TransactionId",
@@ -51,87 +42,99 @@ COLUMNS = [
     "Σημείωση",
     "Voided",
     "VoidOf",
+    "MovementKind",
 ]
 
+TRUE_VALUES = {"true", "1", "yes", "y", "ναι", "nai"}
+NORMAL = "Normal"
+REVERSAL = "Reversal"
+COMPENSATION = "Compensation"
 
-def clean_barcode(value):
-    return re.sub(r"\D", "", str(value or ""))
+
+class InventoryError(Exception):
+    pass
 
 
-def clean(value):
+class SchemaError(InventoryError):
+    pass
+
+
+def clean(value: Any) -> str:
     return str(value or "").strip()
 
 
-def show_sheet_error(action, exc):
-    st.error(
-        f"Αποτυχία Google Sheets κατά την ενέργεια «{action}». "
-        "Έλεγξε τα secrets, την κοινή χρήση του Sheet και τη σύνδεση."
-    )
-    st.caption(f"Τεχνική λεπτομέρεια: {exc}")
+def normalize_bool(value: Any) -> bool:
+    return clean(value).lower() in TRUE_VALUES
 
 
-@st.cache_resource(show_spinner=False)
-def worksheet():
-    if "gcp_service_account" not in st.secrets:
-        st.error("Λείπουν τα Streamlit Secrets: gcp_service_account.")
-        st.stop()
-
-    try:
-        info = dict(st.secrets["gcp_service_account"])
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-        creds = Credentials.from_service_account_info(info, scopes=SCOPE)
-        client = gspread.authorize(creds)
-    except Exception as exc:
-        show_sheet_error("σύνδεση", exc)
-        st.stop()
-
-    sheet_name = st.secrets.get("SHEET_NAME", SHEET_NAME)
-
-    try:
-        try:
-            sheet = client.open(sheet_name)
-        except gspread.SpreadsheetNotFound:
-            sheet = client.create(sheet_name)
-    except Exception as exc:
-        show_sheet_error("άνοιγμα ή δημιουργία Sheet", exc)
-        st.stop()
-
-    try:
-        try:
-            ws = sheet.worksheet(WS_NAME)
-        except gspread.WorksheetNotFound:
-            ws = sheet.add_worksheet(title=WS_NAME, rows=5000, cols=40)
-            ws.append_row(COLUMNS)
-            return ws
-
-        headers = ws.row_values(1)
-        if not headers:
-            ws.append_row(COLUMNS)
-        else:
-            missing = [column for column in COLUMNS if column not in headers]
-            if missing:
-                ws.update("A1", [headers + missing])
-        return ws
-    except Exception as exc:
-        show_sheet_error("ρύθμιση φύλλου Transactions", exc)
-        st.stop()
+def validate_code(code_type: str, raw_value: Any) -> tuple[str, str]:
+    value = clean(raw_value)
+    if not value:
+        raise InventoryError("Βάλε Barcode, QR ή άλλο κωδικό.")
+    if code_type == "Barcode":
+        if not value.isdigit():
+            raise InventoryError(
+                "Το Barcode δέχεται μόνο αριθμούς. Για αλφαριθμητικό κωδικό "
+                "διάλεξε QR ή Other."
+            )
+        return value, value
+    return value, ""
 
 
-def load_data():
-    try:
-        records = worksheet().get_all_records()
-    except Exception as exc:
-        show_sheet_error("ανάγνωση κινήσεων", exc)
-        st.stop()
+def deterministic_reversal_id(original_id: str) -> str:
+    return f"reverse-{clean(original_id)}"
 
+
+def deterministic_compensation_id(transaction_id: str) -> str:
+    return f"compensation-{clean(transaction_id)}"
+
+
+def validate_and_migrate_headers(ws) -> tuple[list[str], list[str]]:
+    headers = [clean(h) for h in ws.row_values(1)]
+
+    if not headers or not any(headers):
+        ws.update("A1", [COLUMNS])
+        return COLUMNS.copy(), []
+
+    if any(not h for h in headers):
+        raise SchemaError(
+            "Η πρώτη γραμμή του Google Sheet έχει κενές επικεφαλίδες. "
+            "Διόρθωσέ τες πριν συνεχίσεις."
+        )
+
+    duplicates = sorted({h for h in headers if headers.count(h) > 1})
+    if duplicates:
+        raise SchemaError(
+            "Υπάρχουν διπλές επικεφαλίδες στο Google Sheet: "
+            + ", ".join(duplicates)
+        )
+
+    missing = [column for column in COLUMNS if column not in headers]
+    if missing:
+        headers = headers + missing
+        ws.update("A1", [headers])
+
+    unknown = [header for header in headers if header not in COLUMNS]
+    return headers, unknown
+
+
+def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(records)
     for column in COLUMNS:
         if column not in df.columns:
             df[column] = ""
 
-    for column in ["Barcode", "CodeType", "CodeValue", "TransactionId", "VoidOf"]:
-        df[column] = df[column].astype(str).fillna("")
+    for column in [
+        "TransactionId",
+        "Timestamp",
+        "Ημερομηνία",
+        "CodeType",
+        "CodeValue",
+        "Barcode",
+        "VoidOf",
+        "MovementKind",
+    ]:
+        df[column] = df[column].fillna("").astype(str)
 
     legacy_code = (
         df["CodeValue"].str.strip().eq("")
@@ -140,48 +143,52 @@ def load_data():
     df.loc[legacy_code, "CodeType"] = "Barcode"
     df.loc[legacy_code, "CodeValue"] = df.loc[legacy_code, "Barcode"]
 
-    legacy_timestamp = df["Timestamp"].astype(str).str.strip().eq("")
+    legacy_timestamp = df["Timestamp"].str.strip().eq("")
     df.loc[legacy_timestamp, "Timestamp"] = df.loc[legacy_timestamp, "Ημερομηνία"]
 
-    df["DeltaQty"] = pd.to_numeric(df["DeltaQty"], errors="coerce").fillna(0)
-    df["LocationId"] = pd.to_numeric(
-        df["LocationId"], errors="coerce"
-    ).fillna(-1).astype(int)
-    df["Voided"] = df["Voided"].astype(str).str.lower().isin(
-        ["true", "1", "yes", "ναι"]
-    )
+    legacy_kind = df["MovementKind"].str.strip().eq("")
+    df.loc[legacy_kind, "MovementKind"] = NORMAL
 
+    df["DeltaQty"] = pd.to_numeric(df["DeltaQty"], errors="coerce").fillna(0).astype(int)
+    df["LocationId"] = (
+        pd.to_numeric(df["LocationId"], errors="coerce").fillna(-1).astype(int)
+    )
+    df["Voided"] = df["Voided"].map(normalize_bool)
     return df[COLUMNS]
 
 
-def add_row(row):
+def load_data(ws) -> tuple[pd.DataFrame, list[str]]:
+    _, unknown = validate_and_migrate_headers(ws)
     try:
-        worksheet().append_row(
-            [row.get(column, "") for column in COLUMNS],
+        records = ws.get_all_records()
+    except Exception as exc:
+        raise InventoryError("Δεν ήταν δυνατή η ανάγνωση των κινήσεων.") from exc
+    return records_to_dataframe(records), unknown
+
+
+def append_row(ws, row: dict[str, Any]) -> None:
+    headers, _ = validate_and_migrate_headers(ws)
+    try:
+        ws.append_row(
+            [row.get(header, "") for header in headers],
             value_input_option="USER_ENTERED",
         )
     except Exception as exc:
-        show_sheet_error("αποθήκευση κίνησης", exc)
-        st.stop()
+        raise InventoryError("Δεν ήταν δυνατή η αποθήκευση της κίνησης.") from exc
 
 
-def active_movements(df):
+def active_movements(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df.copy()
-
-    active = df.copy()
-    active["DeltaQty"] = pd.to_numeric(
-        active["DeltaQty"], errors="coerce"
-    ).fillna(0)
-    active["Voided"] = active["Voided"].astype(bool)
-    return active[~active["Voided"]].copy()
+    return df[~df["Voided"].map(bool)].copy()
 
 
-def current_stock(df, code_type, code_value, location_id):
+def current_stock(
+    df: pd.DataFrame, code_type: str, code_value: str, location_id: int
+) -> int:
     active = active_movements(df)
     if active.empty:
         return 0
-
     mask = (
         active["CodeType"].astype(str).eq(str(code_type))
         & active["CodeValue"].astype(str).eq(str(code_value))
@@ -190,74 +197,163 @@ def current_stock(df, code_type, code_value, location_id):
     return int(active.loc[mask, "DeltaQty"].sum())
 
 
-def to_img(file):
-    data = np.frombuffer(file.getvalue(), np.uint8)
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+def transaction_exists(df: pd.DataFrame, transaction_id: str) -> bool:
+    return df["TransactionId"].astype(str).eq(clean(transaction_id)).any()
 
 
-def detect_barcode(image):
-    try:
-        detector = cv2.barcode.BarcodeDetector()
-        ok, values, _, _ = detector.detectAndDecode(image)
-        if ok and values:
-            for value in values:
-                barcode = clean_barcode(value)
-                if barcode:
-                    return barcode
-    except Exception:
-        pass
-    return ""
+def reversal_exists(df: pd.DataFrame, original_id: str) -> bool:
+    original_id = clean(original_id)
+    return (
+        df["VoidOf"].astype(str).eq(original_id).any()
+        or transaction_exists(df, deterministic_reversal_id(original_id))
+    )
 
 
-def detect_qr(image):
-    try:
-        detector = cv2.QRCodeDetector()
-        value, _, _ = detector.detectAndDecode(image)
-        return clean(value)
-    except Exception:
-        return ""
+def reversible_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    reversed_ids = set(
+        df.loc[df["VoidOf"].astype(str).str.strip().ne(""), "VoidOf"].astype(str)
+    )
+    mask = (
+        df["TransactionId"].astype(str).str.strip().ne("")
+        & ~df["TransactionId"].astype(str).isin(reversed_ids)
+        & df["VoidOf"].astype(str).str.strip().eq("")
+        & ~df["MovementKind"].astype(str).isin([REVERSAL, COMPENSATION])
+        & ~df["Voided"].map(bool)
+    )
+    return df[mask].copy()
 
 
-def detect_code(front=None, back=None):
-    for image in [back, front]:
-        if image is not None:
-            barcode = detect_barcode(image)
-            if barcode:
-                return "Barcode", barcode
+def make_transaction(
+    *,
+    code_type: str,
+    code_value: str,
+    barcode: str,
+    brand: str,
+    product: str,
+    category: str,
+    location_id: int,
+    movement: str,
+    quantity: int,
+    delta: int,
+    note: str = "",
+    transaction_id: str | None = None,
+    void_of: str = "",
+    movement_kind: str = NORMAL,
+) -> dict[str, Any]:
+    now = datetime.now()
+    return {
+        "TransactionId": transaction_id or str(uuid.uuid4()),
+        "Timestamp": now.isoformat(timespec="seconds"),
+        "Ημερομηνία": now.strftime("%Y-%m-%d %H:%M"),
+        "CodeType": clean(code_type),
+        "CodeValue": clean(code_value),
+        "Barcode": clean(barcode),
+        "Μάρκα": clean(brand),
+        "Προϊόν": clean(product),
+        "Κατηγορία": clean(category),
+        "LocationId": int(location_id),
+        "Τοποθεσία": LOCATIONS[int(location_id)],
+        "Κίνηση": clean(movement),
+        "Ποσότητα": int(quantity),
+        "DeltaQty": int(delta),
+        "FrontPhotoUrl": "",
+        "BackPhotoUrl": "",
+        "Σημείωση": clean(note),
+        "Voided": False,
+        "VoidOf": clean(void_of),
+        "MovementKind": clean(movement_kind) or NORMAL,
+    }
 
-    for image in [back, front]:
-        if image is not None:
-            qr = detect_qr(image)
-            if qr:
-                return "QR", qr
 
-    return "Barcode", ""
+def append_stock_transaction(ws, row: dict[str, Any]) -> str:
+    fresh, _ = load_data(ws)
+    txid = clean(row["TransactionId"])
+    if transaction_exists(fresh, txid):
+        return "duplicate"
+
+    delta = int(row["DeltaQty"])
+    if delta < 0:
+        available = current_stock(
+            fresh, row["CodeType"], row["CodeValue"], int(row["LocationId"])
+        )
+        if available + delta < 0:
+            raise InventoryError(
+                f"Η κίνηση θα έκανε το stock αρνητικό. "
+                f"Διαθέσιμα: {available}, ζητήθηκαν: {abs(delta)}."
+            )
+
+    append_row(ws, row)
+
+    if delta >= 0:
+        return "saved"
+
+    verified, _ = load_data(ws)
+    after = current_stock(
+        verified, row["CodeType"], row["CodeValue"], int(row["LocationId"])
+    )
+    if after >= 0:
+        return "saved"
+
+    compensation_id = deterministic_compensation_id(txid)
+    if not transaction_exists(verified, compensation_id):
+        compensation = make_transaction(
+            code_type=row["CodeType"],
+            code_value=row["CodeValue"],
+            barcode=row["Barcode"],
+            brand=row["Μάρκα"],
+            product=row["Προϊόν"],
+            category=row["Κατηγορία"],
+            location_id=int(row["LocationId"]),
+            movement="Αυτόματη αντιστάθμιση (+)",
+            quantity=abs(delta),
+            delta=abs(delta),
+            note=f"Αυτόματη αντιστάθμιση για {txid}",
+            transaction_id=compensation_id,
+            void_of=txid,
+            movement_kind=COMPENSATION,
+        )
+        append_row(ws, compensation)
+    return "compensated"
 
 
-@st.cache_resource(show_spinner=False)
-def ocr_reader():
-    return easyocr.Reader(["el", "en"], gpu=False)
+def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
+    original_id = clean(original["TransactionId"])
+    if not original_id:
+        raise InventoryError("Η παλιά κίνηση δεν έχει TransactionId και δεν αναστρέφεται.")
+
+    fresh, _ = load_data(ws)
+    if reversal_exists(fresh, original_id):
+        return "duplicate"
+
+    kind = clean(original.get("MovementKind", NORMAL))
+    if clean(original.get("VoidOf", "")) or kind in {REVERSAL, COMPENSATION}:
+        raise InventoryError("Μια αναστροφή ή αντιστάθμιση δεν μπορεί να αναστραφεί.")
+
+    reverse_delta = -int(original["DeltaQty"])
+    reversal_id = deterministic_reversal_id(original_id)
+    row = make_transaction(
+        code_type=original["CodeType"],
+        code_value=original["CodeValue"],
+        barcode=original["Barcode"],
+        brand=original["Μάρκα"],
+        product=original["Προϊόν"],
+        category=original["Κατηγορία"],
+        location_id=int(original["LocationId"]),
+        movement="Αναστροφή (+)" if reverse_delta > 0 else "Αναστροφή (-)",
+        quantity=abs(reverse_delta),
+        delta=reverse_delta,
+        note=f"Αναστροφή {original_id}. {clean(reason)}",
+        transaction_id=reversal_id,
+        void_of=original_id,
+        movement_kind=REVERSAL,
+    )
+    return append_stock_transaction(ws, row)
 
 
-def detect_product_name(image):
-    if image is None:
-        return "", []
-
-    try:
-        lines = ocr_reader().readtext(image, detail=0)
-    except Exception as exc:
-        st.warning(f"Το OCR δεν ολοκληρώθηκε: {exc}")
-        return "", []
-
-    lines = [clean(line) for line in lines if clean(line)]
-    if not lines:
-        return "", []
-
-    return max(lines, key=len), lines
-
-
-def stock_table(df):
-    columns = [
+def stock_table(df: pd.DataFrame) -> pd.DataFrame:
+    output_columns = [
         "CodeType",
         "CodeValue",
         "Barcode",
@@ -268,103 +364,54 @@ def stock_table(df):
         "Κύριο Κτήριο",
         "Πρώτος Όροφος",
         "Σύνολο",
-        "FrontPhotoUrl",
-        "BackPhotoUrl",
     ]
-    active = active_movements(df)
-    if active.empty:
-        return pd.DataFrame(columns=columns)
+    data = active_movements(df)
+    if data.empty:
+        return pd.DataFrame(columns=output_columns)
 
-    data = active.copy()
-    text_columns = [
-        "CodeType",
-        "CodeValue",
-        "Barcode",
-        "Μάρκα",
-        "Προϊόν",
-        "Κατηγορία",
-        "FrontPhotoUrl",
-        "BackPhotoUrl",
-    ]
-    for column in text_columns:
-        data[column] = data[column].astype(str).fillna("")
-
+    identity = ["CodeType", "CodeValue"]
+    data = data.copy()
+    data["Timestamp_dt"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+    latest = (
+        data.sort_values("Timestamp_dt")
+        .groupby(identity, dropna=False)
+        .tail(1)[identity + ["Barcode", "Μάρκα", "Προϊόν", "Κατηγορία"]]
+    )
     grouped = (
-        data.groupby(
-            [
-                "CodeType",
-                "CodeValue",
-                "Barcode",
-                "Μάρκα",
-                "Προϊόν",
-                "Κατηγορία",
-                "LocationId",
-            ],
-            dropna=False,
-        )["DeltaQty"]
+        data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"]
         .sum()
         .reset_index()
     )
-
     pivot = grouped.pivot_table(
-        index=[
-            "CodeType",
-            "CodeValue",
-            "Barcode",
-            "Μάρκα",
-            "Προϊόν",
-            "Κατηγορία",
-        ],
+        index=identity,
         columns="LocationId",
         values="DeltaQty",
         fill_value=0,
     ).reset_index()
-
-    pivot = pivot.rename(
-        columns={
-            0: "Αποθήκη",
-            1: "Κύριο Κτήριο",
-            2: "Πρώτος Όροφος",
-        }
-    )
-
+    pivot = pivot.rename(columns={0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"})
     for column in ["Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος"]:
         if column not in pivot.columns:
             pivot[column] = 0
-
     pivot["Σύνολο"] = (
-        pivot["Αποθήκη"]
-        + pivot["Κύριο Κτήριο"]
-        + pivot["Πρώτος Όροφος"]
+        pivot["Αποθήκη"] + pivot["Κύριο Κτήριο"] + pivot["Πρώτος Όροφος"]
     )
-
-    photos = (
-        data.sort_values("Timestamp")
-        .groupby("CodeValue", dropna=False)[
-            ["FrontPhotoUrl", "BackPhotoUrl"]
-        ]
-        .last()
-        .reset_index()
-    )
-
     return (
-        pivot.merge(photos, on="CodeValue", how="left")
+        pivot.merge(latest, on=identity, how="left")
         .sort_values("Σύνολο", ascending=False)
+        [output_columns]
     )
 
 
-def search_stock(stock, query):
+def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
     query = clean(query).lower()
     if not query or stock.empty:
         return stock, ""
-
     code_matches = stock[
         stock["CodeValue"].astype(str).str.lower().str.contains(query, na=False)
         | stock["Barcode"].astype(str).str.lower().str.contains(query, na=False)
     ]
     if not code_matches.empty:
         return code_matches, "Βρέθηκε με Barcode / QR"
-
     text_matches = stock[
         stock["Μάρκα"].astype(str).str.lower().str.contains(query, na=False)
         | stock["Προϊόν"].astype(str).str.lower().str.contains(query, na=False)
@@ -372,430 +419,250 @@ def search_stock(stock, query):
     ]
     if not text_matches.empty:
         return text_matches, "Βρέθηκε με Μάρκα / Όνομα / Κατηγορία"
-
     return stock.iloc[0:0], "Δεν βρέθηκε αποτέλεσμα"
 
 
-def cards(stock):
-    if stock.empty:
-        st.info("Δεν υπάρχουν αποτελέσματα.")
-        return
-
-    for _, row in stock.head(20).iterrows():
-        with st.container(border=True):
-            photo_column, details_column = st.columns([1, 2])
-
-            with photo_column:
-                front_url = clean(row.get("FrontPhotoUrl", ""))
-                if front_url:
-                    st.image(
-                        front_url,
-                        caption="Πρόσοψη",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info("Δεν υπάρχει φωτογραφία")
-
-            with details_column:
-                st.markdown(f"### {row.get('Προϊόν', '')}")
-                st.write(f"**Μάρκα:** {row.get('Μάρκα', '') or '—'}")
-                st.write(
-                    f"**Κωδικός:** {row.get('CodeType', '')} | "
-                    f"`{row.get('CodeValue', '')}`"
-                )
-                st.write(f"**Αποθήκη:** {int(row.get('Αποθήκη', 0))}")
-                st.write(
-                    f"**Κύριο Κτήριο:** {int(row.get('Κύριο Κτήριο', 0))}"
-                )
-                st.write(
-                    f"**Πρώτος Όροφος:** "
-                    f"{int(row.get('Πρώτος Όροφος', 0))}"
-                )
-                st.success(f"Σύνολο: {int(row.get('Σύνολο', 0))}")
-
-                back_url = clean(row.get("BackPhotoUrl", ""))
-                if back_url:
-                    st.image(
-                        back_url,
-                        caption="Πίσω / Barcode",
-                        use_container_width=True,
-                    )
+def to_img(file):
+    data = np.frombuffer(file.getvalue(), np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
 
-def transaction_row(
-    code_type,
-    code_value,
-    barcode,
-    brand,
-    product,
-    category,
-    location_id,
-    movement,
-    quantity,
-    delta,
-    front_url="",
-    back_url="",
-    note="",
-    void_of="",
-):
-    now = datetime.now()
-    return {
-        "TransactionId": str(uuid.uuid4()),
-        "Timestamp": now.isoformat(timespec="seconds"),
-        "Ημερομηνία": now.strftime("%Y-%m-%d %H:%M"),
-        "CodeType": code_type,
-        "CodeValue": code_value,
-        "Barcode": barcode,
-        "Μάρκα": clean(brand),
-        "Προϊόν": clean(product),
-        "Κατηγορία": category,
-        "LocationId": int(location_id),
-        "Τοποθεσία": LOCATIONS[int(location_id)],
-        "Κίνηση": movement,
-        "Ποσότητα": int(quantity),
-        "DeltaQty": int(delta),
-        "FrontPhotoUrl": clean(front_url),
-        "BackPhotoUrl": clean(back_url),
-        "Σημείωση": clean(note),
-        "Voided": False,
-        "VoidOf": clean(void_of),
-    }
+def detect_code(front=None, back=None) -> tuple[str, str]:
+    for image in [back, front]:
+        if image is None:
+            continue
+        try:
+            detector = cv2.barcode.BarcodeDetector()
+            ok, values, _, _ = detector.detectAndDecode(image)
+            if ok and values:
+                for value in values:
+                    value = clean(value)
+                    if value.isdigit():
+                        return "Barcode", value
+        except Exception:
+            pass
+    for image in [back, front]:
+        if image is None:
+            continue
+        try:
+            value, _, _ = cv2.QRCodeDetector().detectAndDecode(image)
+            if clean(value):
+                return "QR", clean(value)
+        except Exception:
+            pass
+    return "Barcode", ""
 
 
-st.set_page_config(
-    page_title="Αποθήκη Φαρμακείου",
-    page_icon="📦",
-    layout="wide",
-)
+@st.cache_resource(show_spinner=False)
+def ocr_reader():
+    if easyocr is None:
+        return None
+    try:
+        return easyocr.Reader(["el", "en"], gpu=False)
+    except Exception:
+        return None
 
-st.title("📦 Αποθήκη Φαρμακείου")
-st.caption(
-    "Barcode/QR, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων στο Google Sheets."
-)
 
-entry_tab, search_tab, sales_tab, data_tab, reversal_tab = st.tabs(
-    [
-        "➕ Καταχώρηση",
-        "🔎 Search",
-        "📅 Πωλήσεις",
-        "📄 Δεδομένα",
-        "↩️ Αναστροφή",
-    ]
-)
+def detect_product_name(image) -> tuple[str, list[str]]:
+    if image is None:
+        return "", []
+    reader = ocr_reader()
+    if reader is None:
+        return "", []
+    try:
+        lines = [clean(line) for line in reader.readtext(image, detail=0) if clean(line)]
+    except Exception:
+        return "", []
+    return (max(lines, key=len), lines) if lines else ("", [])
 
-with entry_tab:
-    st.subheader("Καταχώρηση")
 
-    front_column, back_column = st.columns(2)
-    with front_column:
-        front_file = st.camera_input(
-            "Φωτογραφία πρόσοψης",
-            key="front",
-        ) or st.file_uploader(
-            "Ή ανέβασε πρόσοψη",
-            ["jpg", "jpeg", "png"],
-            key="front_up",
+@st.cache_resource(show_spinner=False)
+def worksheet():
+    if "gcp_service_account" not in st.secrets:
+        st.error("Λείπουν τα Streamlit Secrets: gcp_service_account.")
+        st.stop()
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+        if "private_key" in info:
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        creds = Credentials.from_service_account_info(info, scopes=SCOPE)
+        client = gspread.authorize(creds)
+        sheet = client.open(st.secrets.get("SHEET_NAME", SHEET_NAME))
+        ws = sheet.worksheet(WS_NAME)
+        validate_and_migrate_headers(ws)
+        return ws
+    except (gspread.SpreadsheetNotFound, gspread.WorksheetNotFound):
+        st.error(
+            "Δεν βρέθηκε το Google Sheet ή το φύλλο Transactions. "
+            "Δημιούργησέ τα και μοιράσου το Sheet με το service-account email."
         )
-    with back_column:
-        back_file = st.camera_input(
-            "Φωτογραφία πίσω / Barcode / QR",
-            key="back",
-        ) or st.file_uploader(
-            "Ή ανέβασε πίσω",
-            ["jpg", "jpeg", "png"],
-            key="back_up",
+        st.stop()
+    except SchemaError as exc:
+        st.error(str(exc))
+        st.stop()
+    except Exception:
+        st.error(
+            "Αποτυχία σύνδεσης με το Google Sheets. Έλεγξε τα secrets, "
+            "την κοινή χρήση του Sheet και τη σύνδεση."
         )
+        st.stop()
 
-    front_image = to_img(front_file) if front_file else None
-    back_image = to_img(back_file) if back_file else None
 
-    if front_image is not None:
-        st.image(front_image, caption="Πρόσοψη", use_container_width=True)
-    if back_image is not None:
-        st.image(back_image, caption="Πίσω", use_container_width=True)
+def main():
+    st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
+    st.title("📦 Αποθήκη Φαρμακείου")
+    st.caption("Barcode/QR, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων.")
 
-    detected_type, detected_code = detect_code(front_image, back_image)
-    if detected_code:
-        st.success(f"Βρέθηκε {detected_type}: {detected_code}")
+    entry_tab, search_tab, sales_tab, data_tab, reversal_tab = st.tabs(
+        ["➕ Καταχώρηση", "🔎 Search", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
+    )
 
-    detected_product = ""
-    ocr_lines = []
-    if front_image is not None:
-        with st.spinner("Αναγνώριση ονόματος προϊόντος..."):
-            detected_product, ocr_lines = detect_product_name(front_image)
+    with entry_tab:
+        st.subheader("Καταχώρηση")
+        left, right = st.columns(2)
+        with left:
+            front_file = st.camera_input("Φωτογραφία πρόσοψης", key="front") or st.file_uploader(
+                "Ή ανέβασε πρόσοψη", ["jpg", "jpeg", "png"], key="front_up"
+            )
+        with right:
+            back_file = st.camera_input("Φωτογραφία πίσω / Barcode / QR", key="back") or st.file_uploader(
+                "Ή ανέβασε πίσω", ["jpg", "jpeg", "png"], key="back_up"
+            )
+
+        front_image = to_img(front_file) if front_file else None
+        back_image = to_img(back_file) if back_file else None
+        detected_type, detected_code = detect_code(front_image, back_image)
+        detected_product, ocr_lines = detect_product_name(front_image)
+
+        if detected_code:
+            st.success(f"Βρέθηκε {detected_type}: {detected_code}")
         if detected_product:
             st.info(f"Πρόταση OCR: {detected_product}")
-        if ocr_lines:
-            with st.expander("Όλα τα αποτελέσματα OCR"):
-                st.write(ocr_lines)
+        elif front_image is not None and ocr_reader() is None:
+            st.warning("Το OCR δεν είναι διαθέσιμο, αλλά η εφαρμογή συνεχίζει κανονικά.")
 
-    code_type = st.selectbox(
-        "Τύπος κωδικού",
-        ["Barcode", "QR", "Other"],
-        index=["Barcode", "QR", "Other"].index(detected_type),
-    )
-    code_value_input = st.text_input(
-        "Barcode / QR",
-        value=detected_code,
-    )
-    brand = st.text_input("Μάρκα")
-    product = st.text_input(
-        "Όνομα προϊόντος",
-        value=detected_product,
-    )
-    category = st.selectbox("Κατηγορία", CATEGORIES)
-    front_url = st.text_input("URL φωτογραφίας πρόσοψης")
-    back_url = st.text_input("URL φωτογραφίας πίσω/barcode")
+        code_type = st.selectbox("Τύπος κωδικού", ["Barcode", "QR", "Other"], index=["Barcode", "QR", "Other"].index(detected_type))
+        code_input = st.text_input("Barcode / QR / Other", value=detected_code)
+        brand = st.text_input("Μάρκα")
+        product = st.text_input("Όνομα προϊόντος", value=detected_product)
+        category = st.selectbox("Κατηγορία", CATEGORIES)
+        location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
+        location_id = int(location_label.split("-")[0].strip())
+        movement = st.selectbox("Κίνηση", ["Παραλαβή (+)", "Πώληση (-)", "Διόρθωση (+)", "Διόρθωση (-)"])
+        quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1)
+        note = st.text_input("Σημείωση")
 
-    location_label = st.selectbox(
-        "Τοποθεσία",
-        [f"{key} - {value}" for key, value in LOCATIONS.items()],
-    )
-    location_id = int(location_label.split("-")[0].strip())
+        if "pending_transaction_id" not in st.session_state:
+            st.session_state.pending_transaction_id = str(uuid.uuid4())
 
-    movement = st.selectbox(
-        "Κίνηση",
-        [
-            "Παραλαβή (+)",
-            "Πώληση (-)",
-            "Διόρθωση (+)",
-            "Διόρθωση (-)",
-        ],
-    )
-    quantity = st.number_input(
-        "Ποσότητα",
-        min_value=1,
-        value=1,
-        step=1,
-    )
-    note = st.text_input("Σημείωση")
+        with st.form("entry_form"):
+            confirmed = st.form_submit_button("💾 Αποθήκευση", use_container_width=True)
 
-    if st.button("💾 Αποθήκευση", use_container_width=True):
-        final_code = clean(code_value_input)
-        if not final_code:
-            st.error("Βάλε Barcode ή QR.")
-            st.stop()
+        if confirmed:
+            try:
+                code_value, barcode = validate_code(code_type, code_input)
+                if not clean(product):
+                    raise InventoryError("Βάλε όνομα προϊόντος.")
+                delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
+                row = make_transaction(
+                    code_type=code_type,
+                    code_value=code_value,
+                    barcode=barcode,
+                    brand=brand,
+                    product=product,
+                    category=category,
+                    location_id=location_id,
+                    movement=movement,
+                    quantity=int(quantity),
+                    delta=delta,
+                    note=note,
+                    transaction_id=st.session_state.pending_transaction_id,
+                )
+                status = append_stock_transaction(worksheet(), row)
+                if status == "duplicate":
+                    st.info("Η ίδια υποβολή έχει ήδη καταχωρηθεί.")
+                elif status == "compensated":
+                    st.error(
+                        "Εντοπίστηκε ταυτόχρονη μεταβολή stock. Η κίνηση "
+                        "αντισταθμίστηκε αυτόματα και δεν εφαρμόστηκε."
+                    )
+                else:
+                    st.success("Αποθηκεύτηκε στο Google Sheets.")
+                st.session_state.pending_transaction_id = str(uuid.uuid4())
+            except InventoryError as exc:
+                st.error(str(exc))
 
-        barcode = clean_barcode(final_code) if code_type == "Barcode" else ""
-        if code_type == "Barcode" and not barcode:
-            st.error("Διάλεξες Barcode αλλά δεν έβαλες αριθμητικό barcode.")
-            st.stop()
-
-        code_value = barcode if code_type == "Barcode" else final_code
-
-        if not clean(product):
-            st.error("Βάλε όνομα προϊόντος.")
-            st.stop()
-
-        delta = (
-            int(quantity)
-            if movement in ["Παραλαβή (+)", "Διόρθωση (+)"]
-            else -int(quantity)
-        )
-
-        data = load_data()
-        existing_stock = current_stock(
-            data,
-            code_type,
-            code_value,
-            location_id,
-        )
-        if delta < 0 and existing_stock + delta < 0:
-            st.error(
-                f"Η κίνηση θα έκανε το stock αρνητικό. "
-                f"Διαθέσιμα: {existing_stock}, ζητήθηκαν: {abs(delta)}."
-            )
-            st.stop()
-
-        add_row(
-            transaction_row(
-                code_type=code_type,
-                code_value=code_value,
-                barcode=barcode,
-                brand=brand,
-                product=product,
-                category=category,
-                location_id=location_id,
-                movement=movement,
-                quantity=quantity,
-                delta=delta,
-                front_url=front_url,
-                back_url=back_url,
-                note=note,
-            )
-        )
-        st.success("Αποθηκεύτηκε στο Google Sheets.")
-
-with search_tab:
-    st.subheader("Search")
-    stock = stock_table(load_data())
-    query = st.text_input(
-        "Γράψε Barcode, QR, Μάρκα ή Όνομα",
-        placeholder="π.χ. Depon ή 520...",
-    )
-    results, message = search_stock(stock, query)
-    if message:
-        st.info(message)
-
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-    metric_1.metric(
-        "Σύνολο",
-        int(results["Σύνολο"].sum()) if not results.empty else 0,
-    )
-    metric_2.metric(
-        "Αποθήκη",
-        int(results["Αποθήκη"].sum()) if not results.empty else 0,
-    )
-    metric_3.metric(
-        "Κύριο Κτήριο",
-        int(results["Κύριο Κτήριο"].sum()) if not results.empty else 0,
-    )
-    metric_4.metric(
-        "Πρώτος Όροφος",
-        int(results["Πρώτος Όροφος"].sum()) if not results.empty else 0,
-    )
-
-    cards(results)
-    with st.expander("Πίνακας"):
+    with search_tab:
+        data, unknown = load_data(worksheet())
+        if unknown:
+            st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
+        stock = stock_table(data)
+        query = st.text_input("Γράψε Barcode, QR, Μάρκα ή Όνομα")
+        results, message = search_stock(stock, query)
+        if message:
+            st.info(message)
         st.dataframe(results, use_container_width=True)
 
-with sales_tab:
-    st.subheader("Πωλήσεις")
-    data = active_movements(load_data())
-
-    if data.empty:
-        st.info("Δεν υπάρχουν δεδομένα.")
-    else:
-        data["Timestamp_dt"] = pd.to_datetime(
-            data["Timestamp"],
-            errors="coerce",
-        )
-        start_column, end_column = st.columns(2)
-        start = pd.to_datetime(start_column.date_input("Από"))
-        end = pd.to_datetime(end_column.date_input("Έως")) + pd.Timedelta(days=1)
-
-        period = data[
-            (data["Timestamp_dt"] >= start)
-            & (data["Timestamp_dt"] < end)
-        ]
+    with sales_tab:
+        data, _ = load_data(worksheet())
+        data = active_movements(data)
+        data["Timestamp_dt"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+        start_col, end_col = st.columns(2)
+        start = pd.to_datetime(start_col.date_input("Από"))
+        end = pd.to_datetime(end_col.date_input("Έως")) + pd.Timedelta(days=1)
+        period = data[(data["Timestamp_dt"] >= start) & (data["Timestamp_dt"] < end)]
         sales = period[period["DeltaQty"] < 0].copy()
-
         if sales.empty:
             st.info("Δεν υπάρχουν πωλήσεις ή αφαιρέσεις.")
         else:
             sales["Πωλήθηκαν"] = sales["DeltaQty"].abs()
             report = (
-                sales.groupby(
-                    [
-                        "CodeType",
-                        "CodeValue",
-                        "Barcode",
-                        "Μάρκα",
-                        "Προϊόν",
-                        "Τοποθεσία",
-                    ],
-                    dropna=False,
-                )["Πωλήθηκαν"]
+                sales.groupby(["CodeType", "CodeValue", "Μάρκα", "Προϊόν", "Τοποθεσία"], dropna=False)["Πωλήθηκαν"]
                 .sum()
                 .reset_index()
                 .sort_values("Πωλήθηκαν", ascending=False)
             )
-            st.metric("Σύνολο τεμαχίων", int(report["Πωλήθηκαν"].sum()))
             st.dataframe(report, use_container_width=True)
 
-with data_tab:
-    st.subheader("Όλες οι κινήσεις")
-    all_data = load_data()
-    st.dataframe(all_data, use_container_width=True)
+    with data_tab:
+        data, unknown = load_data(worksheet())
+        if unknown:
+            st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
+        st.dataframe(data, use_container_width=True)
 
-with reversal_tab:
-    st.subheader("Αναστροφή λανθασμένης κίνησης")
-    st.caption(
-        "Δεν διαγράφουμε ιστορικό. Δημιουργούμε αντίθετη κίνηση με σύνδεση "
-        "στην αρχική συναλλαγή."
-    )
-
-    all_data = load_data()
-    reversible = all_data[
-        all_data["TransactionId"].astype(str).str.strip().ne("")
-        & ~all_data["Voided"].astype(bool)
-    ].copy()
-
-    if reversible.empty:
-        st.info("Δεν υπάρχουν διαθέσιμες κινήσεις για αναστροφή.")
-    else:
-        reversed_ids = set(
-            all_data.loc[
-                all_data["VoidOf"].astype(str).str.strip().ne(""),
-                "VoidOf",
-            ].astype(str)
-        )
-        reversible = reversible[
-            ~reversible["TransactionId"].astype(str).isin(reversed_ids)
-        ]
-
-        options = {
-            (
-                f"{row['Ημερομηνία']} | {row['Προϊόν']} | "
-                f"{row['Τοποθεσία']} | Δ={int(row['DeltaQty'])} | "
-                f"{row['TransactionId']}"
-            ): index
-            for index, row in reversible.iterrows()
-        }
-
-        if not options:
-            st.info("Όλες οι διαθέσιμες κινήσεις έχουν ήδη αναστραφεί.")
+    with reversal_tab:
+        data, _ = load_data(worksheet())
+        candidates = reversible_rows(data)
+        if candidates.empty:
+            st.info("Δεν υπάρχουν διαθέσιμες κινήσεις για αναστροφή.")
         else:
-            label = st.selectbox("Επίλεξε κίνηση", list(options))
-            reason = st.text_input("Λόγος αναστροφής")
-            confirm = st.checkbox(
-                "Επιβεβαιώνω ότι θέλω να δημιουργηθεί αντίθετη κίνηση."
+            tx_ids = candidates["TransactionId"].tolist()
+            selected_id = st.selectbox(
+                "Επίλεξε κίνηση",
+                tx_ids,
+                format_func=lambda txid: (
+                    f"{candidates.loc[candidates['TransactionId'].eq(txid), 'Ημερομηνία'].iloc[0]} | "
+                    f"{candidates.loc[candidates['TransactionId'].eq(txid), 'Προϊόν'].iloc[0]} | {txid}"
+                ),
             )
-
+            reason = st.text_input("Λόγος αναστροφής")
+            confirm = st.checkbox("Επιβεβαιώνω την αναστροφή.")
             if st.button("↩️ Δημιουργία αναστροφής", use_container_width=True):
                 if not confirm:
                     st.error("Χρειάζεται επιβεβαίωση.")
-                    st.stop()
+                else:
+                    try:
+                        original = candidates[candidates["TransactionId"].eq(selected_id)].iloc[0]
+                        status = append_reversal(worksheet(), original, reason)
+                        if status == "duplicate":
+                            st.info("Η κίνηση έχει ήδη αναστραφεί.")
+                        elif status == "compensated":
+                            st.error("Η αναστροφή αντισταθμίστηκε λόγω ταυτόχρονης μεταβολής stock.")
+                        else:
+                            st.success("Η αναστροφή καταχωρήθηκε χωρίς διαγραφή ιστορικού.")
+                    except InventoryError as exc:
+                        st.error(str(exc))
 
-                original = reversible.loc[options[label]]
-                reverse_delta = -int(original["DeltaQty"])
-                stock_now = current_stock(
-                    all_data,
-                    original["CodeType"],
-                    original["CodeValue"],
-                    int(original["LocationId"]),
-                )
-                if reverse_delta < 0 and stock_now + reverse_delta < 0:
-                    st.error(
-                        "Η αναστροφή θα έκανε το stock αρνητικό και "
-                        "δεν επιτρέπεται."
-                    )
-                    st.stop()
 
-                movement = (
-                    "Αναστροφή (+)"
-                    if reverse_delta > 0
-                    else "Αναστροφή (-)"
-                )
-                add_row(
-                    transaction_row(
-                        code_type=original["CodeType"],
-                        code_value=original["CodeValue"],
-                        barcode=original["Barcode"],
-                        brand=original["Μάρκα"],
-                        product=original["Προϊόν"],
-                        category=original["Κατηγορία"],
-                        location_id=int(original["LocationId"]),
-                        movement=movement,
-                        quantity=abs(reverse_delta),
-                        delta=reverse_delta,
-                        front_url=original["FrontPhotoUrl"],
-                        back_url=original["BackPhotoUrl"],
-                        note=(
-                            f"Αναστροφή {original['TransactionId']}. "
-                            f"{clean(reason)}"
-                        ),
-                        void_of=original["TransactionId"],
-                    )
-                )
-                st.success("Η αναστροφή καταχωρήθηκε χωρίς διαγραφή ιστορικού.")
+if __name__ == "__main__":
+    main()
