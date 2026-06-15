@@ -189,7 +189,7 @@ def append_row(ws, row: dict[str, Any]) -> None:
     try:
         ws.append_row(
             [row.get(header, "") for header in headers],
-            value_input_option="USER_ENTERED",
+            value_input_option="RAW",
         )
     except Exception as exc:
         raise InventoryError("Δεν ήταν δυνατή η αποθήκευση της κίνησης.") from exc
