@@ -31,6 +31,8 @@ def base_row(**overrides):
         code_type="Barcode",
         code_value="123",
         barcode="123",
+        pc_code="",
+        serial_number="",
         brand="Brand",
         product="Product",
         category="Φάρμακο",
@@ -57,6 +59,8 @@ def test_missing_headers_are_appended_and_unknown_preserved():
     headers, unknown = app.validate_and_migrate_headers(ws)
     assert headers[0:2] == ["TransactionId", "LegacyColumn"]
     assert "MovementKind" in headers
+    assert "PCCode" in headers
+    assert "SerialNumber" in headers
     assert unknown == ["LegacyColumn"]
 
 
@@ -68,8 +72,47 @@ def test_duplicate_headers_rejected():
 
 def test_barcode_rejects_alphanumeric_but_other_preserves_it():
     with pytest.raises(app.InventoryError):
-        app.validate_code("Barcode", "AB123")
-    assert app.validate_code("Other", "AB123") == ("AB123", "")
+        app.resolve_identity("Barcode", "AB123")
+    assert app.resolve_identity("Other", "AB123") == ("Other", "AB123", "")
+
+
+def test_pc_sn_fallback_accepts_either_or_both():
+    assert app.resolve_identity("QR", "", pc_code="111", serial_number="") == (
+        "PC/SN",
+        "PC:111",
+        "",
+    )
+    assert app.resolve_identity("QR", "", pc_code="", serial_number="222") == (
+        "PC/SN",
+        "SN:222",
+        "",
+    )
+    assert app.resolve_identity("QR", "", pc_code="111", serial_number="222") == (
+        "PC/SN",
+        "PC:111|SN:222",
+        "",
+    )
+
+
+def test_no_primary_or_fallback_code_is_rejected():
+    with pytest.raises(app.InventoryError):
+        app.resolve_identity("QR", "", "", "")
+
+
+def test_pc_sn_are_stored_and_searchable():
+    row = base_row(
+        CodeType="PC/SN",
+        CodeValue="PC:111|SN:222",
+        Barcode="",
+        PCCode="111",
+        SerialNumber="222",
+    )
+    df = app.records_to_dataframe([row])
+    stock = app.stock_table(df)
+    assert stock.iloc[0]["PCCode"] == "111"
+    assert stock.iloc[0]["SerialNumber"] == "222"
+    assert len(app.search_stock(stock, "111")[0]) == 1
+    assert len(app.search_stock(stock, "222")[0]) == 1
 
 
 def test_products_with_same_value_different_type_stay_separate():
