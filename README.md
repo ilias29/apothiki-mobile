@@ -1,40 +1,34 @@
 # Αποθήκη Φαρμακείου
 
-Το κύριο MVP entrypoint είναι το `app_inventory_search.py`.
+Κύριο MVP: `app_inventory_search.py`.
 
 ## Λειτουργίες
 
-- Καταχώρηση παραλαβών, πωλήσεων και διορθώσεων
-- Barcode / QR detection
-- Προαιρετικό OCR για πρόταση ονόματος προϊόντος
+- Barcode και QR detection
+- Fallback με `PCCode` και `SerialNumber` όταν δεν διαβάζεται το QR
+- Τα PC και SN είναι προαιρετικά μεμονωμένα: αρκεί να υπάρχει ένα από τα δύο
+- Αναζήτηση με Barcode, QR, PC, SN, μάρκα ή όνομα
+- Προαιρετικό OCR
 - Stock ανά τοποθεσία
-- Αναζήτηση προϊόντων
-- Αναφορές πωλήσεων ανά περίοδο
-- Προστασία από αρνητικό stock με fresh read πριν την εγγραφή
-- Αυτόματη αντιστάθμιση αν μια ταυτόχρονη εγγραφή προκαλέσει αρνητικό stock
-- Μοναδικά transaction IDs και timestamps
-- Ασφαλής αναστροφή λανθασμένων κινήσεων χωρίς διαγραφή ιστορικού
-- Google Sheets ως βασικό storage
+- Αναφορές πωλήσεων
+- Προστασία από αρνητικό stock
+- Ασφαλείς αναστροφές χωρίς διαγραφή ιστορικού
+
+## QR fallback
+
+Όταν δεν διαβάζεται το QR, άφησε κενό το βασικό πεδίο κωδικού και συμπλήρωσε PC και/ή SN. Αν υπάρχουν και τα δύο, αποθηκεύονται σε ξεχωριστές στήλες.
 
 ## Μοντέλο κινήσεων
 
-Η εφαρμογή χρησιμοποιεί **compensating ledger**:
+Η εφαρμογή χρησιμοποιεί compensating ledger. Οι αρχικές κινήσεις παραμένουν, οι αναστροφές γράφονται ως νέες αντίθετες κινήσεις, το `VoidOf` συνδέει τις εγγραφές και το `MovementKind` ξεχωρίζει normal, reversal και compensation.
 
-- Οι αρχικές κινήσεις παραμένουν στο ιστορικό.
-- Οι αναστροφές γράφονται ως νέες αντίθετες κινήσεις.
-- Το `VoidOf` συνδέει την αναστροφή με την αρχική κίνηση.
-- Το `MovementKind` ξεχωρίζει `Normal`, `Reversal` και `Compensation`.
-- Το `Voided` χρησιμοποιείται μόνο ως παλιό/manual exclusion πεδίο και όχι για κανονικές αναστροφές.
+## Ταυτόχρονη χρήση
 
-## Περιορισμός ταυτόχρονης χρήσης
-
-Το Google Sheets **δεν είναι transactional database**. Η εφαρμογή ξαναδιαβάζει το stock πριν από αφαιρετικές κινήσεις, ελέγχει ξανά μετά την εγγραφή και δημιουργεί αντισταθμιστική κίνηση όταν εντοπίζεται race condition. Αυτή είναι best-effort προστασία, όχι απόλυτο lock.
-
-Για έντονη ταυτόχρονη χρήση από πολλούς χρήστες, οι εγγραφές πρέπει να μεταφερθούν πίσω από Google Apps Script `LockService` ή σε transactional database.
+Το Google Sheets δεν είναι transactional database. Η εφαρμογή κάνει fresh read πριν από αφαιρετικές κινήσεις, επανέλεγχο μετά την εγγραφή και αυτόματη αντιστάθμιση όταν εντοπίζεται race condition. Για έντονη ταυτόχρονη χρήση χρειάζεται αργότερα LockService ή transactional database.
 
 ## Φωτογραφίες
 
-Η εφαρμογή δέχεται φωτογραφίες μόνο για άμεσο barcode/OCR έλεγχο. Μόνιμη αποθήκευση φωτογραφιών δεν έχει υλοποιηθεί ακόμη και αυθαίρετα εξωτερικά image URLs δεν αποθηκεύονται ή προβάλλονται.
+Οι φωτογραφίες χρησιμοποιούνται μόνο για άμεσο barcode/OCR έλεγχο. Δεν αποθηκεύονται μόνιμα και δεν φορτώνονται εξωτερικά image URLs.
 
 ## Εγκατάσταση
 
@@ -54,15 +48,7 @@ pip install -r requirements.txt
 
 ## Ρύθμιση Google Sheets
 
-1. Αντέγραψε το `.streamlit/secrets.toml.example` σε `.streamlit/secrets.toml`.
-2. Συμπλήρωσε τα πραγματικά στοιχεία του Google service account.
-3. Δημιούργησε το Google Sheet και ένα worksheet με όνομα `Transactions`.
-4. Μοιράσου το Google Sheet με το `client_email` του service account.
-5. Προαιρετικά άλλαξε το `SHEET_NAME`.
-
-Η εφαρμογή χρησιμοποιεί μόνο το scope `https://www.googleapis.com/auth/spreadsheets` και δεν δημιουργεί αρχεία στο Google Drive.
-
-Μην ανεβάσεις το πραγματικό `.streamlit/secrets.toml` στο GitHub.
+Δημιούργησε το Google Sheet και worksheet με όνομα `Transactions`, συμπλήρωσε το τοπικό Streamlit secrets αρχείο και μοιράσου το Sheet με το service-account email. Η εφαρμογή χρησιμοποιεί μόνο spreadsheet scope και δεν δημιουργεί αρχεία στο Drive.
 
 ## Εκτέλεση
 
@@ -70,10 +56,10 @@ pip install -r requirements.txt
 streamlit run app_inventory_search.py
 ```
 
-Η εφαρμογή ανοίγει συνήθως στο `http://localhost:8501`.
-
 ## Tests
 
+Από τη ρίζα του repository:
+
 ```bash
-pytest -q
+python -m pytest -q
 ```
