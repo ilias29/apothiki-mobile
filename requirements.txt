@@ -6,3 +6,4 @@ openpyxl
 easyocr
 opencv-python-headless
 numpy
+pytest
