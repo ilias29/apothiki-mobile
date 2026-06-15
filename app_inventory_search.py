@@ -1,4 +1,3 @@
-import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -29,6 +28,8 @@ COLUMNS = [
     "CodeType",
     "CodeValue",
     "Barcode",
+    "PCCode",
+    "SerialNumber",
     "Μάρκα",
     "Προϊόν",
     "Κατηγορία",
@@ -67,18 +68,42 @@ def normalize_bool(value: Any) -> bool:
     return clean(value).lower() in TRUE_VALUES
 
 
-def validate_code(code_type: str, raw_value: Any) -> tuple[str, str]:
+def resolve_identity(
+    code_type: str,
+    raw_value: Any,
+    pc_code: Any = "",
+    serial_number: Any = "",
+) -> tuple[str, str, str]:
     value = clean(raw_value)
-    if not value:
-        raise InventoryError("Βάλε Barcode, QR ή άλλο κωδικό.")
-    if code_type == "Barcode":
-        if not value.isdigit():
+    pc = clean(pc_code)
+    serial = clean(serial_number)
+
+    if value:
+        if code_type == "Barcode" and not value.isdigit():
             raise InventoryError(
                 "Το Barcode δέχεται μόνο αριθμούς. Για αλφαριθμητικό κωδικό "
                 "διάλεξε QR ή Other."
             )
-        return value, value
-    return value, ""
+        return code_type, value, value if code_type == "Barcode" else ""
+
+    if pc or serial:
+        parts = []
+        if pc:
+            parts.append(f"PC:{pc}")
+        if serial:
+            parts.append(f"SN:{serial}")
+        return "PC/SN", "|".join(parts), ""
+
+    raise InventoryError(
+        "Βάλε Barcode/QR/Other ή τουλάχιστον έναν από τους κωδικούς PC και SN."
+    )
+
+
+def validate_code(code_type: str, raw_value: Any) -> tuple[str, str]:
+    resolved_type, value, barcode = resolve_identity(code_type, raw_value)
+    if resolved_type == "PC/SN":
+        raise InventoryError("Χρειάζεται PC ή SN για fallback καταχώρηση.")
+    return value, barcode
 
 
 def deterministic_reversal_id(original_id: str) -> str:
@@ -91,29 +116,24 @@ def deterministic_compensation_id(transaction_id: str) -> str:
 
 def validate_and_migrate_headers(ws) -> tuple[list[str], list[str]]:
     headers = [clean(h) for h in ws.row_values(1)]
-
     if not headers or not any(headers):
         ws.update("A1", [COLUMNS])
         return COLUMNS.copy(), []
-
     if any(not h for h in headers):
         raise SchemaError(
             "Η πρώτη γραμμή του Google Sheet έχει κενές επικεφαλίδες. "
             "Διόρθωσέ τες πριν συνεχίσεις."
         )
-
     duplicates = sorted({h for h in headers if headers.count(h) > 1})
     if duplicates:
         raise SchemaError(
             "Υπάρχουν διπλές επικεφαλίδες στο Google Sheet: "
             + ", ".join(duplicates)
         )
-
     missing = [column for column in COLUMNS if column not in headers]
     if missing:
         headers = headers + missing
         ws.update("A1", [headers])
-
     unknown = [header for header in headers if header not in COLUMNS]
     return headers, unknown
 
@@ -124,22 +144,22 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
         if column not in df.columns:
             df[column] = ""
 
-    for column in [
+    text_columns = [
         "TransactionId",
         "Timestamp",
         "Ημερομηνία",
         "CodeType",
         "CodeValue",
         "Barcode",
+        "PCCode",
+        "SerialNumber",
         "VoidOf",
         "MovementKind",
-    ]:
+    ]
+    for column in text_columns:
         df[column] = df[column].fillna("").astype(str)
 
-    legacy_code = (
-        df["CodeValue"].str.strip().eq("")
-        & df["Barcode"].str.strip().ne("")
-    )
+    legacy_code = df["CodeValue"].str.strip().eq("") & df["Barcode"].str.strip().ne("")
     df.loc[legacy_code, "CodeType"] = "Barcode"
     df.loc[legacy_code, "CodeValue"] = df.loc[legacy_code, "Barcode"]
 
@@ -150,9 +170,7 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     df.loc[legacy_kind, "MovementKind"] = NORMAL
 
     df["DeltaQty"] = pd.to_numeric(df["DeltaQty"], errors="coerce").fillna(0).astype(int)
-    df["LocationId"] = (
-        pd.to_numeric(df["LocationId"], errors="coerce").fillna(-1).astype(int)
-    )
+    df["LocationId"] = pd.to_numeric(df["LocationId"], errors="coerce").fillna(-1).astype(int)
     df["Voided"] = df["Voided"].map(normalize_bool)
     return df[COLUMNS]
 
@@ -183,9 +201,7 @@ def active_movements(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df["Voided"].map(bool)].copy()
 
 
-def current_stock(
-    df: pd.DataFrame, code_type: str, code_value: str, location_id: int
-) -> int:
+def current_stock(df: pd.DataFrame, code_type: str, code_value: str, location_id: int) -> int:
     active = active_movements(df)
     if active.empty:
         return 0
@@ -237,6 +253,8 @@ def make_transaction(
     movement: str,
     quantity: int,
     delta: int,
+    pc_code: str = "",
+    serial_number: str = "",
     note: str = "",
     transaction_id: str | None = None,
     void_of: str = "",
@@ -250,6 +268,8 @@ def make_transaction(
         "CodeType": clean(code_type),
         "CodeValue": clean(code_value),
         "Barcode": clean(barcode),
+        "PCCode": clean(pc_code),
+        "SerialNumber": clean(serial_number),
         "Μάρκα": clean(brand),
         "Προϊόν": clean(product),
         "Κατηγορία": clean(category),
@@ -285,7 +305,6 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             )
 
     append_row(ws, row)
-
     if delta >= 0:
         return "saved"
 
@@ -302,6 +321,8 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             code_type=row["CodeType"],
             code_value=row["CodeValue"],
             barcode=row["Barcode"],
+            pc_code=row.get("PCCode", ""),
+            serial_number=row.get("SerialNumber", ""),
             brand=row["Μάρκα"],
             product=row["Προϊόν"],
             category=row["Κατηγορία"],
@@ -332,11 +353,12 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
         raise InventoryError("Μια αναστροφή ή αντιστάθμιση δεν μπορεί να αναστραφεί.")
 
     reverse_delta = -int(original["DeltaQty"])
-    reversal_id = deterministic_reversal_id(original_id)
     row = make_transaction(
         code_type=original["CodeType"],
         code_value=original["CodeValue"],
         barcode=original["Barcode"],
+        pc_code=original.get("PCCode", ""),
+        serial_number=original.get("SerialNumber", ""),
         brand=original["Μάρκα"],
         product=original["Προϊόν"],
         category=original["Κατηγορία"],
@@ -345,7 +367,7 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
         quantity=abs(reverse_delta),
         delta=reverse_delta,
         note=f"Αναστροφή {original_id}. {clean(reason)}",
-        transaction_id=reversal_id,
+        transaction_id=deterministic_reversal_id(original_id),
         void_of=original_id,
         movement_kind=REVERSAL,
     )
@@ -354,16 +376,9 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
 
 def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     output_columns = [
-        "CodeType",
-        "CodeValue",
-        "Barcode",
-        "Μάρκα",
-        "Προϊόν",
-        "Κατηγορία",
-        "Αποθήκη",
-        "Κύριο Κτήριο",
-        "Πρώτος Όροφος",
-        "Σύνολο",
+        "CodeType", "CodeValue", "Barcode", "PCCode", "SerialNumber",
+        "Μάρκα", "Προϊόν", "Κατηγορία", "Αποθήκη", "Κύριο Κτήριο",
+        "Πρώτος Όροφος", "Σύνολο",
     ]
     data = active_movements(df)
     if data.empty:
@@ -375,30 +390,20 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     latest = (
         data.sort_values("Timestamp_dt")
         .groupby(identity, dropna=False)
-        .tail(1)[identity + ["Barcode", "Μάρκα", "Προϊόν", "Κατηγορία"]]
+        .tail(1)[identity + ["Barcode", "PCCode", "SerialNumber", "Μάρκα", "Προϊόν", "Κατηγορία"]]
     )
-    grouped = (
-        data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"]
-        .sum()
-        .reset_index()
-    )
+    grouped = data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"].sum().reset_index()
     pivot = grouped.pivot_table(
-        index=identity,
-        columns="LocationId",
-        values="DeltaQty",
-        fill_value=0,
+        index=identity, columns="LocationId", values="DeltaQty", fill_value=0
     ).reset_index()
     pivot = pivot.rename(columns={0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"})
     for column in ["Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος"]:
         if column not in pivot.columns:
             pivot[column] = 0
-    pivot["Σύνολο"] = (
-        pivot["Αποθήκη"] + pivot["Κύριο Κτήριο"] + pivot["Πρώτος Όροφος"]
-    )
+    pivot["Σύνολο"] = pivot["Αποθήκη"] + pivot["Κύριο Κτήριο"] + pivot["Πρώτος Όροφος"]
     return (
         pivot.merge(latest, on=identity, how="left")
-        .sort_values("Σύνολο", ascending=False)
-        [output_columns]
+        .sort_values("Σύνολο", ascending=False)[output_columns]
     )
 
 
@@ -406,19 +411,13 @@ def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
     query = clean(query).lower()
     if not query or stock.empty:
         return stock, ""
-    code_matches = stock[
-        stock["CodeValue"].astype(str).str.lower().str.contains(query, na=False)
-        | stock["Barcode"].astype(str).str.lower().str.contains(query, na=False)
-    ]
-    if not code_matches.empty:
-        return code_matches, "Βρέθηκε με Barcode / QR"
-    text_matches = stock[
-        stock["Μάρκα"].astype(str).str.lower().str.contains(query, na=False)
-        | stock["Προϊόν"].astype(str).str.lower().str.contains(query, na=False)
-        | stock["Κατηγορία"].astype(str).str.lower().str.contains(query, na=False)
-    ]
-    if not text_matches.empty:
-        return text_matches, "Βρέθηκε με Μάρκα / Όνομα / Κατηγορία"
+    searchable = ["CodeValue", "Barcode", "PCCode", "SerialNumber", "Μάρκα", "Προϊόν", "Κατηγορία"]
+    mask = pd.Series(False, index=stock.index)
+    for column in searchable:
+        mask |= stock[column].astype(str).str.lower().str.contains(query, na=False, regex=False)
+    matches = stock[mask]
+    if not matches.empty:
+        return matches, "Βρέθηκε με κωδικό, PC, SN, μάρκα ή όνομα"
     return stock.iloc[0:0], "Δεν βρέθηκε αποτέλεσμα"
 
 
@@ -511,7 +510,7 @@ def worksheet():
 def main():
     st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη Φαρμακείου")
-    st.caption("Barcode/QR, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων.")
+    st.caption("Barcode/QR, fallback PC/SN, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων.")
 
     entry_tab, search_tab, sales_tab, data_tab, reversal_tab = st.tabs(
         ["➕ Καταχώρηση", "🔎 Search", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
@@ -532,7 +531,7 @@ def main():
         front_image = to_img(front_file) if front_file else None
         back_image = to_img(back_file) if back_file else None
         detected_type, detected_code = detect_code(front_image, back_image)
-        detected_product, ocr_lines = detect_product_name(front_image)
+        detected_product, _ = detect_product_name(front_image)
 
         if detected_code:
             st.success(f"Βρέθηκε {detected_type}: {detected_code}")
@@ -541,8 +540,14 @@ def main():
         elif front_image is not None and ocr_reader() is None:
             st.warning("Το OCR δεν είναι διαθέσιμο, αλλά η εφαρμογή συνεχίζει κανονικά.")
 
-        code_type = st.selectbox("Τύπος κωδικού", ["Barcode", "QR", "Other"], index=["Barcode", "QR", "Other"].index(detected_type))
+        code_type = st.selectbox(
+            "Τύπος βασικού κωδικού", ["Barcode", "QR", "Other"],
+            index=["Barcode", "QR", "Other"].index(detected_type),
+        )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code)
+        st.caption("Αν δεν διαβάζεται το QR, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
+        pc_code = st.text_input("PC code (προαιρετικό)")
+        serial_number = st.text_input("Serial Number / SN (προαιρετικό)")
         brand = st.text_input("Μάρκα")
         product = st.text_input("Όνομα προϊόντος", value=detected_product)
         category = st.selectbox("Κατηγορία", CATEGORIES)
@@ -555,19 +560,20 @@ def main():
         if "pending_transaction_id" not in st.session_state:
             st.session_state.pending_transaction_id = str(uuid.uuid4())
 
-        with st.form("entry_form"):
-            confirmed = st.form_submit_button("💾 Αποθήκευση", use_container_width=True)
-
-        if confirmed:
+        if st.button("💾 Αποθήκευση", use_container_width=True):
             try:
-                code_value, barcode = validate_code(code_type, code_input)
+                resolved_type, code_value, barcode = resolve_identity(
+                    code_type, code_input, pc_code, serial_number
+                )
                 if not clean(product):
                     raise InventoryError("Βάλε όνομα προϊόντος.")
                 delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
                 row = make_transaction(
-                    code_type=code_type,
+                    code_type=resolved_type,
                     code_value=code_value,
                     barcode=barcode,
+                    pc_code=pc_code,
+                    serial_number=serial_number,
                     brand=brand,
                     product=product,
                     category=category,
@@ -597,7 +603,7 @@ def main():
         if unknown:
             st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
         stock = stock_table(data)
-        query = st.text_input("Γράψε Barcode, QR, Μάρκα ή Όνομα")
+        query = st.text_input("Αναζήτηση: Barcode, QR, PC, SN, μάρκα ή όνομα")
         results, message = search_stock(stock, query)
         if message:
             st.info(message)
@@ -617,10 +623,11 @@ def main():
         else:
             sales["Πωλήθηκαν"] = sales["DeltaQty"].abs()
             report = (
-                sales.groupby(["CodeType", "CodeValue", "Μάρκα", "Προϊόν", "Τοποθεσία"], dropna=False)["Πωλήθηκαν"]
-                .sum()
-                .reset_index()
-                .sort_values("Πωλήθηκαν", ascending=False)
+                sales.groupby(
+                    ["CodeType", "CodeValue", "PCCode", "SerialNumber", "Μάρκα", "Προϊόν", "Τοποθεσία"],
+                    dropna=False,
+                )["Πωλήθηκαν"]
+                .sum().reset_index().sort_values("Πωλήθηκαν", ascending=False)
             )
             st.dataframe(report, use_container_width=True)
 
