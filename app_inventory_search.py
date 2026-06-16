@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 try:
     import pytesseract
@@ -436,11 +436,16 @@ def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
 
 
 def to_img(file):
-    data = np.frombuffer(file.getvalue(), np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None:
-        return None
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    try:
+        pil_image = Image.open(file).convert("RGB")
+        pil_image = ImageOps.exif_transpose(pil_image)
+        return np.array(pil_image)
+    except Exception:
+        data = np.frombuffer(file.getvalue(), np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
 def decoder_status() -> dict[str, str]:
@@ -537,30 +542,141 @@ def tesseract_status() -> dict[str, str]:
 
 
 def ocr_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return [("original_rgb", image), ("grayscale", gray), ("thresholded", thresholded)]
+    rgb = Image.fromarray(image).convert("RGB")
+    variants: list[tuple[str, Image.Image]] = [("rgb", rgb)]
+    for scale in (2, 3):
+        upscaled = rgb.resize((rgb.width * scale, rgb.height * scale), Image.Resampling.LANCZOS)
+        gray = upscaled.convert("L")
+        contrast = ImageEnhance.Contrast(gray).enhance(2.0)
+        sharp = contrast.filter(ImageFilter.SHARPEN)
+        thresholded = sharp.point(lambda px: 255 if px > 160 else 0)
+        variants.extend([
+            (f"{scale}x_rgb", upscaled),
+            (f"{scale}x_grayscale", gray),
+            (f"{scale}x_contrast", contrast),
+            (f"{scale}x_sharpened", sharp),
+            (f"{scale}x_thresholded", thresholded),
+        ])
+    return [(name, np.array(variant)) for name, variant in variants]
 
 
-def detect_product_name(image) -> tuple[str, list[str], dict[str, Any]]:
-    debug: dict[str, Any] = {"ocr": tesseract_status(), "attempts": [], "errors": [], "raw_values": []}
-    if image is None:
-        return "", [], debug
-    if debug["ocr"].get("available") != "yes":
-        return "", [], debug
-    lines: list[str] = []
+def _ocr_text_and_data(variant: np.ndarray) -> tuple[str, list[dict[str, Any]]]:
+    pil = Image.fromarray(variant)
+    text = pytesseract.image_to_string(pil, lang="ell+eng")
+    data = pytesseract.image_to_data(pil, lang="ell+eng", output_type=pytesseract.Output.DICT)
+    words = []
+    for i, word in enumerate(data.get("text", [])):
+        value = clean(word)
+        if not value:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except Exception:
+            conf = -1.0
+        words.append({
+            "text": value,
+            "conf": conf,
+            "left": int(data["left"][i]),
+            "top": int(data["top"][i]),
+            "width": int(data["width"][i]),
+            "height": int(data["height"][i]),
+        })
+    return text, words
+
+
+def _is_descriptive_line(line: str) -> bool:
+    lowered = line.lower()
+    excluded = ["tablet", "capsule", "δισκ", "καψ", "φαρμα", "εταιρ", "manufacturer", "ltd", "ae", "a.e."]
+    return any(token in lowered for token in excluded)
+
+
+def extract_front_fields(lines: list[str], words: list[dict[str, Any]]) -> dict[str, Any]:
+    import re
+    unique = list(dict.fromkeys([clean(line) for line in lines if clean(line)]))
+    joined = "\n".join(unique)
+    strength = ""
+    package_size = ""
+    dosage_form = ""
+    strength_match = re.search(r"\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|μg|g|ml|iu|%)\b", joined, re.I)
+    if strength_match:
+        strength = strength_match.group(0).replace(" ", " ")
+    package_match = re.search(r"\b(\d+)\s*(?:tabs?|tablets?|δισκ\w*|caps?|capsules?|καψ\w*)\b", joined, re.I)
+    if package_match:
+        package_size = package_match.group(1)
+    form_match = re.search(r"\b(tablets?|tabs?|capsules?|caps?|syrup|cream|spray|drops|δισκ\w*|καψ\w*|σιρόπι|κρέμα)\b", joined, re.I)
+    if form_match:
+        dosage_form = form_match.group(0)
+    scored = []
+    for idx, line in enumerate(unique[:8]):
+        if re.fullmatch(r"[\d\s.,]+(?:mg|mcg|μg|g|ml|iu|%)?", line, re.I):
+            continue
+        if package_match and package_match.group(0).lower() in line.lower():
+            continue
+        if _is_descriptive_line(line):
+            continue
+        alpha = len(re.findall(r"[A-Za-zΑ-Ωα-ω]", line))
+        if alpha < 3:
+            continue
+        matching = [w for w in words if w["text"] in line]
+        avg_height = sum(w["height"] for w in matching) / len(matching) if matching else 10
+        avg_conf = sum(w["conf"] for w in matching if w["conf"] >= 0) / max(1, len([w for w in matching if w["conf"] >= 0])) if matching else 0
+        score = (100 - idx * 10) + avg_height + alpha + avg_conf / 5
+        scored.append((score, line, avg_conf))
+    scored.sort(reverse=True)
+    product_name = scored[0][1] if scored else (unique[0] if unique else "")
+    brand = product_name.split()[0] if product_name else ""
+    confidence = round(scored[0][2], 1) if scored else None
+    return {
+        "product_name": product_name,
+        "brand": brand,
+        "strength": strength,
+        "dosage_form": dosage_form,
+        "package_size": package_size,
+        "candidate": product_name,
+        "confidence": confidence,
+    }
+
+
+def detect_product_name(image) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    debug: dict[str, Any] = {"ocr": tesseract_status(), "attempts": [], "errors": [], "raw_values": [], "raw_text": "", "variant_used": "", "selected_candidate": "", "confidence": None}
+    if image is None or debug["ocr"].get("available") != "yes":
+        return {}, [], debug
+    best: tuple[int, str, str, list[dict[str, Any]], list[str]] | None = None
     for variant_name, variant in ocr_variants(image):
         try:
-            text = pytesseract.image_to_string(Image.fromarray(variant), lang="ell+eng")
+            text, words = _ocr_text_and_data(variant)
             variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
+            score = len(variant_lines) + len(words)
             debug["attempts"].append(f"tesseract:{variant_name}:ok:{len(variant_lines)}")
             debug["raw_values"].extend(variant_lines)
-            lines.extend(variant_lines)
+            if best is None or score > best[0]:
+                best = (score, variant_name, text, words, variant_lines)
         except Exception as exc:
             debug["attempts"].append(f"tesseract:{variant_name}:failed")
             debug["errors"].append(f"tesseract {variant_name}: {exc}")
+    if best is None:
+        return {}, [], debug
+    _, variant_name, text, words, lines = best
+    fields = extract_front_fields(lines, words)
+    debug.update({"raw_text": text, "variant_used": variant_name, "selected_candidate": fields.get("candidate", ""), "confidence": fields.get("confidence")})
     unique_lines = list(dict.fromkeys(lines))
-    return (max(unique_lines, key=len), unique_lines, debug) if unique_lines else ("", [], debug)
+    return fields, unique_lines, debug
+
+
+def extract_back_fields(text: str) -> dict[str, str]:
+    import re
+    fields = {"pc_code": "", "serial_number": "", "lot_number": "", "expiry_date": ""}
+    patterns = {
+        "pc_code": r"(?:PC|P\.?C\.?|Product\s*Code)[:\s-]*([A-Z0-9-]{4,})",
+        "serial_number": r"(?:SN|S/N|Serial)[:\s-]*([A-Z0-9-]{4,})",
+        "lot_number": r"(?:LOT|Lot|Batch)[:\s-]*([A-Z0-9-]{2,})",
+        "expiry_date": r"(?:EXP|Expiry|ΛΗΞΗ)[:\s-]*(\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2})",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.I)
+        if match:
+            fields[key] = clean(match.group(1))
+    return fields
 
 
 @st.cache_resource(show_spinner=False)
@@ -619,7 +735,11 @@ def main():
         front_image = to_img(front_file) if front_file else None
         back_image = to_img(back_file) if back_file else None
         detected_type, detected_code, barcode_debug = detect_code(front_image, back_image)
-        detected_product, _, ocr_debug = detect_product_name(front_image)
+        front_suggestions, _, ocr_debug = detect_product_name(front_image)
+        _, _, back_ocr_debug = detect_product_name(back_image)
+        back_fields = extract_back_fields(back_ocr_debug.get("raw_text", ""))
+        detected_product = front_suggestions.get("product_name", "")
+        detected_brand = front_suggestions.get("brand", "")
 
         if detected_code:
             st.success(f"Βρέθηκε {detected_type}: {detected_code}")
@@ -627,9 +747,25 @@ def main():
             st.warning("Δεν διαβάστηκε barcode. Δοκίμασε πιο κοντινή και καθαρή φωτογραφία.")
 
         if detected_product:
-            st.info(f"Πρόταση OCR: {detected_product}")
+            st.info(f"Πρόταση OCR πρόσοψης: {detected_product}")
         elif front_image is not None and ocr_debug["ocr"].get("available") != "yes":
             st.warning("Το OCR δεν είναι διαθέσιμο. Δες τις λεπτομέρειες στο debug.")
+
+        if front_image is not None and front_suggestions:
+            with st.expander("Επεξεργάσιμες προτάσεις από OCR πρόσοψης", expanded=True):
+                suggested_product = st.text_input("Προτεινόμενο όνομα προϊόντος", value=front_suggestions.get("product_name", ""))
+                suggested_brand = st.text_input("Προτεινόμενη μάρκα", value=front_suggestions.get("brand", ""))
+                suggested_strength = st.text_input("Προτεινόμενη περιεκτικότητα", value=front_suggestions.get("strength", ""))
+                suggested_dosage_form = st.text_input("Προτεινόμενη μορφή", value=front_suggestions.get("dosage_form", ""))
+                suggested_package_size = st.text_input("Προτεινόμενο μέγεθος συσκευασίας", value=front_suggestions.get("package_size", ""))
+                extraction_confirmed = st.checkbox("Επιβεβαιώνω τις προτάσεις πριν την αποθήκευση")
+        else:
+            suggested_product = detected_product
+            suggested_brand = detected_brand
+            suggested_strength = ""
+            suggested_dosage_form = ""
+            suggested_package_size = ""
+            extraction_confirmed = front_image is None
 
         if front_image is not None or back_image is not None:
             with st.expander("Debug OCR / Barcode"):
@@ -640,7 +776,12 @@ def main():
                 st.write("OCR availability", ocr_debug.get("ocr"))
                 st.write("OCR attempts", ocr_debug.get("attempts"))
                 st.write("OCR failures", ocr_debug.get("errors"))
+                st.text_area("Raw OCR text from front image", value=ocr_debug.get("raw_text", ""), height=160)
+                st.write("Preprocessing variant used", ocr_debug.get("variant_used"))
+                st.write("Selected product name candidate", ocr_debug.get("selected_candidate"))
+                st.write("Confidence score", ocr_debug.get("confidence"))
                 st.write("OCR raw values", ocr_debug.get("raw_values"))
+                st.write("Back OCR extracted logistics", back_fields)
 
         code_type = st.selectbox(
             "Τύπος βασικού κωδικού", ["Barcode", "QR", "Other"],
@@ -648,10 +789,15 @@ def main():
         )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code)
         st.caption("Αν δεν διαβάζεται το QR, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
-        pc_code = st.text_input("PC code (προαιρετικό)")
-        serial_number = st.text_input("Serial Number / SN (προαιρετικό)")
-        brand = st.text_input("Μάρκα")
-        product = st.text_input("Όνομα προϊόντος", value=detected_product)
+        pc_code = st.text_input("PC code (προαιρετικό)", value=back_fields.get("pc_code", ""))
+        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=back_fields.get("serial_number", ""))
+        lot_number = st.text_input("Lot number (προαιρετικό)", value=back_fields.get("lot_number", ""))
+        expiry_date = st.text_input("Expiry date (προαιρετικό)", value=back_fields.get("expiry_date", ""))
+        brand = st.text_input("Μάρκα", value=suggested_brand)
+        product = st.text_input("Όνομα προϊόντος", value=suggested_product)
+        strength = st.text_input("Περιεκτικότητα", value=suggested_strength)
+        dosage_form = st.text_input("Μορφή", value=suggested_dosage_form)
+        package_size = st.text_input("Μέγεθος συσκευασίας", value=suggested_package_size)
         category = st.selectbox("Κατηγορία", CATEGORIES)
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
@@ -667,6 +813,8 @@ def main():
                 resolved_type, code_value, barcode = resolve_identity(
                     code_type, code_input, pc_code, serial_number
                 )
+                if front_image is not None and front_suggestions and not extraction_confirmed:
+                    raise InventoryError("Επιβεβαίωσε τις προτάσεις OCR πριν την αποθήκευση.")
                 if not clean(product):
                     raise InventoryError("Βάλε όνομα προϊόντος.")
                 delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
@@ -683,7 +831,14 @@ def main():
                     movement=movement,
                     quantity=int(quantity),
                     delta=delta,
-                    note=note,
+                    note=" | ".join(filter(None, [
+                        clean(note),
+                        f"strength={clean(strength)}" if clean(strength) else "",
+                        f"dosage_form={clean(dosage_form)}" if clean(dosage_form) else "",
+                        f"package_size={clean(package_size)}" if clean(package_size) else "",
+                        f"lot_number={clean(lot_number)}" if clean(lot_number) else "",
+                        f"expiry_date={clean(expiry_date)}" if clean(expiry_date) else "",
+                    ])),
                     transaction_id=st.session_state.pending_transaction_id,
                 )
                 status = append_stock_transaction(worksheet(), row)
