@@ -1,3 +1,4 @@
+import shutil
 import uuid
 from datetime import datetime
 from typing import Any
@@ -8,11 +9,24 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from PIL import Image
 
 try:
-    import easyocr
-except Exception:
-    easyocr = None
+    import pytesseract
+except Exception as exc:
+    pytesseract = None
+    PYTESSERACT_IMPORT_ERROR = exc
+else:
+    PYTESSERACT_IMPORT_ERROR = None
+
+try:
+    from pyzbar.pyzbar import ZBarSymbol, decode as pyzbar_decode
+except Exception as exc:
+    pyzbar_decode = None
+    ZBarSymbol = None
+    PYZBAR_IMPORT_ERROR = exc
+else:
+    PYZBAR_IMPORT_ERROR = None
 
 SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_NAME = "Apothiki_Cloud"
@@ -423,56 +437,130 @@ def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
 
 def to_img(file):
     data = np.frombuffer(file.getvalue(), np.uint8)
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
-
-
-def detect_code(front=None, back=None) -> tuple[str, str]:
-    for image in [back, front]:
-        if image is None:
-            continue
-        try:
-            detector = cv2.barcode.BarcodeDetector()
-            ok, values, _, _ = detector.detectAndDecode(image)
-            if ok and values:
-                for value in values:
-                    value = clean(value)
-                    if value.isdigit():
-                        return "Barcode", value
-        except Exception:
-            pass
-    for image in [back, front]:
-        if image is None:
-            continue
-        try:
-            value, _, _ = cv2.QRCodeDetector().detectAndDecode(image)
-            if clean(value):
-                return "QR", clean(value)
-        except Exception:
-            pass
-    return "Barcode", ""
-
-
-@st.cache_resource(show_spinner=False)
-def ocr_reader():
-    if easyocr is None:
-        return None
-    try:
-        return easyocr.Reader(["el", "en"], gpu=False)
-    except Exception:
-        return None
-
-
-def detect_product_name(image) -> tuple[str, list[str]]:
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
-        return "", []
-    reader = ocr_reader()
-    if reader is None:
-        return "", []
-    try:
-        lines = [clean(line) for line in reader.readtext(image, detail=0) if clean(line)]
-    except Exception:
-        return "", []
-    return (max(lines, key=len), lines) if lines else ("", [])
+        return None
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def decoder_status() -> dict[str, str]:
+    return {
+        "pyzbar": "available" if pyzbar_decode else f"failed: {PYZBAR_IMPORT_ERROR}",
+        "opencv_barcode": "available" if hasattr(cv2, "barcode") else "failed: cv2.barcode is not available",
+        "opencv_qr": "available" if hasattr(cv2, "QRCodeDetector") else "failed: cv2.QRCodeDetector is not available",
+    }
+
+
+def barcode_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    variants = [("original_rgb", image), ("grayscale", gray)]
+    for scale in (2, 3):
+        variants.append((f"resized_{scale}x", cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)))
+    _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(("thresholded", thresholded))
+    return variants
+
+
+def classify_pyzbar_type(kind: str) -> str:
+    if kind == "QRCODE":
+        return "QR"
+    return "Barcode" if kind in {"EAN13", "EAN8", "CODE128", "DATAMATRIX"} else "Other"
+
+
+def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
+    if pyzbar_decode is None:
+        raise RuntimeError(f"pyzbar unavailable: {PYZBAR_IMPORT_ERROR}")
+    symbols = None
+    if ZBarSymbol is not None:
+        wanted = ["EAN13", "EAN8", "CODE128", "QRCODE", "DATAMATRIX"]
+        symbols = [getattr(ZBarSymbol, name) for name in wanted if hasattr(ZBarSymbol, name)]
+    decoded = pyzbar_decode(Image.fromarray(image), symbols=symbols) if symbols else pyzbar_decode(Image.fromarray(image))
+    values = []
+    for item in decoded:
+        raw = item.data.decode("utf-8", errors="replace")
+        value = clean(raw)
+        if value:
+            values.append((classify_pyzbar_type(item.type), value, item.type))
+    return values
+
+
+def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
+    debug: dict[str, Any] = {"decoders": decoder_status(), "attempts": [], "errors": [], "raw_values": []}
+    for source, image in [("back", back), ("front", front)]:
+        if image is None:
+            continue
+        for variant_name, variant in barcode_variants(image):
+            try:
+                values = decode_with_pyzbar(variant)
+                debug["attempts"].append(f"pyzbar:{source}:{variant_name}:ok:{len(values)}")
+                for detected_type, value, raw_type in values:
+                    debug["raw_values"].append({"decoder": "pyzbar", "source": source, "variant": variant_name, "type": raw_type, "value": value})
+                    return detected_type, value, debug
+            except Exception as exc:
+                debug["attempts"].append(f"pyzbar:{source}:{variant_name}:failed")
+                debug["errors"].append(f"pyzbar {source} {variant_name}: {exc}")
+
+            try:
+                detector = cv2.barcode.BarcodeDetector()
+                bgr = cv2.cvtColor(variant, cv2.COLOR_RGB2BGR) if variant.ndim == 3 else variant
+                ok, values, _, _ = detector.detectAndDecode(bgr)
+                found = [clean(v) for v in values] if ok and values is not None else []
+                debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:ok:{len(found)}")
+                for value in found:
+                    if value:
+                        debug["raw_values"].append({"decoder": "opencv_barcode", "source": source, "variant": variant_name, "value": value})
+                        return ("Barcode" if value.isdigit() else "Other"), value, debug
+            except Exception as exc:
+                debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:failed")
+                debug["errors"].append(f"opencv_barcode {source} {variant_name}: {exc}")
+
+            try:
+                value, _, _ = cv2.QRCodeDetector().detectAndDecode(variant)
+                value = clean(value)
+                debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:ok:{1 if value else 0}")
+                if value:
+                    debug["raw_values"].append({"decoder": "opencv_qr", "source": source, "variant": variant_name, "value": value})
+                    return "QR", value, debug
+            except Exception as exc:
+                debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:failed")
+                debug["errors"].append(f"opencv_qr {source} {variant_name}: {exc}")
+    return "Barcode", "", debug
+
+
+def tesseract_status() -> dict[str, str]:
+    executable = shutil.which("tesseract")
+    if pytesseract is None:
+        return {"available": "no", "reason": f"pytesseract import failed: {PYTESSERACT_IMPORT_ERROR}"}
+    if not executable:
+        return {"available": "no", "reason": "tesseract executable was not found in PATH"}
+    return {"available": "yes", "executable": executable}
+
+
+def ocr_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return [("original_rgb", image), ("grayscale", gray), ("thresholded", thresholded)]
+
+
+def detect_product_name(image) -> tuple[str, list[str], dict[str, Any]]:
+    debug: dict[str, Any] = {"ocr": tesseract_status(), "attempts": [], "errors": [], "raw_values": []}
+    if image is None:
+        return "", [], debug
+    if debug["ocr"].get("available") != "yes":
+        return "", [], debug
+    lines: list[str] = []
+    for variant_name, variant in ocr_variants(image):
+        try:
+            text = pytesseract.image_to_string(Image.fromarray(variant), lang="ell+eng")
+            variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
+            debug["attempts"].append(f"tesseract:{variant_name}:ok:{len(variant_lines)}")
+            debug["raw_values"].extend(variant_lines)
+            lines.extend(variant_lines)
+        except Exception as exc:
+            debug["attempts"].append(f"tesseract:{variant_name}:failed")
+            debug["errors"].append(f"tesseract {variant_name}: {exc}")
+    unique_lines = list(dict.fromkeys(lines))
+    return (max(unique_lines, key=len), unique_lines, debug) if unique_lines else ("", [], debug)
 
 
 @st.cache_resource(show_spinner=False)
@@ -530,15 +618,29 @@ def main():
 
         front_image = to_img(front_file) if front_file else None
         back_image = to_img(back_file) if back_file else None
-        detected_type, detected_code = detect_code(front_image, back_image)
-        detected_product, _ = detect_product_name(front_image)
+        detected_type, detected_code, barcode_debug = detect_code(front_image, back_image)
+        detected_product, _, ocr_debug = detect_product_name(front_image)
 
         if detected_code:
             st.success(f"Βρέθηκε {detected_type}: {detected_code}")
+        elif front_image is not None or back_image is not None:
+            st.warning("Δεν διαβάστηκε barcode. Δοκίμασε πιο κοντινή και καθαρή φωτογραφία.")
+
         if detected_product:
             st.info(f"Πρόταση OCR: {detected_product}")
-        elif front_image is not None and ocr_reader() is None:
-            st.warning("Το OCR δεν είναι διαθέσιμο, αλλά η εφαρμογή συνεχίζει κανονικά.")
+        elif front_image is not None and ocr_debug["ocr"].get("available") != "yes":
+            st.warning("Το OCR δεν είναι διαθέσιμο. Δες τις λεπτομέρειες στο debug.")
+
+        if front_image is not None or back_image is not None:
+            with st.expander("Debug OCR / Barcode"):
+                st.write("Decoders", barcode_debug.get("decoders"))
+                st.write("Barcode attempts", barcode_debug.get("attempts"))
+                st.write("Barcode failures", barcode_debug.get("errors"))
+                st.write("Detected raw barcode values", barcode_debug.get("raw_values"))
+                st.write("OCR availability", ocr_debug.get("ocr"))
+                st.write("OCR attempts", ocr_debug.get("attempts"))
+                st.write("OCR failures", ocr_debug.get("errors"))
+                st.write("OCR raw values", ocr_debug.get("raw_values"))
 
         code_type = st.selectbox(
             "Τύπος βασικού κωδικού", ["Barcode", "QR", "Other"],

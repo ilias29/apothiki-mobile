@@ -3,7 +3,9 @@ pandas
 gspread
 google-auth
 openpyxl
-easyocr
+pillow
 opencv-python-headless
+pyzbar
+pytesseract
 numpy
 pytest
