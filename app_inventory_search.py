@@ -1096,8 +1096,10 @@ def worksheet():
             info["private_key"] = info["private_key"].replace("\\n", "\n")
         creds = Credentials.from_service_account_info(info, scopes=SCOPE)
         client = gspread.authorize(creds)
-        sheet = client.open(st.secrets.get("SHEET_NAME", SHEET_NAME))
-        ws = sheet.worksheet(WS_NAME)
+        sheet_name = st.secrets.get("SHEET_NAME", SHEET_NAME)
+        worksheet_name = st.secrets.get("WORKSHEET_NAME" , WS_NAME)
+        sheet = cleint.open(sheet_name)
+        ws = sheet.worksheet(worksheet_name)
         validate_and_migrate_headers(ws)
         return ws
     except (gspread.SpreadsheetNotFound, gspread.WorksheetNotFound):
