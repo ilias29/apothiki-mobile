@@ -1,3 +1,4 @@
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -541,30 +542,75 @@ def tesseract_status() -> dict[str, str]:
     return {"available": "yes", "executable": executable}
 
 
+def _crop_to_content(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 120)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    h, w = gray.shape[:2]
+    min_area = h * w * 0.08
+    candidates = [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= min_area]
+    if not candidates:
+        mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        points = cv2.findNonZero(mask)
+        if points is None:
+            return image
+        x, y, bw, bh = cv2.boundingRect(points)
+    else:
+        x, y, bw, bh = max(candidates, key=lambda box: box[2] * box[3])
+    pad = max(8, int(min(w, h) * 0.02))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+    if (x1 - x0) < w * 0.25 or (y1 - y0) < h * 0.25:
+        return image
+    return image[y0:y1, x0:x1]
+
+
+def _clahe(gray: np.ndarray) -> np.ndarray:
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+
+def _sharpen(gray: np.ndarray) -> np.ndarray:
+    blurred = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    return cv2.addWeighted(gray, 1.6, blurred, -0.6, 0)
+
+
+def _adaptive_threshold(gray: np.ndarray) -> np.ndarray:
+    return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+
+
+def _otsu_threshold(gray: np.ndarray) -> np.ndarray:
+    return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+
 def ocr_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    rgb = Image.fromarray(image).convert("RGB")
-    variants: list[tuple[str, Image.Image]] = [("rgb", rgb)]
-    for scale in (2, 3):
-        upscaled = rgb.resize((rgb.width * scale, rgb.height * scale), Image.Resampling.LANCZOS)
-        gray = upscaled.convert("L")
-        contrast = ImageEnhance.Contrast(gray).enhance(2.0)
-        sharp = contrast.filter(ImageFilter.SHARPEN)
-        thresholded = sharp.point(lambda px: 255 if px > 160 else 0)
-        variants.extend([
-            (f"{scale}x_rgb", upscaled),
-            (f"{scale}x_grayscale", gray),
-            (f"{scale}x_contrast", contrast),
-            (f"{scale}x_sharpened", sharp),
-            (f"{scale}x_thresholded", thresholded),
-        ])
-    return [(name, np.array(variant)) for name, variant in variants]
+    base = _crop_to_content(image)
+    variants: list[tuple[str, np.ndarray]] = []
+    for rotation in (0, 90, 180, 270):
+        rotated = np.array(Image.fromarray(base).rotate(rotation, expand=True)) if rotation else base
+        for scale in (2, 3, 4):
+            upscaled = cv2.resize(rotated, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            gray = cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY) if upscaled.ndim == 3 else upscaled
+            clahe = _clahe(gray)
+            sharp = _sharpen(clahe)
+            variants.extend([
+                (f"rot{rotation}_{scale}x_rgb", upscaled),
+                (f"rot{rotation}_{scale}x_gray", gray),
+                (f"rot{rotation}_{scale}x_clahe", clahe),
+                (f"rot{rotation}_{scale}x_sharpen", sharp),
+                (f"rot{rotation}_{scale}x_adaptive", _adaptive_threshold(sharp)),
+                (f"rot{rotation}_{scale}x_otsu", _otsu_threshold(sharp)),
+            ])
+    return variants
 
 
-def _ocr_text_and_data(variant: np.ndarray) -> tuple[str, list[dict[str, Any]]]:
+def _ocr_text_and_data(variant: np.ndarray, psm: int) -> tuple[str, list[dict[str, Any]], float | None]:
     pil = Image.fromarray(variant)
-    text = pytesseract.image_to_string(pil, lang="ell+eng")
-    data = pytesseract.image_to_data(pil, lang="ell+eng", output_type=pytesseract.Output.DICT)
+    config = f"--psm {psm}"
+    text = pytesseract.image_to_string(pil, lang="ell+eng", config=config)
+    data = pytesseract.image_to_data(pil, lang="ell+eng", config=config, output_type=pytesseract.Output.DICT)
     words = []
+    confidences = []
     for i, word in enumerate(data.get("text", [])):
         value = clean(word)
         if not value:
@@ -573,6 +619,8 @@ def _ocr_text_and_data(variant: np.ndarray) -> tuple[str, list[dict[str, Any]]]:
             conf = float(data["conf"][i])
         except Exception:
             conf = -1.0
+        if conf >= 0:
+            confidences.append(conf)
         words.append({
             "text": value,
             "conf": conf,
@@ -581,17 +629,27 @@ def _ocr_text_and_data(variant: np.ndarray) -> tuple[str, list[dict[str, Any]]]:
             "width": int(data["width"][i]),
             "height": int(data["height"][i]),
         })
-    return text, words
+    avg_conf = round(sum(confidences) / len(confidences), 1) if confidences else None
+    return text, words, avg_conf
+
+
+def _ocr_score(text: str, words: list[dict[str, Any]], avg_conf: float | None) -> tuple[int, float, int]:
+    alpha = len(re.findall(r"[A-Za-zΑ-Ωα-ω]", text))
+    valid_words = [w["text"] for w in words if len(re.findall(r"[A-Za-zΑ-Ωα-ω]", w["text"])) >= 2]
+    numeric_penalty = len(re.findall(r"\d", text))
+    return (alpha + len(valid_words) * 8 - numeric_penalty // 3, avg_conf or 0.0, len(valid_words))
 
 
 def _is_descriptive_line(line: str) -> bool:
     lowered = line.lower()
-    excluded = ["tablet", "capsule", "δισκ", "καψ", "φαρμα", "εταιρ", "manufacturer", "ltd", "ae", "a.e."]
+    excluded = [
+        "tablet", "capsule", "δισκ", "καψ", "φαρμα", "εταιρ", "manufacturer",
+        "ltd", "ae", "a.e.", "ενδει", "χρήση", "περιέχει", "σύνθεση", "expiry", "exp",
+    ]
     return any(token in lowered for token in excluded)
 
 
 def extract_front_fields(lines: list[str], words: list[dict[str, Any]]) -> dict[str, Any]:
-    import re
     unique = list(dict.fromkeys([clean(line) for line in lines if clean(line)]))
     joined = "\n".join(unique)
     strength = ""
@@ -599,69 +657,67 @@ def extract_front_fields(lines: list[str], words: list[dict[str, Any]]) -> dict[
     dosage_form = ""
     strength_match = re.search(r"\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|μg|g|ml|iu|%)\b", joined, re.I)
     if strength_match:
-        strength = strength_match.group(0).replace(" ", " ")
+        strength = strength_match.group(0)
     package_match = re.search(r"\b(\d+)\s*(?:tabs?|tablets?|δισκ\w*|caps?|capsules?|καψ\w*)\b", joined, re.I)
     if package_match:
-        package_size = package_match.group(1)
+        package_size = package_match.group(0)
     form_match = re.search(r"\b(tablets?|tabs?|capsules?|caps?|syrup|cream|spray|drops|δισκ\w*|καψ\w*|σιρόπι|κρέμα)\b", joined, re.I)
     if form_match:
         dosage_form = form_match.group(0)
     scored = []
-    for idx, line in enumerate(unique[:8]):
-        if re.fullmatch(r"[\d\s.,]+(?:mg|mcg|μg|g|ml|iu|%)?", line, re.I):
+    for idx, line in enumerate(unique[:12]):
+        if re.search(r"\b(?:exp|lot|sn|pc)\b|\d{1,2}[./-]\d{2,4}|\b\d{8,}\b", line, re.I):
             continue
-        if package_match and package_match.group(0).lower() in line.lower():
+        if re.fullmatch(r"[\d\s.,/:-]+(?:mg|mcg|μg|g|ml|iu|%)?", line, re.I):
             continue
         if _is_descriptive_line(line):
             continue
         alpha = len(re.findall(r"[A-Za-zΑ-Ωα-ω]", line))
         if alpha < 3:
             continue
+        upper_bonus = 25 if line == line.upper() else 0
         matching = [w for w in words if w["text"] in line]
-        avg_height = sum(w["height"] for w in matching) / len(matching) if matching else 10
+        top = min((w["top"] for w in matching), default=idx * 100)
         avg_conf = sum(w["conf"] for w in matching if w["conf"] >= 0) / max(1, len([w for w in matching if w["conf"] >= 0])) if matching else 0
-        score = (100 - idx * 10) + avg_height + alpha + avg_conf / 5
+        score = 180 - idx * 12 - top / 20 + upper_bonus + alpha * 2 + avg_conf / 3
         scored.append((score, line, avg_conf))
     scored.sort(reverse=True)
-    product_name = scored[0][1] if scored else (unique[0] if unique else "")
+    product_name = scored[0][1] if scored else ""
     brand = product_name.split()[0] if product_name else ""
     confidence = round(scored[0][2], 1) if scored else None
-    return {
-        "product_name": product_name,
-        "brand": brand,
-        "strength": strength,
-        "dosage_form": dosage_form,
-        "package_size": package_size,
-        "candidate": product_name,
-        "confidence": confidence,
-    }
+    return {"product_name": product_name, "brand": brand, "strength": strength, "dosage_form": dosage_form, "package_size": package_size, "candidate": product_name, "confidence": confidence}
 
 
 def detect_product_name(image) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
-    debug: dict[str, Any] = {"ocr": tesseract_status(), "attempts": [], "errors": [], "raw_values": [], "raw_text": "", "variant_used": "", "selected_candidate": "", "confidence": None}
+    debug: dict[str, Any] = {"ocr": tesseract_status(), "language": "ell+eng", "psm_modes": [6, 11, 12], "attempts": [], "errors": [], "raw_values": [], "raw_text": "", "variant_used": "", "selected_candidate": "", "confidence": None, "variant_results": []}
     if image is None or debug["ocr"].get("available") != "yes":
         return {}, [], debug
-    best: tuple[int, str, str, list[dict[str, Any]], list[str]] | None = None
+    best: tuple[tuple[int, float, int], str, int, str, list[dict[str, Any]], list[str], float | None] | None = None
     for variant_name, variant in ocr_variants(image):
-        try:
-            text, words = _ocr_text_and_data(variant)
-            variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
-            score = len(variant_lines) + len(words)
-            debug["attempts"].append(f"tesseract:{variant_name}:ok:{len(variant_lines)}")
-            debug["raw_values"].extend(variant_lines)
-            if best is None or score > best[0]:
-                best = (score, variant_name, text, words, variant_lines)
-        except Exception as exc:
-            debug["attempts"].append(f"tesseract:{variant_name}:failed")
-            debug["errors"].append(f"tesseract {variant_name}: {exc}")
+        for psm in (6, 11, 12):
+            label = f"{variant_name}_psm{psm}"
+            try:
+                text, words, avg_conf = _ocr_text_and_data(variant, psm)
+                variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
+                empty = not clean(text)
+                score = _ocr_score(text, words, avg_conf)
+                debug["attempts"].append(f"tesseract:{label}:ok:{len(variant_lines)}:empty={empty}:conf={avg_conf}")
+                debug["variant_results"].append({"variant": variant_name, "psm": psm, "empty": empty, "confidence": avg_conf, "score": score, "raw_text": text})
+                debug["raw_values"].extend(variant_lines)
+                if best is None or score > best[0]:
+                    best = (score, variant_name, psm, text, words, variant_lines, avg_conf)
+            except Exception as exc:
+                debug["attempts"].append(f"tesseract:{label}:failed")
+                debug["errors"].append(f"tesseract {label}: {exc}")
     if best is None:
         return {}, [], debug
-    _, variant_name, text, words, lines = best
+    _, variant_name, psm, text, words, lines, avg_conf = best
     fields = extract_front_fields(lines, words)
-    debug.update({"raw_text": text, "variant_used": variant_name, "selected_candidate": fields.get("candidate", ""), "confidence": fields.get("confidence")})
+    if not fields.get("confidence"):
+        fields["confidence"] = avg_conf
+    debug.update({"raw_text": text, "variant_used": f"{variant_name}_psm{psm}", "selected_candidate": fields.get("candidate", ""), "confidence": fields.get("confidence")})
     unique_lines = list(dict.fromkeys(lines))
     return fields, unique_lines, debug
-
 
 def extract_back_fields(text: str) -> dict[str, str]:
     import re
@@ -758,6 +814,9 @@ def main():
                 suggested_strength = st.text_input("Προτεινόμενη περιεκτικότητα", value=front_suggestions.get("strength", ""))
                 suggested_dosage_form = st.text_input("Προτεινόμενη μορφή", value=front_suggestions.get("dosage_form", ""))
                 suggested_package_size = st.text_input("Προτεινόμενο μέγεθος συσκευασίας", value=front_suggestions.get("package_size", ""))
+                if not clean(suggested_product) and clean(ocr_debug.get("raw_text", "")):
+                    st.info("Δεν βρέθηκε δομημένο όνομα προϊόντος, αλλά υπάρχει raw OCR κείμενο. Αντέγραψε ή γράψε χειροκίνητα το σωστό όνομα.")
+                    st.text_area("Raw OCR για χειροκίνητη επιλογή ονόματος", value=ocr_debug.get("raw_text", ""), height=140)
                 extraction_confirmed = st.checkbox("Επιβεβαιώνω τις προτάσεις πριν την αποθήκευση")
         else:
             suggested_product = detected_product
@@ -774,12 +833,37 @@ def main():
                 st.write("Barcode failures", barcode_debug.get("errors"))
                 st.write("Detected raw barcode values", barcode_debug.get("raw_values"))
                 st.write("OCR availability", ocr_debug.get("ocr"))
+                st.write("OCR language", ocr_debug.get("language"))
+                st.write("OCR PSM modes", ocr_debug.get("psm_modes"))
                 st.write("OCR attempts", ocr_debug.get("attempts"))
                 st.write("OCR failures", ocr_debug.get("errors"))
-                st.text_area("Raw OCR text from front image", value=ocr_debug.get("raw_text", ""), height=160)
-                st.write("Preprocessing variant used", ocr_debug.get("variant_used"))
+                st.text_area("Best raw OCR text from front image", value=ocr_debug.get("raw_text", ""), height=160)
+                st.write("Selected best variant", ocr_debug.get("variant_used"))
                 st.write("Selected product name candidate", ocr_debug.get("selected_candidate"))
-                st.write("Confidence score", ocr_debug.get("confidence"))
+                st.write("OCR confidence", ocr_debug.get("confidence"))
+                variant_results = ocr_debug.get("variant_results", [])
+                if variant_results:
+                    st.dataframe(pd.DataFrame([
+                        {
+                            "variant": item.get("variant"),
+                            "psm": item.get("psm"),
+                            "empty_text": item.get("empty"),
+                            "confidence": item.get("confidence"),
+                            "score": item.get("score"),
+                            "chars": len(item.get("raw_text", "")),
+                        }
+                        for item in variant_results
+                    ]), use_container_width=True)
+                    selected_debug_variant = st.selectbox(
+                        "Raw OCR text ανά preprocessing variant",
+                        list(range(len(variant_results))),
+                        format_func=lambda i: f"{variant_results[i].get('variant')} / psm {variant_results[i].get('psm')} / empty={variant_results[i].get('empty')}",
+                    )
+                    st.text_area(
+                        "Raw OCR text selected variant",
+                        value=variant_results[selected_debug_variant].get("raw_text", ""),
+                        height=180,
+                    )
                 st.write("OCR raw values", ocr_debug.get("raw_values"))
                 st.write("Back OCR extracted logistics", back_fields)
 
