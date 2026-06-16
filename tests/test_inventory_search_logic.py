@@ -230,3 +230,43 @@ def test_search_includes_gtin_lot_and_raw_datamatrix():
     assert len(app.search_stock(stock, "01234567890128")[0]) == 1
     assert len(app.search_stock(stock, "LOT123")[0]) == 1
     assert len(app.search_stock(stock, "260630")[0]) == 1
+
+
+def test_expiry_status_rules_and_semester_labels():
+    today = pd.Timestamp("2026-06-16").date()
+    assert app.expiry_status("2026-06-15", today) == "expired"
+    assert app.expiry_status("2026-07-16", today) == "expiring_soon"
+    assert app.expiry_status("2026-09-14", today) == "expiring_soon"
+    assert app.expiry_status("2026-09-15", today) == "valid"
+    assert app.expiry_status("", today) == "without_expiry"
+    assert app.expiry_semester("2026-06-30") == "A εξάμηνο 2026"
+    assert app.expiry_semester("2026-07-01") == "B εξάμηνο 2026"
+
+
+def test_stock_table_adds_expiry_alert_columns():
+    row = base_row(ExpiryDate="2026-07-31")
+    stock = app.stock_table(app.records_to_dataframe([row]))
+    enriched = app.add_expiry_columns(stock, pd.Timestamp("2026-06-16").date())
+    assert stock.iloc[0]["ExpiryDate"] == "2026-07-31"
+    assert enriched.iloc[0]["ExpiryStatus"] == "expiring_soon"
+    assert enriched.iloc[0]["Semester"] == "B εξάμηνο 2026"
+    assert "Λήγει σε" in enriched.iloc[0]["ExpiryWarning"]
+
+
+def test_expiry_reports_return_requested_buckets():
+    today = pd.Timestamp("2026-06-16").date()
+    rows = [
+        base_row(TransactionId="expired", CodeValue="1", ExpiryDate="2026-06-15"),
+        base_row(TransactionId="soon30", CodeValue="2", ExpiryDate="2026-07-01"),
+        base_row(TransactionId="soon90", CodeValue="3", ExpiryDate="2026-09-14"),
+        base_row(TransactionId="valid", CodeValue="4", ExpiryDate="2026-12-31"),
+        base_row(TransactionId="missing", CodeValue="5", ExpiryDate=""),
+    ]
+    stock = app.stock_table(app.records_to_dataframe(rows))
+    reports = app.expiry_reports(stock, today)
+    assert len(reports["expired products"]) == 1
+    assert len(reports["expiring in 30 days"]) == 1
+    assert len(reports["expiring in 90 days"]) == 2
+    assert len(reports["A εξάμηνο"]) == 1
+    assert len(reports["B εξάμηνο"]) == 3
+    assert len(reports["products without expiry date"]) == 1

@@ -4,7 +4,7 @@ import calendar
 import shutil
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 import requests
@@ -461,7 +461,8 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
 def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     output_columns = [
         "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber",
-        "LotNumber", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία",
+        "LotNumber", "ExpiryDate", "ExpiryStatus", "ExpiryWarning", "Semester",
+        "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία",
         "Strength", "DosageForm", "PackageSize", "Αποθήκη", "Κύριο Κτήριο",
         "Πρώτος Όροφος", "Σύνολο",
     ]
@@ -475,7 +476,7 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     latest = (
         data.sort_values("Timestamp_dt")
         .groupby(identity, dropna=False)
-        .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm", "PackageSize"]]
+        .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm", "PackageSize"]]
     )
     grouped = data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"].sum().reset_index()
     pivot = grouped.pivot_table(
@@ -486,10 +487,71 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
         if column not in pivot.columns:
             pivot[column] = 0
     pivot["Σύνολο"] = pivot["Αποθήκη"] + pivot["Κύριο Κτήριο"] + pivot["Πρώτος Όροφος"]
-    return (
-        pivot.merge(latest, on=identity, how="left")
-        .sort_values("Σύνολο", ascending=False)[output_columns]
-    )
+    stock = pivot.merge(latest, on=identity, how="left").sort_values("Σύνολο", ascending=False)
+    stock = add_expiry_columns(stock)
+    return stock[output_columns]
+
+
+def expiry_semester(expiry: Any) -> str:
+    expiry_dt = pd.to_datetime(clean(expiry), errors="coerce")
+    if pd.isna(expiry_dt):
+        return ""
+    label = "A" if expiry_dt.month <= 6 else "B"
+    return f"{label} εξάμηνο {expiry_dt.year}"
+
+
+def expiry_status(expiry: Any, today: date | None = None) -> str:
+    today = today or date.today()
+    expiry_dt = pd.to_datetime(clean(expiry), errors="coerce")
+    if pd.isna(expiry_dt):
+        return "without_expiry"
+    expiry_date = expiry_dt.date()
+    days = (expiry_date - today).days
+    if days < 0:
+        return "expired"
+    if days <= 90:
+        return "expiring_soon"
+    return "valid"
+
+
+def expiry_warning(expiry: Any, today: date | None = None) -> str:
+    today = today or date.today()
+    status = expiry_status(expiry, today)
+    if status == "without_expiry":
+        return "⚪ Χωρίς ημερομηνία λήξης"
+    expiry_dt = pd.to_datetime(clean(expiry), errors="coerce").date()
+    days = (expiry_dt - today).days
+    if status == "expired":
+        return f"🔴 Έληξε στις {expiry_dt:%Y-%m-%d}"
+    if status == "expiring_soon":
+        return f"🟠 Λήγει σε {days} ημέρες ({expiry_dt:%Y-%m-%d})"
+    return f"🟢 Ισχύει έως {expiry_dt:%Y-%m-%d}"
+
+
+def add_expiry_columns(stock: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
+    output = stock.copy()
+    if "ExpiryDate" not in output.columns:
+        output["ExpiryDate"] = ""
+    output["ExpiryStatus"] = output["ExpiryDate"].map(lambda value: expiry_status(value, today))
+    output["ExpiryWarning"] = output["ExpiryDate"].map(lambda value: expiry_warning(value, today))
+    output["Semester"] = output["ExpiryDate"].map(expiry_semester)
+    return output
+
+
+def expiry_reports(stock: pd.DataFrame, today: date | None = None) -> dict[str, pd.DataFrame]:
+    today = today or date.today()
+    stock = add_expiry_columns(stock, today)
+    expiry_dates = pd.to_datetime(stock["ExpiryDate"].replace("", pd.NA), errors="coerce").dt.date
+    in_30 = expiry_dates.notna() & (expiry_dates >= today) & (expiry_dates <= today + pd.Timedelta(days=30))
+    in_90 = expiry_dates.notna() & (expiry_dates >= today) & (expiry_dates <= today + pd.Timedelta(days=90))
+    return {
+        "expired products": stock[stock["ExpiryStatus"].eq("expired")],
+        "expiring in 30 days": stock[in_30],
+        "expiring in 90 days": stock[in_90],
+        "A εξάμηνο": stock[stock["Semester"].str.startswith("A εξάμηνο", na=False)],
+        "B εξάμηνο": stock[stock["Semester"].str.startswith("B εξάμηνο", na=False)],
+        "products without expiry date": stock[stock["ExpiryStatus"].eq("without_expiry")],
+    }
 
 
 def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
@@ -1060,8 +1122,8 @@ def main():
     st.title("📦 Αποθήκη Φαρμακείου")
     st.caption("Barcode/QR, fallback PC/SN, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων.")
 
-    entry_tab, search_tab, sales_tab, data_tab, reversal_tab = st.tabs(
-        ["➕ Καταχώρηση", "🔎 Search", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
+    entry_tab, search_tab, reports_tab, sales_tab, data_tab, reversal_tab = st.tabs(
+        ["➕ Καταχώρηση", "🔎 Search", "⚠️ Λήξεις / Reports", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
     )
 
     with entry_tab:
@@ -1303,7 +1365,55 @@ def main():
         results, message = search_stock(stock, query)
         if message:
             st.info(message)
+        if not results.empty:
+            warning_counts = results["ExpiryStatus"].value_counts().to_dict() if "ExpiryStatus" in results else {}
+            if warning_counts.get("expired", 0):
+                st.error(f"{warning_counts['expired']} προϊόν(τα) έχουν λήξει.")
+            if warning_counts.get("expiring_soon", 0):
+                st.warning(f"{warning_counts['expiring_soon']} προϊόν(τα) λήγουν μέσα στις επόμενες 90 ημέρες.")
+            if warning_counts.get("without_expiry", 0):
+                st.info(f"{warning_counts['without_expiry']} προϊόν(τα) δεν έχουν ημερομηνία λήξης.")
+            for _, row in results.head(12).iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{row.get('Προϊόν', '') or 'Χωρίς όνομα'}**")
+                    st.caption(f"{row.get('Μάρκα', '')} | {row.get('Κατηγορία', '')} | {row.get('CodeType', '')}: {row.get('CodeValue', '')}")
+                    status = row.get("ExpiryStatus", "")
+                    warning = row.get("ExpiryWarning", "")
+                    if status == "expired":
+                        st.error(warning)
+                    elif status == "expiring_soon":
+                        st.warning(warning)
+                    elif status == "without_expiry":
+                        st.info(warning)
+                    else:
+                        st.success(warning)
+                    st.write(
+                        f"Stock: {row.get('Σύνολο', 0)} | Lot: {row.get('LotNumber', '')} | "
+                        f"Εξάμηνο: {row.get('Semester', '') or '-'}"
+                    )
         st.dataframe(results, use_container_width=True)
+
+    with reports_tab:
+        data, unknown = load_data(worksheet())
+        if unknown:
+            st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
+        stock = stock_table(data)
+        reports = expiry_reports(stock)
+        labels = {
+            "expired products": "Expired products",
+            "expiring in 30 days": "Expiring in 30 days",
+            "expiring in 90 days": "Expiring in 90 days",
+            "A εξάμηνο": "A εξάμηνο",
+            "B εξάμηνο": "B εξάμηνο",
+            "products without expiry date": "Products without expiry date",
+        }
+        report_key = st.selectbox("Report", list(labels), format_func=lambda key: labels[key])
+        selected = reports[report_key]
+        st.metric("Προϊόντα", len(selected))
+        if selected.empty:
+            st.info("Δεν υπάρχουν προϊόντα για αυτό το report.")
+        else:
+            st.dataframe(selected, use_container_width=True)
 
     with sales_tab:
         data, _ = load_data(worksheet())
