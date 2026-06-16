@@ -1111,14 +1111,10 @@ def worksheet():
     except SchemaError as exc:
         st.error(str(exc))
         st.stop()
-    except Exception:
-        st.error(
-            "Αποτυχία σύνδεσης με το Google Sheets. Έλεγξε τα secrets, "
-            "την κοινή χρήση του Sheet και τη σύνδεση."
-        )
+    except Exception as exc:
+        st.error(f"Σφάλμα Goodle Sheets:{type(exc)._name_}: {exc}"
+                )
         st.stop()
-
-
 def main():
     st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη Φαρμακείου")
