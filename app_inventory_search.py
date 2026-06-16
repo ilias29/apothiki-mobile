@@ -1,10 +1,13 @@
 import hashlib
 import re
+import calendar
 import shutil
 import time
 import uuid
 from datetime import datetime
 from typing import Any
+
+import requests
 
 import cv2
 import gspread
@@ -50,7 +53,17 @@ COLUMNS = [
     "CodeValue",
     "Barcode",
     "PCCode",
+    "GTIN",
     "SerialNumber",
+    "LotNumber",
+    "ExpiryDate",
+    "QRRawData",
+    "DataMatrixRawData",
+    "LookupSource",
+    "LookupTimestamp",
+    "Strength",
+    "DosageForm",
+    "PackageSize",
     "Μάρκα",
     "Προϊόν",
     "Κατηγορία",
@@ -173,7 +186,17 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
         "CodeValue",
         "Barcode",
         "PCCode",
+        "GTIN",
         "SerialNumber",
+        "LotNumber",
+        "ExpiryDate",
+        "QRRawData",
+        "DataMatrixRawData",
+        "LookupSource",
+        "LookupTimestamp",
+        "Strength",
+        "DosageForm",
+        "PackageSize",
         "VoidOf",
         "MovementKind",
     ]
@@ -275,7 +298,17 @@ def make_transaction(
     quantity: int,
     delta: int,
     pc_code: str = "",
+    gtin: str = "",
     serial_number: str = "",
+    lot_number: str = "",
+    expiry_date: str = "",
+    qr_raw_data: str = "",
+    datamatrix_raw_data: str = "",
+    lookup_source: str = "",
+    lookup_timestamp: str = "",
+    strength: str = "",
+    dosage_form: str = "",
+    package_size: str = "",
     note: str = "",
     transaction_id: str | None = None,
     void_of: str = "",
@@ -290,7 +323,17 @@ def make_transaction(
         "CodeValue": clean(code_value),
         "Barcode": clean(barcode),
         "PCCode": clean(pc_code),
+        "GTIN": clean(gtin),
         "SerialNumber": clean(serial_number),
+        "LotNumber": clean(lot_number),
+        "ExpiryDate": clean(expiry_date),
+        "QRRawData": clean(qr_raw_data),
+        "DataMatrixRawData": clean(datamatrix_raw_data),
+        "LookupSource": clean(lookup_source),
+        "LookupTimestamp": clean(lookup_timestamp),
+        "Strength": clean(strength),
+        "DosageForm": clean(dosage_form),
+        "PackageSize": clean(package_size),
         "Μάρκα": clean(brand),
         "Προϊόν": clean(product),
         "Κατηγορία": clean(category),
@@ -343,7 +386,17 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             code_value=row["CodeValue"],
             barcode=row["Barcode"],
             pc_code=row.get("PCCode", ""),
+            gtin=row.get("GTIN", ""),
             serial_number=row.get("SerialNumber", ""),
+            lot_number=row.get("LotNumber", ""),
+            expiry_date=row.get("ExpiryDate", ""),
+            qr_raw_data=row.get("QRRawData", ""),
+            datamatrix_raw_data=row.get("DataMatrixRawData", ""),
+            lookup_source=row.get("LookupSource", ""),
+            lookup_timestamp=row.get("LookupTimestamp", ""),
+            strength=row.get("Strength", ""),
+            dosage_form=row.get("DosageForm", ""),
+            package_size=row.get("PackageSize", ""),
             brand=row["Μάρκα"],
             product=row["Προϊόν"],
             category=row["Κατηγορία"],
@@ -379,7 +432,17 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
         code_value=original["CodeValue"],
         barcode=original["Barcode"],
         pc_code=original.get("PCCode", ""),
+        gtin=original.get("GTIN", ""),
         serial_number=original.get("SerialNumber", ""),
+        lot_number=original.get("LotNumber", ""),
+        expiry_date=original.get("ExpiryDate", ""),
+        qr_raw_data=original.get("QRRawData", ""),
+        datamatrix_raw_data=original.get("DataMatrixRawData", ""),
+        lookup_source=original.get("LookupSource", ""),
+        lookup_timestamp=original.get("LookupTimestamp", ""),
+        strength=original.get("Strength", ""),
+        dosage_form=original.get("DosageForm", ""),
+        package_size=original.get("PackageSize", ""),
         brand=original["Μάρκα"],
         product=original["Προϊόν"],
         category=original["Κατηγορία"],
@@ -397,8 +460,9 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
 
 def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     output_columns = [
-        "CodeType", "CodeValue", "Barcode", "PCCode", "SerialNumber",
-        "Μάρκα", "Προϊόν", "Κατηγορία", "Αποθήκη", "Κύριο Κτήριο",
+        "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber",
+        "LotNumber", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία",
+        "Strength", "DosageForm", "PackageSize", "Αποθήκη", "Κύριο Κτήριο",
         "Πρώτος Όροφος", "Σύνολο",
     ]
     data = active_movements(df)
@@ -411,7 +475,7 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     latest = (
         data.sort_values("Timestamp_dt")
         .groupby(identity, dropna=False)
-        .tail(1)[identity + ["Barcode", "PCCode", "SerialNumber", "Μάρκα", "Προϊόν", "Κατηγορία"]]
+        .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm", "PackageSize"]]
     )
     grouped = data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"].sum().reset_index()
     pivot = grouped.pivot_table(
@@ -432,13 +496,13 @@ def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
     query = clean(query).lower()
     if not query or stock.empty:
         return stock, ""
-    searchable = ["CodeValue", "Barcode", "PCCode", "SerialNumber", "Μάρκα", "Προϊόν", "Κατηγορία"]
+    searchable = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "PCCode", "SerialNumber", "LotNumber", "QRRawData", "DataMatrixRawData", "CodeValue", "Κατηγορία"]
     mask = pd.Series(False, index=stock.index)
     for column in searchable:
         mask |= stock[column].astype(str).str.lower().str.contains(query, na=False, regex=False)
     matches = stock[mask]
     if not matches.empty:
-        return matches, "Βρέθηκε με κωδικό, PC, SN, μάρκα ή όνομα"
+        return matches, "Βρέθηκε με όνομα, μάρκα, barcode, GTIN, PC, SN, lot ή raw QR/DataMatrix"
     return stock.iloc[0:0], "Δεν βρέθηκε αποτέλεσμα"
 
 
@@ -515,7 +579,9 @@ def barcode_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
 def classify_pyzbar_type(kind: str) -> str:
     if kind == "QRCODE":
         return "QR"
-    return "Barcode" if kind in {"EAN13", "EAN8", "CODE128", "DATAMATRIX"} else "Other"
+    if kind == "DATAMATRIX":
+        return "DataMatrix"
+    return "Barcode" if kind in {"EAN13", "EAN8", "CODE128"} else "Other"
 
 
 def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
@@ -786,9 +852,9 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
     detected_type, detected_code, barcode_debug = detect_code(front_image, back_image)
     st.session_state.barcode_result = {"type": detected_type, "value": detected_code, "debug": barcode_debug}
 
-    progress.progress(35, text="Reading front text")
-    front_deadline = time.monotonic() + FRONT_OCR_TIMEOUT_SECONDS
-    front_fields, front_lines, front_debug = detect_product_name(front_image, deadline=front_deadline)
+    progress.progress(35, text="Skipping front OCR")
+    front_fields, front_lines, front_debug = {}, [], _empty_ocr_debug()
+    front_debug["skipped"] = "front_image_ocr_requires_manual_entry"
     st.session_state.front_ocr_result = {"fields": front_fields, "lines": front_lines, "debug": front_debug}
 
     progress.progress(70, text="Reading back codes")
@@ -829,6 +895,132 @@ def extract_back_fields(text: str) -> dict[str, str]:
         if match:
             fields[key] = clean(match.group(1))
     return fields
+
+
+def parse_expiry_date(value: str) -> str:
+    value = clean(value)
+    if not value:
+        return ""
+    match = re.fullmatch(r"(\d{2})(\d{2})(\d{2})", value)
+    if match:
+        year = 2000 + int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3)) or calendar.monthrange(year, month)[1]
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    match = re.fullmatch(r"(\d{1,2})[./-](\d{4})", value)
+    if match:
+        month, year = int(match.group(1)), int(match.group(2))
+        day = calendar.monthrange(year, month)[1]
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    match = re.fullmatch(r"(\d{4})[./-](\d{1,2})(?:[./-](\d{1,2}))?", value)
+    if match:
+        year, month = int(match.group(1)), int(match.group(2))
+        day = int(match.group(3)) if match.group(3) else calendar.monthrange(year, month)[1]
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", value)
+    if match:
+        day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        if year < 100:
+            year += 2000
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    raise InventoryError("Η ημερομηνία λήξης δεν διαβάζεται. Χρησιμοποίησε DD/MM/YYYY ή MM/YYYY.")
+
+
+def parse_gs1_datamatrix(raw_value: str) -> dict[str, str]:
+    raw = clean(raw_value)
+    normalized = raw.replace("(", "").replace(")", "")
+    fields = {"gtin": "", "lot_number": "", "serial_number": "", "expiry_date": ""}
+    idx = 0
+    fixed = {"01": ("gtin", 14), "17": ("expiry_date", 6)}
+    variable = {"10": "lot_number", "21": "serial_number"}
+    while idx < len(normalized):
+        ai = normalized[idx:idx + 2]
+        if ai in fixed:
+            key, length = fixed[ai]
+            value = normalized[idx + 2:idx + 2 + length]
+            if len(value) == length:
+                fields[key] = parse_expiry_date(value) if key == "expiry_date" else value
+            idx += 2 + length
+            continue
+        if ai in variable:
+            next_positions = [
+                pos for marker in fixed | variable
+                if (pos := normalized.find(marker, idx + 2)) > idx + 2
+            ]
+            end = min(next_positions) if next_positions else len(normalized)
+            fields[variable[ai]] = normalized[idx + 2:end].strip("\x1d")
+            idx = end
+            continue
+        idx += 1
+    return fields
+
+
+def lookup_local_database(stock: pd.DataFrame, code: str, parsed: dict[str, str] | None = None) -> dict[str, Any] | None:
+    parsed = parsed or {}
+    terms = [clean(code), parsed.get("gtin", ""), parsed.get("serial_number", ""), parsed.get("lot_number", "")]
+    if stock.empty:
+        return None
+    for term in [t for t in terms if clean(t)]:
+        matches, _ = search_stock(stock, term)
+        if not matches.empty:
+            row = matches.iloc[0].to_dict()
+            return {
+                "product_name": row.get("Προϊόν", ""),
+                "brand": row.get("Μάρκα", ""),
+                "category": row.get("Κατηγορία", ""),
+                "strength": row.get("Strength", ""),
+                "dosage_form": row.get("DosageForm", ""),
+                "package_size": row.get("PackageSize", ""),
+                "stock": row.get("Σύνολο", 0),
+                "source": "local_database",
+                "local": True,
+            }
+    return None
+
+
+def _openfacts_lookup(code: str, base_url: str, source: str) -> dict[str, Any] | None:
+    if not clean(code):
+        return None
+    try:
+        response = requests.get(f"{base_url}/api/v2/product/{clean(code)}.json", timeout=6)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+    if payload.get("status") != 1:
+        return None
+    product = payload.get("product", {})
+    return {
+        "product_name": product.get("product_name") or product.get("generic_name", ""),
+        "brand": product.get("brands", ""),
+        "category": product.get("categories", ""),
+        "strength": "",
+        "dosage_form": "",
+        "package_size": product.get("quantity", ""),
+        "source": source,
+        "local": False,
+    }
+
+
+def lookup_open_product_provider(code: str) -> dict[str, Any] | None:
+    return _openfacts_lookup(code, "https://world.openfoodfacts.org", "Open Food Facts")
+
+
+def lookup_additional_provider(code: str) -> dict[str, Any] | None:
+    return _openfacts_lookup(code, "https://world.openbeautyfacts.org", "Open Beauty Facts")
+
+
+def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
+    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "package_size": "", "source": ""}
+    sources = []
+    for result in [r for r in results if r]:
+        sources.append(result.get("source", ""))
+        for key in merged:
+            if key != "source" and not clean(merged[key]) and clean(result.get(key, "")):
+                merged[key] = result[key]
+    merged["source"] = ", ".join([s for s in sources if s])
+    return merged
 
 
 @st.cache_resource(show_spinner=False)
@@ -922,10 +1114,8 @@ def main():
         elif has_current_analysis and (front_image is not None or back_image is not None):
             st.warning("Δεν διαβάστηκε barcode. Δοκίμασε πιο κοντινή και καθαρή φωτογραφία.")
 
-        if has_current_analysis and detected_product:
-            st.info(f"Πρόταση OCR πρόσοψης: {detected_product}")
-        elif has_current_analysis and front_image is not None and ocr_debug.get("ocr", {}).get("available") != "yes":
-            st.warning("Το OCR δεν είναι διαθέσιμο. Δες τις λεπτομέρειες στο debug.")
+        if has_current_analysis and front_image is not None:
+            st.info("Δεν τρέχει αυτόματα OCR πρόσοψης. Συμπλήρωσε ή επιβεβαίωσε τα στοιχεία χειροκίνητα.")
 
         if has_current_analysis and front_image is not None and front_suggestions:
             with st.expander("Επεξεργάσιμες προτάσεις από OCR πρόσοψης", expanded=True):
@@ -985,21 +1175,53 @@ def main():
                 st.write("OCR raw values", ocr_debug.get("raw_values"))
                 st.write("Back OCR extracted logistics", back_fields)
 
+        parsed_gs1 = parse_gs1_datamatrix(detected_code) if detected_type == "DataMatrix" and detected_code else {}
         code_type = st.selectbox(
-            "Τύπος βασικού κωδικού", ["Barcode", "QR", "Other"],
-            index=["Barcode", "QR", "Other"].index(detected_type),
+            "Τύπος βασικού κωδικού", ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"],
+            index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_type if detected_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
         )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code)
-        st.caption("Αν δεν διαβάζεται το QR, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
-        pc_code = st.text_input("PC code (προαιρετικό)", value=back_fields.get("pc_code", ""))
-        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=back_fields.get("serial_number", ""))
-        lot_number = st.text_input("Lot number (προαιρετικό)", value=back_fields.get("lot_number", ""))
-        expiry_date = st.text_input("Expiry date (προαιρετικό)", value=back_fields.get("expiry_date", ""))
-        brand = st.text_input("Μάρκα", value=suggested_brand)
-        product = st.text_input("Όνομα προϊόντος", value=suggested_product)
-        strength = st.text_input("Περιεκτικότητα", value=suggested_strength)
-        dosage_form = st.text_input("Μορφή", value=suggested_dosage_form)
-        package_size = st.text_input("Μέγεθος συσκευασίας", value=suggested_package_size)
+        lookup_code = parsed_gs1.get("gtin") or code_input
+        stock_for_lookup = stock_table(load_data(worksheet())[0])
+        local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
+        online_lookup_allowed = clean(lookup_code) and (not local_product or st.button("Refresh online suggestion"))
+        online_suggestion = {}
+        if online_lookup_allowed:
+            online_suggestion = merge_lookup_results([lookup_open_product_provider(lookup_code), lookup_additional_provider(lookup_code)])
+        if local_product and not online_suggestion:
+            st.success(f"Βρέθηκε τοπικά: {local_product.get('product_name')} | stock: {local_product.get('stock')}")
+            suggested_product = local_product.get("product_name", suggested_product)
+            suggested_brand = local_product.get("brand", suggested_brand)
+            suggested_strength = local_product.get("strength", suggested_strength)
+            suggested_dosage_form = local_product.get("dosage_form", suggested_dosage_form)
+            suggested_package_size = local_product.get("package_size", suggested_package_size)
+            lookup_source_default = "local_database"
+        else:
+            lookup_source_default = online_suggestion.get("source", "manual")
+            if online_suggestion.get("source"):
+                st.info("Τα online αποτελέσματα είναι μόνο προτάσεις και χρειάζονται επιβεβαίωση.")
+                suggested_product = online_suggestion.get("product_name") or suggested_product
+                suggested_brand = online_suggestion.get("brand") or suggested_brand
+                suggested_strength = online_suggestion.get("strength") or suggested_strength
+                suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
+                suggested_package_size = online_suggestion.get("package_size") or suggested_package_size
+            elif clean(lookup_code):
+                st.warning("Δεν βρέθηκε online πρόταση. Χρησιμοποίησε χειροκίνητη καταχώρηση.")
+
+        st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
+        pc_code = st.text_input("PC code (προαιρετικό)", value=back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""))
+        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=parsed_gs1.get("serial_number") or back_fields.get("serial_number", ""))
+        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""))
+        expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""))
+        gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""))
+        with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("source"))):
+            st.write("Πηγή", lookup_source_default)
+            product = st.text_input("Όνομα προϊόντος", value=suggested_product)
+            brand = st.text_input("Μάρκα", value=suggested_brand)
+            strength = st.text_input("Περιεκτικότητα", value=suggested_strength)
+            dosage_form = st.text_input("Μορφή", value=suggested_dosage_form)
+            package_size = st.text_input("Μέγεθος συσκευασίας", value=suggested_package_size)
+            confirmed_product = st.checkbox("Επιβεβαιώνω τα στοιχεία")
         category = st.selectbox("Κατηγορία", CATEGORIES)
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
@@ -1019,13 +1241,28 @@ def main():
                     raise InventoryError("Επιβεβαίωσε τις προτάσεις OCR πριν την αποθήκευση.")
                 if not clean(product):
                     raise InventoryError("Βάλε όνομα προϊόντος.")
+                if not confirmed_product:
+                    raise InventoryError("Επιβεβαίωσε τα στοιχεία προϊόντος πριν την αποθήκευση.")
+                normalized_expiry = parse_expiry_date(expiry_date) if clean(expiry_date) else ""
+                if category == "Φάρμακο" and movement in {"Παραλαβή (+)", "Διόρθωση (+)"} and not normalized_expiry:
+                    raise InventoryError("Για stock φαρμάκου απαιτείται ημερομηνία λήξης από GS1 AI (17) ή χειροκίνητη εισαγωγή.")
                 delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
                 row = make_transaction(
                     code_type=resolved_type,
                     code_value=code_value,
                     barcode=barcode,
                     pc_code=pc_code,
+                    gtin=gtin or parsed_gs1.get("gtin", ""),
                     serial_number=serial_number,
+                    lot_number=lot_number,
+                    expiry_date=normalized_expiry,
+                    qr_raw_data=code_input if code_type == "QR" else "",
+                    datamatrix_raw_data=code_input if code_type == "DataMatrix" else "",
+                    lookup_source=lookup_source_default,
+                    lookup_timestamp=datetime.now().isoformat(timespec="seconds") if lookup_source_default else "",
+                    strength=strength,
+                    dosage_form=dosage_form,
+                    package_size=package_size,
                     brand=brand,
                     product=product,
                     category=category,
@@ -1039,7 +1276,7 @@ def main():
                         f"dosage_form={clean(dosage_form)}" if clean(dosage_form) else "",
                         f"package_size={clean(package_size)}" if clean(package_size) else "",
                         f"lot_number={clean(lot_number)}" if clean(lot_number) else "",
-                        f"expiry_date={clean(expiry_date)}" if clean(expiry_date) else "",
+                        f"expiry_date={clean(normalized_expiry)}" if clean(normalized_expiry) else "",
                     ])),
                     transaction_id=st.session_state.pending_transaction_id,
                 )

@@ -9,3 +9,5 @@ pyzbar
 pytesseract
 numpy
 pytest
+
+requests

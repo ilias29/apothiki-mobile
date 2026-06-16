@@ -195,3 +195,38 @@ def test_compensation_is_appended_when_race_creates_negative_stock(monkeypatch):
         and row["MovementKind"] == app.COMPENSATION
         for row in ws.appended
     )
+
+
+def test_gs1_datamatrix_parses_gtin_expiry_lot_serial():
+    parsed = app.parse_gs1_datamatrix("01012345678901281726063010LOT12321SER456")
+    assert parsed["gtin"] == "01234567890128"
+    assert parsed["expiry_date"] == "2026-06-30"
+    assert parsed["lot_number"] == "LOT123"
+    assert parsed["serial_number"] == "SER456"
+
+
+def test_expiry_month_year_stores_last_day():
+    assert app.parse_expiry_date("02/2027") == "2027-02-28"
+
+
+def test_merge_lookup_results_keeps_first_values_and_sources():
+    merged = app.merge_lookup_results([
+        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "source": "Open Food Facts"},
+        {"product_name": "Other", "brand": "Brand", "package_size": "50 ml", "source": "Open Beauty Facts"},
+    ])
+    assert merged["product_name"] == "Cream"
+    assert merged["brand"] == "Brand"
+    assert merged["package_size"] == "50 ml"
+    assert merged["source"] == "Open Food Facts, Open Beauty Facts"
+
+
+def test_search_includes_gtin_lot_and_raw_datamatrix():
+    row = base_row(
+        GTIN="01234567890128",
+        LotNumber="LOT123",
+        DataMatrixRawData="01012345678901281726063010LOT123",
+    )
+    stock = app.stock_table(app.records_to_dataframe([row]))
+    assert len(app.search_stock(stock, "01234567890128")[0]) == 1
+    assert len(app.search_stock(stock, "LOT123")[0]) == 1
+    assert len(app.search_stock(stock, "260630")[0]) == 1
