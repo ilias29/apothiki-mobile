@@ -34,7 +34,9 @@ except Exception as exc:
 else:
     PYZBAR_IMPORT_ERROR = None
 
-SCOPE = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets", 
+        "https://www.googleapis.com/auth/drive" ,
+        ]
 SHEET_NAME = "Apothiki_Cloud"
 WS_NAME = "Transactions"
 
