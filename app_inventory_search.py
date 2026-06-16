@@ -61,11 +61,8 @@ COLUMNS = [
     "ExpiryDate",
     "QRRawData",
     "DataMatrixRawData",
-    "LookupSource",
-    "LookupTimestamp",
     "Strength",
     "DosageForm",
-    "PackageSize",
     "Μάρκα",
     "Προϊόν",
     "Κατηγορία",
@@ -142,6 +139,55 @@ def validate_code(code_type: str, raw_value: Any) -> tuple[str, str]:
     return value, barcode
 
 
+def normalize_spaces(value: Any) -> str:
+    return re.sub(r"\s+", " ", clean(value)).strip()
+
+
+def normalize_strength(value: Any) -> str:
+    text = normalize_spaces(value)
+    text = re.sub(r"\bmcg\b|μg", "MCG", text, flags=re.I)
+    text = re.sub(r"\bmg\b", "MG", text, flags=re.I)
+    text = re.sub(r"\bml\b", "ML", text, flags=re.I)
+    text = re.sub(r"\biu\b", "IU", text, flags=re.I)
+    text = re.sub(r"\bg\b", "G", text, flags=re.I)
+    return text
+
+
+def normalize_product_fields(fields: dict[str, Any]) -> dict[str, str]:
+    return {
+        "product_name": normalize_spaces(fields.get("product_name", "")).upper(),
+        "brand": normalize_spaces(fields.get("brand", fields.get("brand_or_company", ""))).upper(),
+        "strength": normalize_strength(fields.get("strength", "")),
+        "dosage_form": normalize_spaces(fields.get("dosage_form", "")).upper(),
+        "barcode": clean(fields.get("barcode", "")),
+        "gtin": clean(fields.get("gtin", "")),
+        "category": clean(fields.get("category", "")),
+    }
+
+
+def is_valid_gtin_check_digit(gtin: str) -> bool:
+    digits = clean(gtin)
+    if not digits.isdigit() or len(digits) not in {8, 12, 13, 14}:
+        return False
+    body = [int(ch) for ch in digits[:-1]]
+    total = 0
+    for idx, digit in enumerate(reversed(body), start=1):
+        total += digit * (3 if idx % 2 else 1)
+    return (10 - (total % 10)) % 10 == int(digits[-1])
+
+
+def validate_barcode_gtin(barcode: str = "", gtin: str = "") -> list[str]:
+    warnings = []
+    if clean(barcode) and not clean(barcode).isdigit():
+        warnings.append("Το barcode πρέπει να περιέχει μόνο ψηφία.")
+    if clean(gtin):
+        if not clean(gtin).isdigit() or len(clean(gtin)) not in {8, 12, 13, 14}:
+            warnings.append("Το GTIN πρέπει να έχει 8, 12, 13 ή 14 ψηφία.")
+        elif not is_valid_gtin_check_digit(clean(gtin)):
+            warnings.append("Το GTIN έχει μη έγκυρο check digit.")
+    return warnings
+
+
 def deterministic_reversal_id(original_id: str) -> str:
     return f"reverse-{clean(original_id)}"
 
@@ -194,11 +240,8 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
         "ExpiryDate",
         "QRRawData",
         "DataMatrixRawData",
-        "LookupSource",
-        "LookupTimestamp",
         "Strength",
         "DosageForm",
-        "PackageSize",
         "VoidOf",
         "MovementKind",
     ]
@@ -306,11 +349,8 @@ def make_transaction(
     expiry_date: str = "",
     qr_raw_data: str = "",
     datamatrix_raw_data: str = "",
-    lookup_source: str = "",
-    lookup_timestamp: str = "",
     strength: str = "",
     dosage_form: str = "",
-    package_size: str = "",
     note: str = "",
     transaction_id: str | None = None,
     void_of: str = "",
@@ -331,11 +371,8 @@ def make_transaction(
         "ExpiryDate": clean(expiry_date),
         "QRRawData": clean(qr_raw_data),
         "DataMatrixRawData": clean(datamatrix_raw_data),
-        "LookupSource": clean(lookup_source),
-        "LookupTimestamp": clean(lookup_timestamp),
         "Strength": clean(strength),
         "DosageForm": clean(dosage_form),
-        "PackageSize": clean(package_size),
         "Μάρκα": clean(brand),
         "Προϊόν": clean(product),
         "Κατηγορία": clean(category),
@@ -394,11 +431,8 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             expiry_date=row.get("ExpiryDate", ""),
             qr_raw_data=row.get("QRRawData", ""),
             datamatrix_raw_data=row.get("DataMatrixRawData", ""),
-            lookup_source=row.get("LookupSource", ""),
-            lookup_timestamp=row.get("LookupTimestamp", ""),
             strength=row.get("Strength", ""),
             dosage_form=row.get("DosageForm", ""),
-            package_size=row.get("PackageSize", ""),
             brand=row["Μάρκα"],
             product=row["Προϊόν"],
             category=row["Κατηγορία"],
@@ -440,11 +474,8 @@ def append_reversal(ws, original: pd.Series, reason: str = "") -> str:
         expiry_date=original.get("ExpiryDate", ""),
         qr_raw_data=original.get("QRRawData", ""),
         datamatrix_raw_data=original.get("DataMatrixRawData", ""),
-        lookup_source=original.get("LookupSource", ""),
-        lookup_timestamp=original.get("LookupTimestamp", ""),
         strength=original.get("Strength", ""),
         dosage_form=original.get("DosageForm", ""),
-        package_size=original.get("PackageSize", ""),
         brand=original["Μάρκα"],
         product=original["Προϊόν"],
         category=original["Κατηγορία"],
@@ -465,7 +496,7 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
         "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber",
         "LotNumber", "ExpiryDate", "ExpiryStatus", "ExpiryWarning", "Semester",
         "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία",
-        "Strength", "DosageForm", "PackageSize", "Αποθήκη", "Κύριο Κτήριο",
+        "Strength", "DosageForm", "Αποθήκη", "Κύριο Κτήριο",
         "Πρώτος Όροφος", "Σύνολο",
     ]
     data = active_movements(df)
@@ -478,7 +509,7 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     latest = (
         data.sort_values("Timestamp_dt")
         .groupby(identity, dropna=False)
-        .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm", "PackageSize"]]
+        .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm"]]
     )
     grouped = data.groupby(identity + ["LocationId"], dropna=False)["DeltaQty"].sum().reset_index()
     pivot = grouped.pivot_table(
@@ -617,7 +648,6 @@ def _empty_ocr_debug() -> dict[str, Any]:
         "raw_text": "",
         "variant_used": "",
         "selected_candidate": "",
-        "confidence": None,
         "variant_results": [],
         "timed_out": False,
     }
@@ -817,14 +847,10 @@ def extract_front_fields(lines: list[str], words: list[dict[str, Any]]) -> dict[
     unique = list(dict.fromkeys([clean(line) for line in lines if clean(line)]))
     joined = "\n".join(unique)
     strength = ""
-    package_size = ""
     dosage_form = ""
     strength_match = re.search(r"\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|μg|g|ml|iu|%)\b", joined, re.I)
     if strength_match:
         strength = strength_match.group(0)
-    package_match = re.search(r"\b(\d+)\s*(?:tabs?|tablets?|δισκ\w*|caps?|capsules?|καψ\w*)\b", joined, re.I)
-    if package_match:
-        package_size = package_match.group(0)
     form_match = re.search(r"\b(tablets?|tabs?|capsules?|caps?|syrup|cream|spray|drops|δισκ\w*|καψ\w*|σιρόπι|κρέμα)\b", joined, re.I)
     if form_match:
         dosage_form = form_match.group(0)
@@ -848,8 +874,9 @@ def extract_front_fields(lines: list[str], words: list[dict[str, Any]]) -> dict[
     scored.sort(reverse=True)
     product_name = scored[0][1] if scored else ""
     brand = product_name.split()[0] if product_name else ""
-    confidence = round(scored[0][2], 1) if scored else None
-    return {"product_name": product_name, "brand": brand, "strength": strength, "dosage_form": dosage_form, "package_size": package_size, "candidate": product_name, "confidence": confidence}
+    fields = normalize_product_fields({"product_name": product_name, "brand": brand, "strength": strength, "dosage_form": dosage_form})
+    fields["candidate"] = product_name
+    return fields
 
 
 def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
@@ -872,7 +899,7 @@ def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str,
             empty = not clean(text)
             score = _ocr_score(text, words, avg_conf)
             debug["attempts"].append(f"tesseract:{label}:ok:{len(variant_lines)}:empty={empty}:conf={avg_conf}")
-            debug["variant_results"].append({"variant": variant_name, "psm": psm, "empty": empty, "confidence": avg_conf, "score": score, "raw_text": text})
+            debug["variant_results"].append({"variant": variant_name, "psm": psm, "empty": empty, "score": score, "raw_text": text})
             debug["raw_values"].extend(variant_lines)
             if best is None or score > best[0]:
                 best = (score, variant_name, psm, text, words, variant_lines, avg_conf)
@@ -890,9 +917,7 @@ def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str,
         return {}, [], debug
     _, variant_name, psm, text, words, lines, avg_conf = best
     fields = extract_front_fields(lines, words)
-    if not fields.get("confidence"):
-        fields["confidence"] = avg_conf
-    debug.update({"raw_text": text, "variant_used": f"{variant_name}_psm{psm}", "selected_candidate": fields.get("candidate", ""), "confidence": fields.get("confidence")})
+    debug.update({"raw_text": text, "variant_used": f"{variant_name}_psm{psm}", "selected_candidate": fields.get("candidate", "")})
     unique_lines = list(dict.fromkeys(lines))
     return fields, unique_lines, debug
 
@@ -1021,22 +1046,30 @@ def parse_gs1_datamatrix(raw_value: str) -> dict[str, str]:
 
 def lookup_local_database(stock: pd.DataFrame, code: str, parsed: dict[str, str] | None = None) -> dict[str, Any] | None:
     parsed = parsed or {}
-    terms = [clean(code), parsed.get("gtin", ""), parsed.get("serial_number", ""), parsed.get("lot_number", "")]
     if stock.empty:
         return None
-    for term in [t for t in terms if clean(t)]:
-        matches, _ = search_stock(stock, term)
+    terms = [clean(code), clean(parsed.get("gtin", ""))]
+    for term in [t for t in terms if t and t.isdigit()]:
+        matches = stock[
+            stock["Barcode"].astype(str).str.strip().eq(term)
+            | stock["GTIN"].astype(str).str.strip().eq(term)
+            | (
+                stock["CodeType"].astype(str).isin(["Barcode", "GTIN"])
+                & stock["CodeValue"].astype(str).str.strip().eq(term)
+            )
+        ]
         if not matches.empty:
             row = matches.iloc[0].to_dict()
-            return {
+            return normalize_product_fields({
                 "product_name": row.get("Προϊόν", ""),
                 "brand": row.get("Μάρκα", ""),
                 "category": row.get("Κατηγορία", ""),
                 "strength": row.get("Strength", ""),
                 "dosage_form": row.get("DosageForm", ""),
-                "package_size": row.get("PackageSize", ""),
+                "barcode": row.get("Barcode", ""),
+                "gtin": row.get("GTIN", ""),
+            }) | {
                 "stock": row.get("Σύνολο", 0),
-                "source": "local_database",
                 "local": True,
             }
     return None
@@ -1055,16 +1088,15 @@ def _openfacts_lookup(code: str, base_url: str, source: str) -> dict[str, Any] |
     if payload.get("status") != 1:
         return None
     product = payload.get("product", {})
-    return {
+    fields = normalize_product_fields({
         "product_name": product.get("product_name") or product.get("generic_name", ""),
         "brand": product.get("brands", ""),
         "category": product.get("categories", ""),
         "strength": "",
         "dosage_form": "",
-        "package_size": product.get("quantity", ""),
-        "source": source,
-        "local": False,
-    }
+    })
+    fields.update({"provider": source, "local": False})
+    return fields
 
 
 def lookup_open_product_provider(code: str) -> dict[str, Any] | None:
@@ -1075,15 +1107,37 @@ def lookup_additional_provider(code: str) -> dict[str, Any] | None:
     return _openfacts_lookup(code, "https://world.openbeautyfacts.org", "Open Beauty Facts")
 
 
+def lookup_openpharma_provider(code: str) -> dict[str, Any] | None:
+    return _openfacts_lookup(code, "https://world.openproductsfacts.org", "Open Products Facts")
+
+
+def lookup_web_search_provider(code: str) -> dict[str, Any] | None:
+    template = clean(st.secrets.get("BARCODE_WEB_SEARCH_URL", ""))
+    if not template or not clean(code):
+        return None
+    return {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": f"Web search: {template.format(code=clean(code))}", "local": False}
+
+
+def online_lookup_candidates(code: str) -> list[dict[str, Any]]:
+    candidates = [
+        lookup_open_product_provider(code),
+        lookup_additional_provider(code),
+        lookup_openpharma_provider(code),
+        lookup_web_search_provider(code),
+    ]
+    return [normalize_product_fields(c or {}) | {"provider": (c or {}).get("provider", ""), "local": False} for c in candidates if c][:3]
+
+
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
-    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "package_size": "", "source": ""}
-    sources = []
+    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": ""}
+    providers = []
     for result in [r for r in results if r]:
-        sources.append(result.get("source", ""))
-        for key in merged:
-            if key != "source" and not clean(merged[key]) and clean(result.get(key, "")):
-                merged[key] = result[key]
-    merged["source"] = ", ".join([s for s in sources if s])
+        providers.append(result.get("provider", result.get("source", "")))
+        normalized = normalize_product_fields(result)
+        for key in ["product_name", "brand", "category", "strength", "dosage_form"]:
+            if not clean(merged[key]) and clean(normalized.get(key, "")):
+                merged[key] = normalized[key]
+    merged["provider"] = ", ".join([s for s in providers if s])
     return merged
 
 
@@ -1188,7 +1242,6 @@ def main():
                 suggested_brand = st.text_input("Προτεινόμενη μάρκα", value=front_suggestions.get("brand", ""))
                 suggested_strength = st.text_input("Προτεινόμενη περιεκτικότητα", value=front_suggestions.get("strength", ""))
                 suggested_dosage_form = st.text_input("Προτεινόμενη μορφή", value=front_suggestions.get("dosage_form", ""))
-                suggested_package_size = st.text_input("Προτεινόμενο μέγεθος συσκευασίας", value=front_suggestions.get("package_size", ""))
                 if not clean(suggested_product) and clean(ocr_debug.get("raw_text", "")):
                     st.info("Δεν βρέθηκε δομημένο όνομα προϊόντος, αλλά υπάρχει raw OCR κείμενο. Αντέγραψε ή γράψε χειροκίνητα το σωστό όνομα.")
                     st.text_area("Raw OCR για χειροκίνητη επιλογή ονόματος", value=ocr_debug.get("raw_text", ""), height=140)
@@ -1198,7 +1251,6 @@ def main():
             suggested_brand = detected_brand if has_current_analysis else ""
             suggested_strength = front_suggestions.get("strength", "") if has_current_analysis else ""
             suggested_dosage_form = front_suggestions.get("dosage_form", "") if has_current_analysis else ""
-            suggested_package_size = front_suggestions.get("package_size", "") if has_current_analysis else ""
             extraction_confirmed = not (has_current_analysis and front_image is not None and bool(front_suggestions))
 
         if front_image is not None or back_image is not None:
@@ -1220,7 +1272,6 @@ def main():
                 st.text_area("Best raw OCR text from front image", value=ocr_debug.get("raw_text", ""), height=160)
                 st.write("Selected best variant", ocr_debug.get("variant_used"))
                 st.write("Selected product name candidate", ocr_debug.get("selected_candidate"))
-                st.write("OCR confidence", ocr_debug.get("confidence"))
                 variant_results = ocr_debug.get("variant_results", [])
                 if variant_results:
                     st.dataframe(pd.DataFrame([
@@ -1228,7 +1279,6 @@ def main():
                             "variant": item.get("variant"),
                             "psm": item.get("psm"),
                             "empty_text": item.get("empty"),
-                            "confidence": item.get("confidence"),
                             "score": item.get("score"),
                             "chars": len(item.get("raw_text", "")),
                         }
@@ -1246,27 +1296,22 @@ def main():
         lookup_code = parsed_gs1.get("gtin") or code_input
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
-        online_lookup_allowed = clean(lookup_code) and (not local_product or st.button("Refresh online suggestion"))
-        online_suggestion = {}
-        if online_lookup_allowed:
-            online_suggestion = merge_lookup_results([lookup_open_product_provider(lookup_code), lookup_additional_provider(lookup_code)])
+        refresh_online = st.button("Νέα online αναζήτηση", disabled=not clean(lookup_code))
+        online_candidates = online_lookup_candidates(lookup_code) if clean(lookup_code) and (not local_product or refresh_online) else []
+        online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
         if local_product and not online_suggestion:
             st.success(f"Βρέθηκε τοπικά: {local_product.get('product_name')} | stock: {local_product.get('stock')}")
             suggested_product = local_product.get("product_name", suggested_product)
             suggested_brand = local_product.get("brand", suggested_brand)
             suggested_strength = local_product.get("strength", suggested_strength)
             suggested_dosage_form = local_product.get("dosage_form", suggested_dosage_form)
-            suggested_package_size = local_product.get("package_size", suggested_package_size)
-            lookup_source_default = "local_database"
         else:
-            lookup_source_default = online_suggestion.get("source", "manual")
-            if online_suggestion.get("source"):
+            if online_suggestion.get("provider"):
                 st.info("Τα online αποτελέσματα είναι μόνο προτάσεις και χρειάζονται επιβεβαίωση.")
                 suggested_product = online_suggestion.get("product_name") or suggested_product
                 suggested_brand = online_suggestion.get("brand") or suggested_brand
                 suggested_strength = online_suggestion.get("strength") or suggested_strength
                 suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
-                suggested_package_size = online_suggestion.get("package_size") or suggested_package_size
             elif clean(lookup_code):
                 st.warning("Δεν βρέθηκε online πρόταση. Χρησιμοποίησε χειροκίνητη καταχώρηση.")
 
@@ -1276,13 +1321,16 @@ def main():
         lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""))
         expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""))
         gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""))
-        with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("source"))):
-            st.write("Πηγή", lookup_source_default)
+        for warning in validate_barcode_gtin(code_input if code_type == "Barcode" else "", gtin):
+            st.warning(warning)
+        if online_candidates:
+            st.write("Online προτάσεις (έως 3)")
+            st.dataframe(pd.DataFrame(online_candidates), use_container_width=True)
+        with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
             product = st.text_input("Όνομα προϊόντος", value=suggested_product)
             brand = st.text_input("Μάρκα", value=suggested_brand)
             strength = st.text_input("Περιεκτικότητα", value=suggested_strength)
             dosage_form = st.text_input("Μορφή", value=suggested_dosage_form)
-            package_size = st.text_input("Μέγεθος συσκευασίας", value=suggested_package_size)
             confirmed_product = st.checkbox("Επιβεβαιώνω τα στοιχεία")
         category = st.selectbox("Κατηγορία", CATEGORIES)
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
@@ -1305,6 +1353,19 @@ def main():
                     raise InventoryError("Βάλε όνομα προϊόντος.")
                 if not confirmed_product:
                     raise InventoryError("Επιβεβαίωσε τα στοιχεία προϊόντος πριν την αποθήκευση.")
+                validation_warnings = validate_barcode_gtin(barcode, gtin or parsed_gs1.get("gtin", ""))
+                if validation_warnings:
+                    raise InventoryError(" ".join(validation_warnings))
+                normalized_product = normalize_product_fields(
+                    {
+                        "product_name": product,
+                        "brand": brand,
+                        "strength": strength,
+                        "dosage_form": dosage_form,
+                        "barcode": barcode,
+                        "gtin": gtin or parsed_gs1.get("gtin", ""),
+                    }
+                )
                 normalized_expiry = parse_expiry_date(expiry_date) if clean(expiry_date) else ""
                 if category == "Φάρμακο" and movement in {"Παραλαβή (+)", "Διόρθωση (+)"} and not normalized_expiry:
                     raise InventoryError("Για stock φαρμάκου απαιτείται ημερομηνία λήξης από GS1 AI (17) ή χειροκίνητη εισαγωγή.")
@@ -1312,21 +1373,18 @@ def main():
                 row = make_transaction(
                     code_type=resolved_type,
                     code_value=code_value,
-                    barcode=barcode,
+                    barcode=normalized_product["barcode"],
                     pc_code=pc_code,
-                    gtin=gtin or parsed_gs1.get("gtin", ""),
+                    gtin=normalized_product["gtin"],
                     serial_number=serial_number,
                     lot_number=lot_number,
                     expiry_date=normalized_expiry,
                     qr_raw_data=code_input if code_type == "QR" else "",
                     datamatrix_raw_data=code_input if code_type == "DataMatrix" else "",
-                    lookup_source=lookup_source_default,
-                    lookup_timestamp=datetime.now().isoformat(timespec="seconds") if lookup_source_default else "",
-                    strength=strength,
-                    dosage_form=dosage_form,
-                    package_size=package_size,
-                    brand=brand,
-                    product=product,
+                    strength=normalized_product["strength"],
+                    dosage_form=normalized_product["dosage_form"],
+                    brand=normalized_product["brand"],
+                    product=normalized_product["product_name"],
                     category=category,
                     location_id=location_id,
                     movement=movement,
@@ -1334,9 +1392,8 @@ def main():
                     delta=delta,
                     note=" | ".join(filter(None, [
                         clean(note),
-                        f"strength={clean(strength)}" if clean(strength) else "",
-                        f"dosage_form={clean(dosage_form)}" if clean(dosage_form) else "",
-                        f"package_size={clean(package_size)}" if clean(package_size) else "",
+                        f"strength={normalized_product['strength']}" if normalized_product["strength"] else "",
+                        f"dosage_form={normalized_product['dosage_form']}" if normalized_product["dosage_form"] else "",
                         f"lot_number={clean(lot_number)}" if clean(lot_number) else "",
                         f"expiry_date={clean(normalized_expiry)}" if clean(normalized_expiry) else "",
                     ])),

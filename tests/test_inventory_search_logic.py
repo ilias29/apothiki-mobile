@@ -209,15 +209,15 @@ def test_expiry_month_year_stores_last_day():
     assert app.parse_expiry_date("02/2027") == "2027-02-28"
 
 
-def test_merge_lookup_results_keeps_first_values_and_sources():
+def test_merge_lookup_results_keeps_first_values_and_providers_normalized():
     merged = app.merge_lookup_results([
-        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "source": "Open Food Facts"},
-        {"product_name": "Other", "brand": "Brand", "package_size": "50 ml", "source": "Open Beauty Facts"},
+        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "provider": "Open Food Facts"},
+        {"product_name": "Other", "brand": "Brand", "provider": "Open Beauty Facts"},
     ])
-    assert merged["product_name"] == "Cream"
-    assert merged["brand"] == "Brand"
-    assert merged["package_size"] == "50 ml"
-    assert merged["source"] == "Open Food Facts, Open Beauty Facts"
+    assert merged["product_name"] == "CREAM"
+    assert merged["brand"] == "BRAND"
+    assert "package_size" not in merged
+    assert merged["provider"] == "Open Food Facts, Open Beauty Facts"
 
 
 def test_search_includes_gtin_lot_and_raw_datamatrix():
@@ -270,3 +270,42 @@ def test_expiry_reports_return_requested_buckets():
     assert len(reports["A εξάμηνο"]) == 1
     assert len(reports["B εξάμηνο"]) == 3
     assert len(reports["products without expiry date"]) == 1
+
+
+def test_product_field_normalization_preserves_identifier_digits():
+    normalized = app.normalize_product_fields(
+        {
+            "product_name": " depon  odis ",
+            "brand": "  upsa - pharma ",
+            "strength": "500 mg / 5 ml + 10 μg",
+            "dosage_form": "orodispersible tabs",
+            "barcode": " 5201234567890 ",
+            "gtin": "05201234567890",
+        }
+    )
+    assert normalized["product_name"] == "DEPON ODIS"
+    assert normalized["brand"] == "UPSA - PHARMA"
+    assert normalized["strength"] == "500 MG / 5 ML + 10 MCG"
+    assert normalized["dosage_form"] == "ORODISPERSIBLE TABS"
+    assert normalized["barcode"] == "5201234567890"
+    assert normalized["gtin"] == "05201234567890"
+
+
+def test_local_lookup_is_exact_barcode_or_gtin_only():
+    rows = [
+        base_row(Barcode="1112223334445", CodeValue="1112223334445", Προϊόν="Moducare", Μάρκα="Pharma", Strength="30 mg", DosageForm="caps"),
+        base_row(TransactionId="gtin", Barcode="", CodeType="GTIN", CodeValue="01234567890128", GTIN="01234567890128", Προϊόν="Depon Odis"),
+    ]
+    stock = app.stock_table(app.records_to_dataframe(rows))
+    by_barcode = app.lookup_local_database(stock, "1112223334445")
+    by_gtin = app.lookup_local_database(stock, "01234567890128")
+    assert by_barcode["product_name"] == "MODUCARE"
+    assert by_barcode["strength"] == "30 MG"
+    assert by_gtin["product_name"] == "DEPON ODIS"
+    assert app.lookup_local_database(stock, "111222") is None
+
+
+def test_gtin_validation_warns_without_changing_digits():
+    assert app.validate_barcode_gtin("ABC") == ["Το barcode πρέπει να περιέχει μόνο ψηφία."]
+    assert app.validate_barcode_gtin(gtin="01234567890129") == ["Το GTIN έχει μη έγκυρο check digit."]
+    assert app.validate_barcode_gtin(gtin="01234567890128") == []
