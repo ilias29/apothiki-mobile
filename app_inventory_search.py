@@ -37,8 +37,9 @@ WS_NAME = "Transactions"
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
-OCR_TIMEOUT_SECONDS = 25
-MAX_OCR_ATTEMPTS_PER_IMAGE = 6
+FRONT_OCR_TIMEOUT_SECONDS = 12
+BACK_OCR_TIMEOUT_SECONDS = 8
+MAX_FRONT_OCR_CALLS = 2
 
 
 COLUMNS = [
@@ -627,31 +628,31 @@ def _otsu_threshold(gray: np.ndarray) -> np.ndarray:
     return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
 
+def _central_product_crop(pil: Image.Image) -> Image.Image:
+    width, height = pil.size
+    if width < 40 or height < 40:
+        return pil
+    left = int(width * 0.08)
+    right = int(width * 0.92)
+    top = int(height * 0.12)
+    bottom = int(height * 0.88)
+    return pil.crop((left, top, right, bottom))
+
+
 def _base_ocr_image(image: np.ndarray) -> np.ndarray:
     pil = ImageOps.exif_transpose(Image.fromarray(image)).convert("RGB")
-    rgb = np.array(pil)
-    upscaled = cv2.resize(rgb, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    return cv2.cvtColor(upscaled, cv2.COLOR_RGB2GRAY)
+    pil = _central_product_crop(pil)
+    if pil.width > 1600:
+        new_height = max(1, int(pil.height * (1600 / pil.width)))
+        pil = pil.resize((1600, new_height), Image.Resampling.LANCZOS)
+    pil = ImageOps.grayscale(pil)
+    pil = ImageEnhance.Contrast(pil).enhance(1.35)
+    return np.array(pil)
 
 
 def _ocr_attempts(image: np.ndarray) -> list[tuple[str, np.ndarray, int]]:
     base_gray = _base_ocr_image(image)
-    attempts: list[tuple[str, np.ndarray, int]] = [
-        ("fast_2x_gray", base_gray, 6),
-        ("fast_2x_gray", base_gray, 11),
-    ]
-    clahe = _clahe(base_gray)
-    attempts.append(("fallback_clahe", clahe, 6))
-    attempts.append(("fallback_threshold", _otsu_threshold(clahe), 6))
-
-    h, w = base_gray.shape[:2]
-    rotations = [90, 270] if h > w * 1.25 else [180]
-    for rotation in rotations:
-        if len(attempts) >= MAX_OCR_ATTEMPTS_PER_IMAGE:
-            break
-        rotated = np.array(Image.fromarray(base_gray).rotate(rotation, expand=True))
-        attempts.append((f"fallback_rot{rotation}", rotated, 6))
-    return attempts[:MAX_OCR_ATTEMPTS_PER_IMAGE]
+    return [("front_fast_single_pass", base_gray, 6), ("front_fast_single_pass", base_gray, 11)][:MAX_FRONT_OCR_CALLS]
 
 
 def _has_useful_alphabetic_text(text: str) -> bool:
@@ -660,33 +661,10 @@ def _has_useful_alphabetic_text(text: str) -> bool:
     return alpha >= 8 and len(words) >= 2
 
 
-def _ocr_text_and_data(variant: np.ndarray, psm: int, timeout: int = 8) -> tuple[str, list[dict[str, Any]], float | None]:
+def _ocr_text(variant: np.ndarray, psm: int, timeout: int = 8) -> str:
     pil = Image.fromarray(variant)
     config = f"--psm {psm}"
-    text = pytesseract.image_to_string(pil, lang="ell+eng", config=config, timeout=timeout)
-    data = pytesseract.image_to_data(pil, lang="ell+eng", config=config, output_type=pytesseract.Output.DICT, timeout=timeout)
-    words = []
-    confidences = []
-    for i, word in enumerate(data.get("text", [])):
-        value = clean(word)
-        if not value:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except Exception:
-            conf = -1.0
-        if conf >= 0:
-            confidences.append(conf)
-        words.append({
-            "text": value,
-            "conf": conf,
-            "left": int(data["left"][i]),
-            "top": int(data["top"][i]),
-            "width": int(data["width"][i]),
-            "height": int(data["height"][i]),
-        })
-    avg_conf = round(sum(confidences) / len(confidences), 1) if confidences else None
-    return text, words, avg_conf
+    return pytesseract.image_to_string(pil, lang="ell+eng", config=config, timeout=timeout)
 
 
 def _ocr_score(text: str, words: list[dict[str, Any]], avg_conf: float | None) -> tuple[int, float, int]:
@@ -757,7 +735,9 @@ def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str,
         label = f"{variant_name}_psm{psm}"
         try:
             remaining = max(1, int(deadline - time.monotonic())) if deadline is not None else 8
-            text, words, avg_conf = _ocr_text_and_data(variant, psm, timeout=min(8, remaining))
+            text = _ocr_text(variant, psm, timeout=min(8, remaining))
+            words: list[dict[str, Any]] = []
+            avg_conf = None
             variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
             empty = not clean(text)
             score = _ocr_score(text, words, avg_conf)
@@ -788,7 +768,6 @@ def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str,
 
 
 def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str) -> None:
-    deadline = time.monotonic() + OCR_TIMEOUT_SECONDS
     cache = st.session_state.analysis_cache
     cache_key = f"{front_hash}:{back_hash}"
     if cache_key in cache:
@@ -808,18 +787,20 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
     st.session_state.barcode_result = {"type": detected_type, "value": detected_code, "debug": barcode_debug}
 
     progress.progress(35, text="Reading front text")
-    front_fields, front_lines, front_debug = detect_product_name(front_image, deadline=deadline)
+    front_deadline = time.monotonic() + FRONT_OCR_TIMEOUT_SECONDS
+    front_fields, front_lines, front_debug = detect_product_name(front_image, deadline=front_deadline)
     st.session_state.front_ocr_result = {"fields": front_fields, "lines": front_lines, "debug": front_debug}
 
     progress.progress(70, text="Reading back codes")
     back_fields: dict[str, str] = {"pc_code": "", "serial_number": "", "lot_number": "", "expiry_date": ""}
     back_lines: list[str] = []
     back_debug = _empty_ocr_debug()
-    if time.monotonic() < deadline:
-        _, back_lines, back_debug = detect_product_name(back_image, deadline=deadline)
+    if not detected_code and back_image is not None:
+        back_deadline = time.monotonic() + BACK_OCR_TIMEOUT_SECONDS
+        _, back_lines, back_debug = detect_product_name(back_image, deadline=back_deadline)
         back_fields = extract_back_fields(back_debug.get("raw_text", ""))
     else:
-        back_debug["timed_out"] = True
+        back_debug["skipped"] = "barcode_or_datamatrix_detected" if detected_code else "no_back_image"
     st.session_state.back_ocr_result = {"fields": back_fields, "lines": back_lines, "debug": back_debug}
     st.session_state.parsed_product_fields = {**front_fields, **back_fields}
     st.session_state.front_image_hash = front_hash
@@ -948,7 +929,10 @@ def main():
 
         if has_current_analysis and front_image is not None and front_suggestions:
             with st.expander("Επεξεργάσιμες προτάσεις από OCR πρόσοψης", expanded=True):
-                suggested_product = st.text_input("Προτεινόμενο όνομα προϊόντος", value=front_suggestions.get("product_name", ""))
+                product_value = front_suggestions.get("product_name", "")
+                if not clean(product_value) and clean(ocr_debug.get("raw_text", "")):
+                    product_value = clean(ocr_debug.get("raw_text", ""))[:240]
+                suggested_product = st.text_area("OCR text / product name candidate", value=product_value, height=100)
                 suggested_brand = st.text_input("Προτεινόμενη μάρκα", value=front_suggestions.get("brand", ""))
                 suggested_strength = st.text_input("Προτεινόμενη περιεκτικότητα", value=front_suggestions.get("strength", ""))
                 suggested_dosage_form = st.text_input("Προτεινόμενη μορφή", value=front_suggestions.get("dosage_form", ""))
