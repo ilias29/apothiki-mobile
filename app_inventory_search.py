@@ -1098,7 +1098,7 @@ def worksheet():
         client = gspread.authorize(creds)
         sheet_name = st.secrets.get("SHEET_NAME", SHEET_NAME)
         worksheet_name = st.secrets.get("WORKSHEET_NAME" , WS_NAME)
-        sheet = cleint.open(sheet_name)
+        sheet = client.open(sheet_name)
         ws = sheet.worksheet(worksheet_name)
         validate_and_migrate_headers(ws)
         return ws
@@ -1112,7 +1112,7 @@ def worksheet():
         st.error(str(exc))
         st.stop()
     except Exception as exc:
-        st.error(f"Σφάλμα Goodle Sheets:{type(exc)._name_}: {exc}"
+        st.error(f"Σφάλμα Goodle Sheets:{type(exc).__name__}: {exc}"
                 )
         st.stop()
 def main():
