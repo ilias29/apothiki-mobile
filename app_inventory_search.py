@@ -45,6 +45,9 @@ CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", 
 FRONT_OCR_TIMEOUT_SECONDS = 12
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 2
+MAX_BACK_EXPIRY_OCR_CALLS = 4
+MIN_VALID_EXPIRY_YEAR = 2020
+
 
 
 COLUMNS = [
@@ -689,7 +692,7 @@ def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
     values = []
     for item in decoded:
         raw = item.data.decode("utf-8", errors="replace")
-        value = clean(raw)
+        value = raw.strip()
         if value:
             values.append((classify_pyzbar_type(item.type), value, item.type))
     return values
@@ -697,6 +700,7 @@ def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
 
 def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
     debug: dict[str, Any] = {"decoders": decoder_status(), "attempts": [], "errors": [], "raw_values": []}
+    # Back/second photo is intentionally the primary source for identity and batch codes.
     for source, image in [("back", back), ("front", front)]:
         if image is None:
             continue
@@ -813,6 +817,56 @@ def _base_ocr_image(image: np.ndarray) -> np.ndarray:
 def _ocr_attempts(image: np.ndarray) -> list[tuple[str, np.ndarray, int]]:
     base_gray = _base_ocr_image(image)
     return [("front_fast_single_pass", base_gray, 6), ("front_fast_single_pass", base_gray, 11)][:MAX_FRONT_OCR_CALLS]
+
+
+def _expiry_ocr_attempts(image: np.ndarray) -> list[tuple[str, np.ndarray, int]]:
+    pil = ImageOps.exif_transpose(Image.fromarray(image)).convert("L")
+    pil = ImageEnhance.Contrast(pil).enhance(1.8)
+    pil = pil.resize((pil.width * 2, pil.height * 2), Image.Resampling.LANCZOS)
+    gray = np.array(pil)
+    return [
+        ("back_expiry_gray_2x", gray, 6),
+        ("back_expiry_clahe_2x", _clahe(gray), 6),
+        ("back_expiry_threshold_2x", _otsu_threshold(_clahe(gray)), 6),
+        ("back_expiry_sparse_2x", _sharpen(_clahe(gray)), 11),
+    ][:MAX_BACK_EXPIRY_OCR_CALLS]
+
+
+def detect_back_expiry_ocr(image: np.ndarray | None, image_hash: str = "") -> tuple[dict[str, str], list[str], dict[str, Any]]:
+    debug = _empty_ocr_debug()
+    debug.update({"language": "eng", "psm_modes": [6, 11], "image_hash": image_hash, "ocr_kind": "back_expiry_only"})
+    if image is None or debug["ocr"].get("available") != "yes":
+        return {"expiry_date": ""}, [], debug
+    whitelist = "0123456789/-. EXPIRYEXPΛΗΞΗ: "
+    best_text = ""
+    lines: list[str] = []
+    for variant_name, variant, psm in _expiry_ocr_attempts(image):
+        label = f"{variant_name}_psm{psm}"
+        try:
+            config = f"--psm {psm} -c tessedit_char_whitelist={whitelist}"
+            text = pytesseract.image_to_string(Image.fromarray(variant), lang="eng", config=config, timeout=BACK_OCR_TIMEOUT_SECONDS)
+            variant_lines = [clean(line) for line in text.splitlines() if clean(line)]
+            debug["attempts"].append(f"tesseract:{label}:ok:{len(variant_lines)}")
+            debug["variant_results"].append({"variant": variant_name, "psm": psm, "raw_text": text})
+            debug["raw_values"].extend(variant_lines)
+            if len(text) > len(best_text):
+                best_text = text
+                lines = variant_lines
+            fields = extract_back_fields(text)
+            if fields.get("expiry_date"):
+                debug.update({"raw_text": text, "variant_used": label, "selected_candidate": fields["expiry_date"]})
+                return {"expiry_date": fields["expiry_date"]}, variant_lines, debug
+        except RuntimeError as exc:
+            debug["attempts"].append(f"tesseract:{label}:timeout")
+            debug["errors"].append(f"tesseract {label}: {exc}")
+            debug["timed_out"] = True
+            break
+        except Exception as exc:
+            debug["attempts"].append(f"tesseract:{label}:failed")
+            debug["errors"].append(f"tesseract {label}: {exc}")
+    fields = extract_back_fields(best_text)
+    debug.update({"raw_text": best_text, "selected_candidate": fields.get("expiry_date", "")})
+    return {"expiry_date": fields.get("expiry_date", "")}, list(dict.fromkeys(lines)), debug
 
 
 def _has_useful_alphabetic_text(text: str) -> bool:
@@ -946,16 +1000,15 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
     front_debug["skipped"] = "front_image_ocr_requires_manual_entry"
     st.session_state.front_ocr_result = {"fields": front_fields, "lines": front_lines, "debug": front_debug}
 
-    progress.progress(70, text="Reading back codes")
+    progress.progress(70, text="Reading back expiry")
     back_fields: dict[str, str] = {"pc_code": "", "serial_number": "", "lot_number": "", "expiry_date": ""}
     back_lines: list[str] = []
     back_debug = _empty_ocr_debug()
-    if not detected_code and back_image is not None:
-        back_deadline = time.monotonic() + BACK_OCR_TIMEOUT_SECONDS
-        _, back_lines, back_debug = detect_product_name(back_image, deadline=back_deadline)
-        back_fields = extract_back_fields(back_debug.get("raw_text", ""))
+    if back_image is not None:
+        expiry_fields, back_lines, back_debug = detect_back_expiry_ocr(back_image, back_hash)
+        back_fields.update(expiry_fields)
     else:
-        back_debug["skipped"] = "barcode_or_datamatrix_detected" if detected_code else "no_back_image"
+        back_debug["skipped"] = "no_back_image"
     st.session_state.back_ocr_result = {"fields": back_fields, "lines": back_lines, "debug": back_debug}
     st.session_state.parsed_product_fields = {**front_fields, **back_fields}
     st.session_state.front_image_hash = front_hash
@@ -971,19 +1024,36 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
     progress.progress(100, text="Finished")
 
 def extract_back_fields(text: str) -> dict[str, str]:
-    import re
     fields = {"pc_code": "", "serial_number": "", "lot_number": "", "expiry_date": ""}
     patterns = {
-        "pc_code": r"(?:PC|P\.?C\.?|Product\s*Code)[:\s-]*([A-Z0-9-]{4,})",
-        "serial_number": r"(?:SN|S/N|Serial)[:\s-]*([A-Z0-9-]{4,})",
-        "lot_number": r"(?:LOT|Lot|Batch)[:\s-]*([A-Z0-9-]{2,})",
-        "expiry_date": r"(?:EXP|Expiry|ΛΗΞΗ)[:\s-]*(\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2})",
+        "pc_code": r"(?:\bPC\b|P\.?C\.?|Product\s*Code)[:\s-]*([A-Z0-9-]{2,})",
+        "serial_number": r"(?:\bSN\b|S/N|Serial(?:\s*Number)?)[:\s-]*([A-Z0-9-]{2,})",
+        "lot_number": r"(?:\bLOT\b|Lot|Batch)[:\s-]*([A-Z0-9-]{2,})",
+        "expiry_date": r"(?:\bEXP\b|Expiry|ΛΗΞΗ)[:\s-]*(\d{1,2}\s+\d{4}|\d{1,2}[./-]\d{4}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})",
     }
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.I)
         if match:
-            fields[key] = clean(match.group(1))
+            value = clean(match.group(1))
+            if key == "expiry_date":
+                try:
+                    fields[key] = parse_expiry_date(value)
+                except InventoryError:
+                    fields[key] = ""
+            else:
+                fields[key] = value
+    if not fields["expiry_date"]:
+        candidates = find_expiry_candidates(text)
+        if candidates:
+            fields["expiry_date"] = candidates[0]
     return fields
+
+
+def _valid_expiry(year: int, month: int, day: int) -> str:
+    if year < MIN_VALID_EXPIRY_YEAR:
+        raise InventoryError("Η ημερομηνία λήξης είναι υπερβολικά παλιά.")
+    parsed = date(year, month, day)
+    return parsed.isoformat()
 
 
 def parse_expiry_date(value: str) -> str:
@@ -995,30 +1065,47 @@ def parse_expiry_date(value: str) -> str:
         year = 2000 + int(match.group(1))
         month = int(match.group(2))
         day = int(match.group(3)) or calendar.monthrange(year, month)[1]
-        return f"{year:04d}-{month:02d}-{day:02d}"
+        return _valid_expiry(year, month, day)
+    match = re.fullmatch(r"(\d{1,2})\s+(\d{4})", value)
+    if match:
+        month, year = int(match.group(1)), int(match.group(2))
+        return _valid_expiry(year, month, calendar.monthrange(year, month)[1])
     match = re.fullmatch(r"(\d{1,2})[./-](\d{4})", value)
     if match:
         month, year = int(match.group(1)), int(match.group(2))
-        day = calendar.monthrange(year, month)[1]
-        return f"{year:04d}-{month:02d}-{day:02d}"
+        return _valid_expiry(year, month, calendar.monthrange(year, month)[1])
     match = re.fullmatch(r"(\d{4})[./-](\d{1,2})(?:[./-](\d{1,2}))?", value)
     if match:
         year, month = int(match.group(1)), int(match.group(2))
         day = int(match.group(3)) if match.group(3) else calendar.monthrange(year, month)[1]
-        return f"{year:04d}-{month:02d}-{day:02d}"
+        return _valid_expiry(year, month, day)
     match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", value)
     if match:
         day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
         if year < 100:
             year += 2000
-        return f"{year:04d}-{month:02d}-{day:02d}"
+        return _valid_expiry(year, month, day)
     raise InventoryError("Η ημερομηνία λήξης δεν διαβάζεται. Χρησιμοποίησε DD/MM/YYYY ή MM/YYYY.")
 
 
-def parse_gs1_datamatrix(raw_value: str) -> dict[str, str]:
-    raw = clean(raw_value)
+def find_expiry_candidates(text: str) -> list[str]:
+    candidates: list[tuple[int, int, str]] = []
+    pattern = r"\d{1,2}\s+\d{4}|\d{1,2}[./-]\d{4}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}"
+    for match in re.finditer(pattern, text):
+        try:
+            parsed = parse_expiry_date(match.group(0))
+        except Exception:
+            continue
+        context = text[max(0, match.start() - 25):match.start()].upper()
+        score = 0 if re.search(r"EXP|EXPIRY|ΛΗΞΗ", context) else 1
+        candidates.append((score, match.start(), parsed))
+    return list(dict.fromkeys([item[2] for item in sorted(candidates)]))
+
+
+def parse_machine_readable_fields(raw_value: str) -> dict[str, str]:
+    raw = str(raw_value or "").strip()
     normalized = raw.replace("(", "").replace(")", "")
-    fields = {"gtin": "", "lot_number": "", "serial_number": "", "expiry_date": ""}
+    fields = {"pc_code": "", "gtin": "", "lot_number": "", "serial_number": "", "expiry_date": ""}
     idx = 0
     fixed = {"01": ("gtin", 14), "17": ("expiry_date", 6)}
     variable = {"10": "lot_number", "21": "serial_number"}
@@ -1041,7 +1128,14 @@ def parse_gs1_datamatrix(raw_value: str) -> dict[str, str]:
             idx = end
             continue
         idx += 1
+    text_fields = extract_back_fields(raw)
+    for key, value in text_fields.items():
+        fields[key] = fields.get(key) or value
     return fields
+
+
+def parse_gs1_datamatrix(raw_value: str) -> dict[str, str]:
+    return {key: value for key, value in parse_machine_readable_fields(raw_value).items() if key != "pc_code"}
 
 
 def lookup_local_database(stock: pd.DataFrame, code: str, parsed: dict[str, str] | None = None) -> dict[str, Any] | None:
@@ -1073,6 +1167,17 @@ def lookup_local_database(stock: pd.DataFrame, code: str, parsed: dict[str, str]
                 "local": True,
             }
     return None
+
+
+def lookup_traceability_exact(stock: pd.DataFrame, pc_code: str = "", serial_number: str = "") -> pd.DataFrame:
+    if stock.empty:
+        return stock.iloc[0:0]
+    mask = pd.Series(False, index=stock.index)
+    if clean(pc_code):
+        mask |= stock["PCCode"].astype(str).str.strip().eq(clean(pc_code))
+    if clean(serial_number):
+        mask |= stock["SerialNumber"].astype(str).str.strip().eq(clean(serial_number))
+    return stock[mask]
 
 
 def _openfacts_lookup(code: str, base_url: str, source: str) -> dict[str, Any] | None:
@@ -1287,13 +1392,13 @@ def main():
                 st.write("OCR raw values", ocr_debug.get("raw_values"))
                 st.write("Back OCR extracted logistics", back_fields)
 
-        parsed_gs1 = parse_gs1_datamatrix(detected_code) if detected_type == "DataMatrix" and detected_code else {}
+        parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
         code_type = st.selectbox(
             "Τύπος βασικού κωδικού", ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"],
             index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_type if detected_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
         )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code)
-        lookup_code = parsed_gs1.get("gtin") or code_input
+        lookup_code = parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else "")
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
         refresh_online = st.button("Νέα online αναζήτηση", disabled=not clean(lookup_code))
@@ -1316,11 +1421,25 @@ def main():
                 st.warning("Δεν βρέθηκε online πρόταση. Χρησιμοποίησε χειροκίνητη καταχώρηση.")
 
         st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
-        pc_code = st.text_input("PC code (προαιρετικό)", value=back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""))
+        pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""))
         serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=parsed_gs1.get("serial_number") or back_fields.get("serial_number", ""))
         lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""))
         expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""))
         gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""))
+        trace_matches = lookup_traceability_exact(stock_for_lookup, pc_code, serial_number)
+        if not trace_matches.empty:
+            st.info(f"Βρέθηκαν {len(trace_matches)} τοπικές κινήσεις με ακριβές PC/SN (μόνο για traceability, όχι ταυτότητα προϊόντος).")
+        with st.expander("Επιβεβαίωση ανίχνευσης πριν την αποθήκευση", expanded=True):
+            st.write({
+                "detected_barcode": code_input if code_type == "Barcode" else "",
+                "detected_gtin": gtin,
+                "pc_code": pc_code,
+                "serial_number": serial_number,
+                "lot_number": lot_number,
+                "proposed_expiry_date": expiry_date,
+            })
+            with st.expander("Raw QR/DataMatrix debug", expanded=False):
+                st.text_area("Raw decoded value", value=code_input if code_type in {"QR", "DataMatrix"} else "", height=100)
         for warning in validate_barcode_gtin(code_input if code_type == "Barcode" else "", gtin):
             st.warning(warning)
         if online_candidates:
@@ -1368,7 +1487,7 @@ def main():
                 )
                 normalized_expiry = parse_expiry_date(expiry_date) if clean(expiry_date) else ""
                 if category == "Φάρμακο" and movement in {"Παραλαβή (+)", "Διόρθωση (+)"} and not normalized_expiry:
-                    raise InventoryError("Για stock φαρμάκου απαιτείται ημερομηνία λήξης από GS1 AI (17) ή χειροκίνητη εισαγωγή.")
+                    st.warning("Δεν υπάρχει ημερομηνία λήξης. Συνεχίζω με κενό πεδίο για χειροκίνητη συμπλήρωση αργότερα.")
                 delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
                 row = make_transaction(
                     code_type=resolved_type,
