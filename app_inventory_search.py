@@ -43,6 +43,7 @@ WS_NAME = "Transactions"
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
 FRONT_OCR_TIMEOUT_SECONDS = 12
+GREEK_PROVIDER_TIMEOUT_SECONDS = 4
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 2
 MAX_BACK_EXPIRY_OCR_CALLS = 4
@@ -179,6 +180,46 @@ def is_valid_gtin_check_digit(gtin: str) -> bool:
     for idx, digit in enumerate(reversed(body), start=1):
         total += digit * (3 if idx % 2 else 1)
     return (10 - (total % 10)) % 10 == int(digits[-1])
+
+
+def classify_barcode_value(code_type: str, value: str) -> dict[str, Any]:
+    value = clean(value)
+    result = {"type": code_type, "value": value, "checksum": "not_applicable", "valid": bool(value), "gtin": ""}
+    if code_type == "Barcode" and value.isdigit():
+        if len(value) == 13:
+            result.update({"type": "EAN-13", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value)})
+        elif len(value) == 8:
+            result.update({"type": "EAN-8", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value)})
+        elif len(value) in {12, 14}:
+            result.update({"type": "GTIN", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value), "gtin": value})
+        elif 4 <= len(value) <= 48:
+            result.update({"type": "CODE128", "valid": True})
+    elif code_type in {"QR", "DataMatrix"}:
+        parsed = parse_machine_readable_fields(value)
+        gtin = parsed.get("gtin", "")
+        result["gtin"] = gtin
+        if gtin:
+            result["checksum"] = "valid" if is_valid_gtin_check_digit(gtin) else "invalid"
+            result["valid"] = is_valid_gtin_check_digit(gtin)
+    return result
+
+
+def choose_detected_code(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [c for c in candidates if c.get("valid")]
+    for preferred in ("EAN-13", "EAN-8"):
+        matches = [c for c in valid if c.get("type") == preferred]
+        if matches:
+            selected = matches[0].copy()
+            selected["ambiguous"] = len(valid) > 1
+            return selected
+    gs1 = [c for c in valid if c.get("gtin")]
+    if gs1:
+        selected = gs1[0].copy()
+        selected["ambiguous"] = len(valid) > 1
+        return selected
+    selected = (valid or candidates or [{"type": "Barcode", "value": "", "checksum": "missing", "valid": False}])[0].copy()
+    selected["ambiguous"] = len(valid) > 1
+    return selected
 
 
 def validate_barcode_gtin(barcode: str = "", gtin: str = "") -> list[str]:
@@ -869,9 +910,9 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 values = decode_with_pyzbar(variant)
                 debug["attempts"].append(f"pyzbar:{source}:{variant_name}:ok:{len(values)}")
                 for detected_type, value, raw_type in values:
-                    item = {"decoder": "pyzbar", "source": source, "variant": variant_name, "type": detected_type, "raw_type": raw_type, "value": value}
-                    debug["raw_values"].append(item)
-                    collected.append(item)
+                    candidate = classify_barcode_value(detected_type, value)
+                    candidate.update({"decoder": "pyzbar", "source": source, "variant": variant_name, "raw_type": raw_type})
+                    debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"pyzbar:{source}:{variant_name}:failed")
                 debug["errors"].append(f"pyzbar {source} {variant_name}: {exc}")
@@ -884,10 +925,9 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:ok:{len(found)}")
                 for value in found:
                     if value:
-                        code_type = "EAN-13" if value.isdigit() and len(value) == 13 else "EAN-8" if value.isdigit() and len(value) == 8 else "CODE128"
-                        item = {"decoder": "opencv_barcode", "source": source, "variant": variant_name, "type": code_type, "value": value}
-                        debug["raw_values"].append(item)
-                        collected.append(item)
+                        candidate = classify_barcode_value("Barcode" if value.isdigit() else "Other", value)
+                        candidate.update({"decoder": "opencv_barcode", "source": source, "variant": variant_name})
+                        debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:failed")
                 debug["errors"].append(f"opencv_barcode {source} {variant_name}: {exc}")
@@ -897,18 +937,15 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 value = clean(value)
                 debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:ok:{1 if value else 0}")
                 if value:
-                    item = {"decoder": "opencv_qr", "source": source, "variant": variant_name, "type": "QR", "value": value}
-                    debug["raw_values"].append(item)
-                    collected.append(item)
+                    candidate = classify_barcode_value("QR", value)
+                    candidate.update({"decoder": "opencv_qr", "source": source, "variant": variant_name})
+                    debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:failed")
                 debug["errors"].append(f"opencv_qr {source} {variant_name}: {exc}")
-        if collected and source == "back":
-            break
-    selection = select_barcode_candidate(collected)
-    debug.update(selection)
-    selected = selection["selected"]
-    return selected.get("type", "Barcode"), selected.get("gtin") or selected.get("value", ""), debug
+    selected = choose_detected_code(debug["raw_values"])
+    debug["selected"] = selected
+    return selected.get("type", "Barcode"), selected.get("value", ""), debug
 
 
 def tesseract_status() -> dict[str, str]:
@@ -1661,13 +1698,16 @@ def main():
         else:
             st.session_state.lookup_selected_product = None
             if online_suggestion.get("provider"):
-                st.info("Βρέθηκε ελληνική online πρόταση. Τα αποτελέσματα είναι προσωρινά και χρειάζονται επιβεβαίωση.")
+                st.info("Βρέθηκε ελληνική online πρόταση. Η πηγή φαίνεται προσωρινά εδώ και χρειάζεται επιβεβαίωση.")
                 suggested_product = online_suggestion.get("product_name") or suggested_product
                 suggested_brand = online_suggestion.get("brand") or suggested_brand
                 suggested_strength = online_suggestion.get("strength") or suggested_strength
                 suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
             elif clean(lookup_code):
-                st.warning("Δεν βρέθηκε ελληνική online πρόταση. Άνοιξε η χειροκίνητη καταχώρηση με προσυμπληρωμένο τον κωδικό.")
+                provider_errors = [t for t in greek_provider_trace if t.get("error")]
+                if provider_errors:
+                    st.warning("Σφάλμα σε ελληνικό provider, συνεχίστηκε η ροή με χειροκίνητη καταχώρηση.")
+                st.warning("Δεν βρέθηκε ελληνική online πρόταση. Άνοιξε χειροκίνητη καταχώρηση με προσυμπληρωμένο barcode.")
 
         st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
         pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""), key=f"pc_code_{_lookup_context_key(lookup_code, image_context)}")
@@ -1694,6 +1734,14 @@ def main():
         if online_candidates:
             st.write("Ελληνικές online προτάσεις (έως 3) — η πηγή εμφανίζεται μόνο εδώ για έγκριση")
             st.dataframe(pd.DataFrame(online_candidates), use_container_width=True)
+        with st.expander("Debug ελληνικής αναζήτησης", expanded=False):
+            selected_debug = barcode_debug.get("selected", {})
+            st.write("Detected code type", selected_debug.get("type", detected_type))
+            st.write("Detected barcode value", selected_debug.get("value", detected_code))
+            st.write("Barcode checksum result", selected_debug.get("checksum"))
+            st.write("Local lookup result", barcode_debug.get("local_lookup_result", "not_attempted"))
+            st.write("Greek providers attempted", greek_provider_trace)
+            st.write("Result count per provider", {t.get("provider"): t.get("count", 0) for t in greek_provider_trace})
         with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
             product = st.text_input("Όνομα προϊόντος", value=suggested_product, key=f"lookup_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
             brand = st.text_input("Μάρκα", value=suggested_brand, key=f"lookup_brand_{_lookup_context_key(lookup_code, gtin, image_context)}")
