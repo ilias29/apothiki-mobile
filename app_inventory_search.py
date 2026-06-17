@@ -50,6 +50,8 @@ MIN_VALID_EXPIRY_YEAR = 2020
 
 
 
+DEPRECATED_COLUMNS = {"LookupSource", "LookupTimestamp", "PackageSize"}
+
 COLUMNS = [
     "TransactionId",
     "Timestamp",
@@ -199,6 +201,16 @@ def deterministic_compensation_id(transaction_id: str) -> str:
     return f"compensation-{clean(transaction_id)}"
 
 
+def _delete_sheet_columns(ws, column_numbers: list[int]) -> None:
+    for column_number in sorted(column_numbers, reverse=True):
+        if hasattr(ws, "delete_columns"):
+            ws.delete_columns(column_number, column_number)
+        elif hasattr(ws, "delete_cols"):
+            ws.delete_cols(column_number, column_number)
+        else:
+            raise AttributeError("Worksheet does not support column deletion")
+
+
 def validate_and_migrate_headers(ws) -> tuple[list[str], list[str]]:
     headers = [clean(h) for h in ws.row_values(1)]
     if not headers or not any(headers):
@@ -215,11 +227,24 @@ def validate_and_migrate_headers(ws) -> tuple[list[str], list[str]]:
             "Υπάρχουν διπλές επικεφαλίδες στο Google Sheet: "
             + ", ".join(duplicates)
         )
+    deprecated_indexes = [
+        index
+        for index, header in enumerate(headers, start=1)
+        if header in DEPRECATED_COLUMNS
+    ]
+    if deprecated_indexes:
+        try:
+            _delete_sheet_columns(ws, deprecated_indexes)
+            headers = [clean(h) for h in ws.row_values(1)]
+        except Exception:
+            headers = [header for header in headers if header not in DEPRECATED_COLUMNS]
+            ws.update("A1", [headers])
+
     missing = [column for column in COLUMNS if column not in headers]
     if missing:
         headers = headers + missing
         ws.update("A1", [headers])
-    unknown = [header for header in headers if header not in COLUMNS]
+    unknown = [header for header in headers if header not in COLUMNS and header not in DEPRECATED_COLUMNS]
     return headers, unknown
 
 
@@ -261,6 +286,11 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     legacy_kind = df["MovementKind"].str.strip().eq("")
     df.loc[legacy_kind, "MovementKind"] = NORMAL
 
+    df["Προϊόν"] = df["Προϊόν"].map(lambda value: normalize_spaces(value).upper())
+    df["Μάρκα"] = df["Μάρκα"].map(lambda value: normalize_spaces(value).upper())
+    df["DosageForm"] = df["DosageForm"].map(lambda value: normalize_spaces(value).upper())
+    df["Strength"] = df["Strength"].map(normalize_strength)
+
     df["DeltaQty"] = pd.to_numeric(df["DeltaQty"], errors="coerce").fillna(0).astype(int)
     df["LocationId"] = pd.to_numeric(df["LocationId"], errors="coerce").fillna(-1).astype(int)
     df["Voided"] = df["Voided"].map(normalize_bool)
@@ -278,9 +308,10 @@ def load_data(ws) -> tuple[pd.DataFrame, list[str]]:
 
 def append_row(ws, row: dict[str, Any]) -> None:
     headers, _ = validate_and_migrate_headers(ws)
+    writable_headers = [header for header in headers if header not in DEPRECATED_COLUMNS]
     try:
         ws.append_row(
-            [row.get(header, "") for header in headers],
+            [row.get(header, "") for header in writable_headers],
             value_input_option="RAW",
         )
     except Exception as exc:
@@ -374,10 +405,10 @@ def make_transaction(
         "ExpiryDate": clean(expiry_date),
         "QRRawData": clean(qr_raw_data),
         "DataMatrixRawData": clean(datamatrix_raw_data),
-        "Strength": clean(strength),
-        "DosageForm": clean(dosage_form),
-        "Μάρκα": clean(brand),
-        "Προϊόν": clean(product),
+        "Strength": normalize_strength(strength),
+        "DosageForm": normalize_spaces(dosage_form).upper(),
+        "Μάρκα": normalize_spaces(brand).upper(),
+        "Προϊόν": normalize_spaces(product).upper(),
         "Κατηγορία": clean(category),
         "LocationId": int(location_id),
         "Τοποθεσία": LOCATIONS[int(location_id)],
