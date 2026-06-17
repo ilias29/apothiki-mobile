@@ -717,6 +717,7 @@ LOOKUP_STATE_KEYS = {
     "lookup_stock_entry_product",
     "lookup_context",
     "lookup_last_search_value",
+    "lookup_manual_barcode",
 }
 
 APPROVAL_FORM_KEYS = {
@@ -749,6 +750,7 @@ def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis
             "expiry_date_",
             "gtin_",
             "online_refresh_",
+            "lookup_manual_barcode_",
         )):
             st.session_state.pop(key, None)
     if clear_analysis:
@@ -761,6 +763,12 @@ def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis
             "back_image_hash",
             "analysis_ran",
             "analysis_timed_out",
+            "lookup_qr_datamatrix_result",
+            "lookup_expiry_result",
+            "lookup_ocr_result",
+            "lookup_manual_barcode",
+            "lookup_online_candidates",
+            "lookup_selected_product",
         ]:
             st.session_state.pop(key, None)
     for key, value in preserve.items():
@@ -797,6 +805,7 @@ def init_analysis_state() -> None:
         "analysis_cache": {},
         "analysis_ran": False,
         "analysis_timed_out": False,
+        "upload_generation": 0,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -826,13 +835,37 @@ def decoder_status() -> dict[str, str]:
 
 
 def barcode_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    variants = [("original_rgb", image), ("grayscale", gray)]
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB) if image.ndim == 2 else image
+    pil_gray = Image.fromarray(gray)
+    variants = [("original_rgb", rgb), ("grayscale", gray)]
     for scale in (2, 3):
-        variants.append((f"resized_{scale}x", cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)))
-    _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("thresholded", thresholded))
+        variants.append((f"upscale_{scale}x", cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)))
+    contrast = ImageEnhance.Contrast(Image.fromarray(rgb)).enhance(1.8)
+    variants.append(("increased_contrast", np.array(contrast)))
+    adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    variants.append(("adaptive_threshold", adaptive))
+    sharpened = pil_gray.filter(ImageFilter.SHARPEN).filter(ImageFilter.SHARPEN)
+    variants.append(("sharpened_grayscale", np.array(sharpened)))
     return variants
+
+
+def barcode_crops(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    h, w = image.shape[:2]
+    x0, x1 = int(w * 0.25), int(w * 0.75)
+    y0, y1 = int(h * 0.25), int(h * 0.75)
+    return [
+        ("complete", image),
+        ("upper_half", image[: h // 2, :]),
+        ("lower_half", image[h // 2 :, :]),
+        ("left_half", image[:, : w // 2]),
+        ("right_half", image[:, w // 2 :]),
+        ("central_region", image[y0:y1, x0:x1]),
+    ]
+
+
+def barcode_rotations(image: np.ndarray) -> list[tuple[int, np.ndarray]]:
+    return [(0, image), (90, np.rot90(image, 3)), (180, np.rot90(image, 2)), (270, np.rot90(image, 1))]
 
 
 def classify_pyzbar_type(kind: str) -> str:
@@ -899,52 +932,59 @@ def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
 
 
 def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
-    debug: dict[str, Any] = {"decoders": decoder_status(), "attempts": [], "errors": [], "raw_values": []}
-    collected: list[dict[str, str]] = []
-    # Back/second photo is intentionally the primary source for product identity. Front is only a rescue path.
+    debug: dict[str, Any] = {
+        "decoders": decoder_status(), "attempts": [], "errors": [], "raw_values": [],
+        "rejected_checksum_values": [], "dimensions": {}, "exif_orientation_applied": True,
+        "rotations_attempted": [], "crops_attempted": [], "variants_attempted": [],
+    }
+    # Back/second photo remains the primary source; front is only a rescue path.
     for source, image in [("back", back), ("front", front)]:
         if image is None:
             continue
-        for variant_name, variant in barcode_variants(image):
-            try:
-                values = decode_with_pyzbar(variant)
-                debug["attempts"].append(f"pyzbar:{source}:{variant_name}:ok:{len(values)}")
-                for detected_type, value, raw_type in values:
-                    candidate = classify_barcode_value(detected_type, value)
-                    candidate.update({"decoder": "pyzbar", "source": source, "variant": variant_name, "raw_type": raw_type})
-                    debug["raw_values"].append(candidate)
-            except Exception as exc:
-                debug["attempts"].append(f"pyzbar:{source}:{variant_name}:failed")
-                debug["errors"].append(f"pyzbar {source} {variant_name}: {exc}")
-
-            try:
-                detector = cv2.barcode.BarcodeDetector()
-                bgr = cv2.cvtColor(variant, cv2.COLOR_RGB2BGR) if variant.ndim == 3 else variant
-                ok, values, _, _ = detector.detectAndDecode(bgr)
-                found = [clean(v) for v in values] if ok and values is not None else []
-                debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:ok:{len(found)}")
-                for value in found:
-                    if value:
-                        candidate = classify_barcode_value("Barcode" if value.isdigit() else "Other", value)
-                        candidate.update({"decoder": "opencv_barcode", "source": source, "variant": variant_name})
-                        debug["raw_values"].append(candidate)
-            except Exception as exc:
-                debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:failed")
-                debug["errors"].append(f"opencv_barcode {source} {variant_name}: {exc}")
-
-            try:
-                value, _, _ = cv2.QRCodeDetector().detectAndDecode(variant)
-                value = clean(value)
-                debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:ok:{1 if value else 0}")
-                if value:
-                    candidate = classify_barcode_value("QR", value)
-                    candidate.update({"decoder": "opencv_qr", "source": source, "variant": variant_name})
-                    debug["raw_values"].append(candidate)
-            except Exception as exc:
-                debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:failed")
-                debug["errors"].append(f"opencv_qr {source} {variant_name}: {exc}")
+        debug["dimensions"][source] = {"width": int(image.shape[1]), "height": int(image.shape[0])}
+        for rotation, rotated in barcode_rotations(image):
+            debug["rotations_attempted"].append(f"{source}:{rotation}")
+            for crop_name, cropped in barcode_crops(rotated):
+                if cropped.size == 0:
+                    continue
+                debug["crops_attempted"].append(f"{source}:{rotation}:{crop_name}")
+                for variant_name, variant in barcode_variants(cropped):
+                    debug["variants_attempted"].append(f"{source}:{rotation}:{crop_name}:{variant_name}")
+                    location = f"{source}:{rotation}:{crop_name}:{variant_name}"
+                    for decoder_name in ("pyzbar", "opencv_barcode", "opencv_qr"):
+                        try:
+                            values = []
+                            if decoder_name == "pyzbar":
+                                values = decode_with_pyzbar(variant)
+                            elif decoder_name == "opencv_barcode":
+                                detector = cv2.barcode.BarcodeDetector()
+                                bgr = cv2.cvtColor(variant, cv2.COLOR_RGB2BGR) if variant.ndim == 3 else variant
+                                ok, decoded_values, _, _ = detector.detectAndDecode(bgr)
+                                if ok and decoded_values is not None:
+                                    values = [("Barcode" if clean(v).isdigit() else "Other", clean(v), "opencv") for v in decoded_values if clean(v)]
+                            else:
+                                value, _, _ = cv2.QRCodeDetector().detectAndDecode(variant)
+                                values = [("QR", clean(value), "opencv_qr")] if clean(value) else []
+                            debug["attempts"].append(f"{decoder_name}:{location}:ok:{len(values)}")
+                            for detected_type, value, raw_type in values:
+                                candidate = classify_barcode_value(detected_type, value)
+                                candidate.update({"decoder": decoder_name, "source": source, "rotation": rotation, "crop": crop_name, "variant": variant_name, "raw_type": raw_type})
+                                if candidate.get("checksum") == "invalid":
+                                    debug["rejected_checksum_values"].append(candidate)
+                                debug["raw_values"].append(candidate)
+                            selected = choose_detected_code(debug["raw_values"])
+                            if selected.get("type") == "EAN-13" and selected.get("valid") and not selected.get("ambiguous"):
+                                debug["selected"] = selected
+                                debug["candidates"] = [c for c in debug["raw_values"] if c.get("valid")]
+                                debug["ambiguous"] = False
+                                return selected.get("type", "Barcode"), selected.get("value", ""), debug
+                        except Exception as exc:
+                            debug["attempts"].append(f"{decoder_name}:{location}:failed")
+                            debug["errors"].append(f"{decoder_name} {location}: {exc}")
     selected = choose_detected_code(debug["raw_values"])
     debug["selected"] = selected
+    debug["candidates"] = [c for c in debug["raw_values"] if c.get("valid")]
+    debug["ambiguous"] = selected.get("ambiguous", False)
     return selected.get("type", "Barcode"), selected.get("value", ""), debug
 
 
@@ -1197,7 +1237,7 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
         st.session_state.analysis_timed_out = False
         return
 
-    progress = st.progress(0, text="Reading barcode")
+    progress = st.progress(0, text="Αναλύεται η δεύτερη φωτογραφία...")
     detected_type, detected_code, barcode_debug = detect_code(front_image, back_image)
     st.session_state.barcode_result = {"type": detected_type, "value": detected_code, "debug": barcode_debug}
 
@@ -1525,16 +1565,16 @@ def main():
     with entry_tab:
         st.subheader("Καταχώρηση")
         left, right = st.columns(2)
+        init_analysis_state()
+        generation = st.session_state.upload_generation
         with left:
-            front_file = st.camera_input("Φωτογραφία πρόσοψης", key="front") or st.file_uploader(
-                "Ή ανέβασε πρόσοψη", ["jpg", "jpeg", "png"], key="front_up"
+            front_file = st.camera_input("Φωτογραφία πρόσοψης", key=f"front_camera_{generation}") or st.file_uploader(
+                "Ή ανέβασε πρόσοψη", ["jpg", "jpeg", "png"], key=f"front_image_{generation}"
             )
         with right:
-            back_file = st.camera_input("Φωτογραφία πίσω / Barcode / QR", key="back") or st.file_uploader(
-                "Ή ανέβασε πίσω", ["jpg", "jpeg", "png"], key="back_up"
+            back_file = st.camera_input("Φωτογραφία πίσω / Barcode / QR", key=f"back_camera_{generation}") or st.file_uploader(
+                "Ή ανέβασε πίσω", ["jpg", "jpeg", "png"], key=f"back_image_{generation}"
             )
-
-        init_analysis_state()
         front_hash = file_hash(front_file)
         back_hash = file_hash(back_file)
         front_image = to_img(front_file) if front_file else None
@@ -1549,11 +1589,20 @@ def main():
             )
             init_analysis_state()
 
-        if st.button("Νέα αναζήτηση", use_container_width=True):
-            reset_lookup_state(clear_analysis=True)
-            st.session_state["search_query_source_of_truth"] = ""
-            init_analysis_state()
-            st.rerun()
+        reset_col, clear_col = st.columns(2)
+        with reset_col:
+            if st.button("Νέα αναζήτηση", use_container_width=True):
+                st.session_state.upload_generation += 1
+                reset_lookup_state(clear_analysis=True)
+                st.session_state["search_query_source_of_truth"] = ""
+                init_analysis_state()
+                st.rerun()
+        with clear_col:
+            if st.button("Καθαρισμός φωτογραφιών", use_container_width=True):
+                st.session_state.upload_generation += 1
+                reset_lookup_state(clear_analysis=True)
+                init_analysis_state()
+                st.rerun()
 
         if st.button("Ανάλυση φωτογραφιών", type="primary", use_container_width=True, disabled=front_image is None and back_image is None):
             run_photo_analysis(front_image, back_image, front_hash, back_hash)
@@ -1583,8 +1632,10 @@ def main():
             st.warning("Η ανάλυση καθυστέρησε. Δοκίμασε πιο καθαρή φωτογραφία.")
 
         if has_current_analysis and detected_code:
-            st.success(f"Βρέθηκε {detected_type}: {detected_code}")
-        elif has_current_analysis and (front_image is not None or back_image is not None):
+            st.success(f"Βρέθηκε barcode: {detected_code}")
+        elif has_current_analysis and back_image is not None:
+            st.warning("Δεν εντοπίστηκε barcode στη δεύτερη φωτογραφία.")
+        elif has_current_analysis and front_image is not None:
             st.warning("Δεν διαβάστηκε barcode. Δοκίμασε πιο κοντινή και καθαρή φωτογραφία.")
 
         if has_current_analysis and front_image is not None:
@@ -1615,10 +1666,16 @@ def main():
                 st.write("Front image hash", front_hash)
                 st.write("Back image hash", back_hash)
                 st.write("Used cached/current analysis", has_current_analysis)
+                st.write("Image dimensions", barcode_debug.get("dimensions"))
+                st.write("EXIF orientation applied", barcode_debug.get("exif_orientation_applied"))
+                st.write("Rotations attempted", barcode_debug.get("rotations_attempted"))
+                st.write("Crops attempted", barcode_debug.get("crops_attempted"))
+                st.write("Variants attempted", barcode_debug.get("variants_attempted"))
                 st.write("Decoders", barcode_debug.get("decoders"))
                 st.write("Barcode attempts", barcode_debug.get("attempts"))
                 st.write("Barcode failures", barcode_debug.get("errors"))
                 st.write("Detected raw barcode values", barcode_debug.get("raw_values"))
+                st.write("Rejected checksum values", barcode_debug.get("rejected_checksum_values"))
                 st.write("OCR availability", ocr_debug.get("ocr"))
                 st.write("OCR language", ocr_debug.get("language"))
                 st.write("OCR PSM modes", ocr_debug.get("psm_modes"))
@@ -1656,12 +1713,16 @@ def main():
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
         detected_gtin = parsed_gs1.get("gtin", "")
         image_context = _lookup_context_key(front_hash, back_hash, detected_code, detected_gtin)
+        code_type_options = ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"]
+        default_code_type = "Barcode" if detected_type in {"EAN-8", "EAN-13", "CODE128"} else detected_type
         code_type = st.selectbox(
-            "Τύπος βασικού κωδικού", ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"],
-            index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_type if detected_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
+            "Τύπος βασικού κωδικού", code_type_options,
+            index=code_type_options.index(default_code_type if default_code_type in code_type_options else "Other"),
             key=f"code_type_{image_context}",
         )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code, key=f"code_input_{image_context}")
+        if has_current_analysis and not detected_code:
+            code_input = st.text_input("Χειροκίνητο barcode", value=code_input, key=f"lookup_manual_barcode_{image_context}")
         lookup_code = clean(parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else ""))
         if lookup_code != st.session_state.get("lookup_last_search_value", ""):
             reset_lookup_state(
