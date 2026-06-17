@@ -43,6 +43,7 @@ WS_NAME = "Transactions"
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
 FRONT_OCR_TIMEOUT_SECONDS = 12
+GREEK_PROVIDER_TIMEOUT_SECONDS = 4
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 2
 MAX_BACK_EXPIRY_OCR_CALLS = 4
@@ -179,6 +180,46 @@ def is_valid_gtin_check_digit(gtin: str) -> bool:
     for idx, digit in enumerate(reversed(body), start=1):
         total += digit * (3 if idx % 2 else 1)
     return (10 - (total % 10)) % 10 == int(digits[-1])
+
+
+def classify_barcode_value(code_type: str, value: str) -> dict[str, Any]:
+    value = clean(value)
+    result = {"type": code_type, "value": value, "checksum": "not_applicable", "valid": bool(value), "gtin": ""}
+    if code_type == "Barcode" and value.isdigit():
+        if len(value) == 13:
+            result.update({"type": "EAN-13", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value)})
+        elif len(value) == 8:
+            result.update({"type": "EAN-8", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value)})
+        elif len(value) in {12, 14}:
+            result.update({"type": "GTIN", "checksum": "valid" if is_valid_gtin_check_digit(value) else "invalid", "valid": is_valid_gtin_check_digit(value), "gtin": value})
+        elif 4 <= len(value) <= 48:
+            result.update({"type": "CODE128", "valid": True})
+    elif code_type in {"QR", "DataMatrix"}:
+        parsed = parse_machine_readable_fields(value)
+        gtin = parsed.get("gtin", "")
+        result["gtin"] = gtin
+        if gtin:
+            result["checksum"] = "valid" if is_valid_gtin_check_digit(gtin) else "invalid"
+            result["valid"] = is_valid_gtin_check_digit(gtin)
+    return result
+
+
+def choose_detected_code(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [c for c in candidates if c.get("valid")]
+    for preferred in ("EAN-13", "EAN-8"):
+        matches = [c for c in valid if c.get("type") == preferred]
+        if matches:
+            selected = matches[0].copy()
+            selected["ambiguous"] = len(valid) > 1
+            return selected
+    gs1 = [c for c in valid if c.get("gtin")]
+    if gs1:
+        selected = gs1[0].copy()
+        selected["ambiguous"] = len(valid) > 1
+        return selected
+    selected = (valid or candidates or [{"type": "Barcode", "value": "", "checksum": "missing", "valid": False}])[0].copy()
+    selected["ambiguous"] = len(valid) > 1
+    return selected
 
 
 def validate_barcode_gtin(barcode: str = "", gtin: str = "") -> list[str]:
@@ -740,8 +781,9 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 values = decode_with_pyzbar(variant)
                 debug["attempts"].append(f"pyzbar:{source}:{variant_name}:ok:{len(values)}")
                 for detected_type, value, raw_type in values:
-                    debug["raw_values"].append({"decoder": "pyzbar", "source": source, "variant": variant_name, "type": raw_type, "value": value})
-                    return detected_type, value, debug
+                    candidate = classify_barcode_value(detected_type, value)
+                    candidate.update({"decoder": "pyzbar", "source": source, "variant": variant_name, "raw_type": raw_type})
+                    debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"pyzbar:{source}:{variant_name}:failed")
                 debug["errors"].append(f"pyzbar {source} {variant_name}: {exc}")
@@ -754,8 +796,9 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:ok:{len(found)}")
                 for value in found:
                     if value:
-                        debug["raw_values"].append({"decoder": "opencv_barcode", "source": source, "variant": variant_name, "value": value})
-                        return ("Barcode" if value.isdigit() else "Other"), value, debug
+                        candidate = classify_barcode_value("Barcode" if value.isdigit() else "Other", value)
+                        candidate.update({"decoder": "opencv_barcode", "source": source, "variant": variant_name})
+                        debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"opencv_barcode:{source}:{variant_name}:failed")
                 debug["errors"].append(f"opencv_barcode {source} {variant_name}: {exc}")
@@ -765,12 +808,15 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                 value = clean(value)
                 debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:ok:{1 if value else 0}")
                 if value:
-                    debug["raw_values"].append({"decoder": "opencv_qr", "source": source, "variant": variant_name, "value": value})
-                    return "QR", value, debug
+                    candidate = classify_barcode_value("QR", value)
+                    candidate.update({"decoder": "opencv_qr", "source": source, "variant": variant_name})
+                    debug["raw_values"].append(candidate)
             except Exception as exc:
                 debug["attempts"].append(f"opencv_qr:{source}:{variant_name}:failed")
                 debug["errors"].append(f"opencv_qr {source} {variant_name}: {exc}")
-    return "Barcode", "", debug
+    selected = choose_detected_code(debug["raw_values"])
+    debug["selected"] = selected
+    return selected.get("type", "Barcode"), selected.get("value", ""), debug
 
 
 def tesseract_status() -> dict[str, str]:
@@ -1211,58 +1257,80 @@ def lookup_traceability_exact(stock: pd.DataFrame, pc_code: str = "", serial_num
     return stock[mask]
 
 
-def _openfacts_lookup(code: str, base_url: str, source: str) -> dict[str, Any] | None:
+GREEK_PROVIDER_URLS = [
+    ("Skroutz", "https://www.skroutz.gr/search?keyphrase={code}"),
+    ("BestPrice", "https://www.bestprice.gr/search?q={code}"),
+    ("Pharmacy295", "https://www.pharmacy295.gr/el/search?search={code}"),
+]
+
+
+def _extract_jsonld_products(html: str) -> list[dict[str, Any]]:
+    products = []
+    for match in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.I | re.S):
+        try:
+            import json
+            data = json.loads(match.group(1).strip())
+        except Exception:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            graph = item.get("@graph", []) if isinstance(item, dict) else []
+            for node in ([item] if isinstance(item, dict) else []) + [g for g in graph if isinstance(g, dict)]:
+                typ = node.get("@type", "")
+                if "Product" in (typ if isinstance(typ, list) else [typ]):
+                    brand = node.get("brand", "")
+                    if isinstance(brand, dict):
+                        brand = brand.get("name", "")
+                    products.append(normalize_product_fields({
+                        "product_name": node.get("name", ""),
+                        "brand": brand,
+                        "barcode": node.get("gtin13", "") or node.get("gtin", "") or node.get("sku", ""),
+                        "gtin": node.get("gtin14", "") or node.get("gtin13", "") or node.get("gtin", ""),
+                    }))
+    return products
+
+
+def lookup_greek_provider(code: str, provider: str, url_template: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    trace = {"provider": provider, "ok": False, "count": 0, "error": ""}
     if not clean(code):
-        return None
+        return [], trace
     try:
-        response = requests.get(f"{base_url}/api/v2/product/{clean(code)}.json", timeout=6)
-        if response.status_code != 200:
-            return None
-        payload = response.json()
-    except Exception:
-        return None
-    if payload.get("status") != 1:
-        return None
-    product = payload.get("product", {})
-    fields = normalize_product_fields({
-        "product_name": product.get("product_name") or product.get("generic_name", ""),
-        "brand": product.get("brands", ""),
-        "category": product.get("categories", ""),
-        "strength": "",
-        "dosage_form": "",
-    })
-    fields.update({"provider": source, "local": False})
-    return fields
+        url = url_template.format(code=requests.utils.quote(clean(code)))
+        response = requests.get(url, timeout=GREEK_PROVIDER_TIMEOUT_SECONDS, headers={"User-Agent": "ApothikiMobile/1.0"})
+        response.raise_for_status()
+        products = _extract_jsonld_products(response.text)
+        for product in products:
+            product["provider"] = provider
+            product["local"] = False
+            if not product.get("barcode") and clean(code).isdigit():
+                product["barcode"] = clean(code)
+        trace.update({"ok": True, "count": len(products)})
+        return products[:3], trace
+    except requests.RequestException as exc:
+        trace["error"] = f"connection: {exc}"
+    except Exception as exc:
+        trace["error"] = f"parsing: {exc}"
+    return [], trace
 
 
-def lookup_open_product_provider(code: str) -> dict[str, Any] | None:
-    return _openfacts_lookup(code, "https://world.openfoodfacts.org", "Open Food Facts")
-
-
-def lookup_additional_provider(code: str) -> dict[str, Any] | None:
-    return _openfacts_lookup(code, "https://world.openbeautyfacts.org", "Open Beauty Facts")
-
-
-def lookup_openpharma_provider(code: str) -> dict[str, Any] | None:
-    return _openfacts_lookup(code, "https://world.openproductsfacts.org", "Open Products Facts")
-
-
-def lookup_web_search_provider(code: str) -> dict[str, Any] | None:
-    template = clean(st.secrets.get("BARCODE_WEB_SEARCH_URL", ""))
-    if not template or not clean(code):
-        return None
-    return {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": f"Web search: {template.format(code=clean(code))}", "local": False}
+def greek_online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    terms = [clean(code)]
+    if clean(product_name):
+        terms.append(f'"{clean(product_name)}"')
+    candidates: list[dict[str, Any]] = []
+    traces: list[dict[str, Any]] = []
+    for term in [t for t in terms if t]:
+        for provider, url in GREEK_PROVIDER_URLS:
+            found, trace = lookup_greek_provider(term, provider, url)
+            traces.append(trace | {"term": term})
+            candidates.extend(found)
+            if len(candidates) >= 3:
+                return candidates[:3], traces
+    return candidates[:3], traces
 
 
 def online_lookup_candidates(code: str) -> list[dict[str, Any]]:
-    candidates = [
-        lookup_open_product_provider(code),
-        lookup_additional_provider(code),
-        lookup_openpharma_provider(code),
-        lookup_web_search_provider(code),
-    ]
-    return [normalize_product_fields(c or {}) | {"provider": (c or {}).get("provider", ""), "local": False} for c in candidates if c][:3]
-
+    return greek_online_lookup_candidates(code)[0]
 
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
     merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": ""}
@@ -1422,19 +1490,27 @@ def main():
                     ]), use_container_width=True)
                 st.write("OCR raw values", ocr_debug.get("raw_values"))
                 st.write("Back OCR extracted logistics", back_fields)
+                st.write("Detected code type", detected_type)
+                st.write("Detected barcode value", detected_code)
+                st.write("Barcode checksum result", barcode_debug.get("selected", {}).get("checksum"))
+                st.write("Local lookup result", barcode_debug.get("local_lookup_result", "pending"))
+                st.write("Greek providers attempted", barcode_debug.get("greek_providers_attempted", []))
 
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
+        detected_ui_type = "Barcode" if detected_type in {"EAN-13", "EAN-8", "CODE128", "Barcode"} else detected_type
         code_type = st.selectbox(
             "Τύπος βασικού κωδικού", ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"],
-            index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_type if detected_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
+            index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_ui_type if detected_ui_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
         )
         code_input = st.text_input("Barcode / QR / Other", value=detected_code)
         lookup_code = parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else "")
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
-        refresh_online = st.button("Νέα online αναζήτηση", disabled=not clean(lookup_code))
-        online_candidates = online_lookup_candidates(lookup_code) if clean(lookup_code) and (not local_product or refresh_online) else []
+        refresh_online = st.button("Νέα ελληνική online αναζήτηση", disabled=not clean(lookup_code) or bool(local_product))
+        online_candidates, greek_provider_trace = greek_online_lookup_candidates(lookup_code, suggested_product) if clean(lookup_code) and not local_product else ([], [])
         online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
+        barcode_debug["local_lookup_result"] = "found" if local_product else "not_found" if clean(lookup_code) else "not_attempted"
+        barcode_debug["greek_providers_attempted"] = greek_provider_trace
         if local_product and not online_suggestion:
             st.success(f"Βρέθηκε τοπικά: {local_product.get('product_name')} | stock: {local_product.get('stock')}")
             suggested_product = local_product.get("product_name", suggested_product)
@@ -1443,13 +1519,16 @@ def main():
             suggested_dosage_form = local_product.get("dosage_form", suggested_dosage_form)
         else:
             if online_suggestion.get("provider"):
-                st.info("Τα online αποτελέσματα είναι μόνο προτάσεις και χρειάζονται επιβεβαίωση.")
+                st.info("Βρέθηκε ελληνική online πρόταση. Η πηγή φαίνεται προσωρινά εδώ και χρειάζεται επιβεβαίωση.")
                 suggested_product = online_suggestion.get("product_name") or suggested_product
                 suggested_brand = online_suggestion.get("brand") or suggested_brand
                 suggested_strength = online_suggestion.get("strength") or suggested_strength
                 suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
             elif clean(lookup_code):
-                st.warning("Δεν βρέθηκε online πρόταση. Χρησιμοποίησε χειροκίνητη καταχώρηση.")
+                provider_errors = [t for t in greek_provider_trace if t.get("error")]
+                if provider_errors:
+                    st.warning("Σφάλμα σε ελληνικό provider, συνεχίστηκε η ροή με χειροκίνητη καταχώρηση.")
+                st.warning("Δεν βρέθηκε ελληνική online πρόταση. Άνοιξε χειροκίνητη καταχώρηση με προσυμπληρωμένο barcode.")
 
         st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
         pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""))
@@ -1474,8 +1553,16 @@ def main():
         for warning in validate_barcode_gtin(code_input if code_type == "Barcode" else "", gtin):
             st.warning(warning)
         if online_candidates:
-            st.write("Online προτάσεις (έως 3)")
+            st.write("Ελληνικές online προτάσεις (έως 3, προσωρινή πηγή μόνο για έγκριση)")
             st.dataframe(pd.DataFrame(online_candidates), use_container_width=True)
+        with st.expander("Debug ελληνικής αναζήτησης", expanded=False):
+            selected_debug = barcode_debug.get("selected", {})
+            st.write("Detected code type", selected_debug.get("type", detected_type))
+            st.write("Detected barcode value", selected_debug.get("value", detected_code))
+            st.write("Barcode checksum result", selected_debug.get("checksum"))
+            st.write("Local lookup result", barcode_debug.get("local_lookup_result", "not_attempted"))
+            st.write("Greek providers attempted", greek_provider_trace)
+            st.write("Result count per provider", {t.get("provider"): t.get("count", 0) for t in greek_provider_trace})
         with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
             product = st.text_input("Όνομα προϊόντος", value=suggested_product)
             brand = st.text_input("Μάρκα", value=suggested_brand)

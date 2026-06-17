@@ -257,13 +257,31 @@ def test_expiry_month_year_stores_last_day():
 
 def test_merge_lookup_results_keeps_first_values_and_providers_normalized():
     merged = app.merge_lookup_results([
-        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "provider": "Open Food Facts"},
-        {"product_name": "Other", "brand": "Brand", "provider": "Open Beauty Facts"},
+        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "provider": "Greek Pharmacy"},
+        {"product_name": "Other", "brand": "Brand", "provider": "Greek Marketplace"},
     ])
     assert merged["product_name"] == "CREAM"
     assert merged["brand"] == "BRAND"
     assert "package_size" not in merged
-    assert merged["provider"] == "Open Food Facts, Open Beauty Facts"
+    assert merged["provider"] == "Greek Pharmacy, Greek Marketplace"
+
+
+def test_detected_code_prefers_valid_ean13_and_preserves_digits():
+    candidates = [
+        app.classify_barcode_value("Barcode", "12345670"),
+        app.classify_barcode_value("Barcode", "5206087700016"),
+    ]
+    selected = app.choose_detected_code(candidates)
+    assert selected["type"] == "EAN-13"
+    assert selected["value"] == "5206087700016"
+    assert selected["checksum"] == "valid"
+
+
+def test_detected_code_rejects_invalid_ean_checksum():
+    invalid = app.classify_barcode_value("Barcode", "5206087700017")
+    assert invalid["type"] == "EAN-13"
+    assert invalid["checksum"] == "invalid"
+    assert invalid["valid"] is False
 
 
 def test_search_includes_gtin_lot_and_raw_datamatrix():
