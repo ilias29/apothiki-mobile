@@ -257,31 +257,24 @@ def test_expiry_month_year_stores_last_day():
 
 def test_merge_lookup_results_keeps_first_values_and_providers_normalized():
     merged = app.merge_lookup_results([
-        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "provider": "Greek Pharmacy"},
-        {"product_name": "Other", "brand": "Brand", "provider": "Greek Marketplace"},
+        {"product_name": "Cream", "brand": "", "category": "Cosmetics", "provider": "skroutz.gr"},
+        {"product_name": "Other", "brand": "Brand", "provider": "eof.gr"},
     ])
     assert merged["product_name"] == "CREAM"
     assert merged["brand"] == "BRAND"
     assert "package_size" not in merged
-    assert merged["provider"] == "Greek Pharmacy, Greek Marketplace"
+    assert merged["provider"] == "skroutz.gr, eof.gr"
 
 
-def test_detected_code_prefers_valid_ean13_and_preserves_digits():
-    candidates = [
-        app.classify_barcode_value("Barcode", "12345670"),
-        app.classify_barcode_value("Barcode", "5206087700016"),
-    ]
-    selected = app.choose_detected_code(candidates)
-    assert selected["type"] == "EAN-13"
-    assert selected["value"] == "5206087700016"
-    assert selected["checksum"] == "valid"
-
-
-def test_detected_code_rejects_invalid_ean_checksum():
-    invalid = app.classify_barcode_value("Barcode", "5206087700017")
-    assert invalid["type"] == "EAN-13"
-    assert invalid["checksum"] == "invalid"
-    assert invalid["valid"] is False
+def test_barcode_candidate_prefers_valid_ean13_and_preserves_digits():
+    selection = app.select_barcode_candidate([
+        {"type": "CODE128", "value": "LOT123"},
+        {"type": "EAN-13", "value": "5206087700016"},
+        {"type": "EAN-13", "value": "5206087700017"},
+    ])
+    assert selection["selected"]["type"] == "EAN-13"
+    assert selection["selected"]["value"] == "5206087700016"
+    assert selection["selected"]["checksum"] == "valid"
 
 
 def test_search_includes_gtin_lot_and_raw_datamatrix():
@@ -371,5 +364,6 @@ def test_local_lookup_is_exact_barcode_or_gtin_only():
 
 def test_gtin_validation_warns_without_changing_digits():
     assert app.validate_barcode_gtin("ABC") == ["Το barcode πρέπει να περιέχει μόνο ψηφία."]
+    assert app.validate_barcode_gtin("5206087700017") == ["Το barcode έχει μη έγκυρο check digit."]
     assert app.validate_barcode_gtin(gtin="01234567890129") == ["Το GTIN έχει μη έγκυρο check digit."]
     assert app.validate_barcode_gtin(gtin="01234567890128") == []
