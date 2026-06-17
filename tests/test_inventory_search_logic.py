@@ -205,8 +205,20 @@ def test_gs1_datamatrix_parses_gtin_expiry_lot_serial():
     assert parsed["serial_number"] == "SER456"
 
 
+def test_qr_text_parses_pc_sn_lot_expiry_separately():
+    parsed = app.parse_machine_readable_fields("PC: PC123 SN: SN456 LOT: L789 EXP: 08 2028")
+    assert parsed["pc_code"] == "PC123"
+    assert parsed["serial_number"] == "SN456"
+    assert parsed["lot_number"] == "L789"
+    assert parsed["expiry_date"] == "2028-08-31"
+
+
 def test_expiry_month_year_stores_last_day():
     assert app.parse_expiry_date("02/2027") == "2027-02-28"
+    assert app.parse_expiry_date("02-2027") == "2027-02-28"
+    assert app.parse_expiry_date("02.2027") == "2027-02-28"
+    assert app.parse_expiry_date("31/12/2027") == "2027-12-31"
+    assert app.parse_expiry_date("2027-12-31") == "2027-12-31"
 
 
 def test_merge_lookup_results_keeps_first_values_and_providers_normalized():
