@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import re
 import calendar
@@ -47,6 +48,7 @@ BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 0
 MAX_BACK_EXPIRY_OCR_CALLS = 4
 MIN_VALID_EXPIRY_YEAR = 2020
+DEFAULT_STOCK_ADD_QUANTITY = 1
 
 
 
@@ -431,6 +433,8 @@ def make_transaction(
     transaction_id: str | None = None,
     void_of: str = "",
     movement_kind: str = NORMAL,
+    front_photo_url: str = "",
+    back_photo_url: str = "",
 ) -> dict[str, Any]:
     now = datetime.now()
     return {
@@ -457,8 +461,8 @@ def make_transaction(
         "Κίνηση": clean(movement),
         "Ποσότητα": int(quantity),
         "DeltaQty": int(delta),
-        "FrontPhotoUrl": "",
-        "BackPhotoUrl": "",
+        "FrontPhotoUrl": clean(front_photo_url),
+        "BackPhotoUrl": clean(back_photo_url),
         "Σημείωση": clean(note),
         "Voided": False,
         "VoidOf": clean(void_of),
@@ -727,6 +731,52 @@ APPROVAL_FORM_KEYS = {
     "lookup_confirmed_product",
 }
 
+BACK_SCAN_STATE_KEYS = {
+    "back_scan_image_hash",
+    "back_scan_barcode",
+    "back_scan_gtin",
+    "back_scan_expiry",
+    "back_scan_barcode_debug",
+    "back_scan_expiry_debug",
+}
+
+
+def clear_only_previous_back_scan_state(state: dict[str, Any] | None = None) -> None:
+    state = state if state is not None else st.session_state
+    for key in BACK_SCAN_STATE_KEYS:
+        state.pop(key, None)
+
+
+def clear_photo_scan_state(state: dict[str, Any] | None = None) -> None:
+    state = state if state is not None else st.session_state
+    clear_only_previous_back_scan_state(state)
+    state.pop("front_photo_data_url", None)
+    state.pop("front_photo_hash", None)
+
+
+def apply_back_scan_result(state: dict[str, Any], current_back_hash: str, result: dict[str, Any]) -> None:
+    if current_back_hash != state.get("back_scan_image_hash"):
+        clear_only_previous_back_scan_state(state)
+    state["back_scan_image_hash"] = current_back_hash
+    if clean(result.get("barcode", "")):
+        state["back_scan_barcode"] = clean(result["barcode"])
+    if clean(result.get("gtin", "")):
+        state["back_scan_gtin"] = clean(result["gtin"])
+    if clean(result.get("expiry", "")):
+        state["back_scan_expiry"] = clean(result["expiry"])
+    if result.get("barcode_debug") is not None:
+        state["back_scan_barcode_debug"] = result.get("barcode_debug", {})
+    if result.get("expiry_debug") is not None:
+        state["back_scan_expiry_debug"] = result.get("expiry_debug", {})
+
+
+def back_scan_values(state: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        clean(state.get("back_scan_barcode", "")),
+        clean(state.get("back_scan_gtin", "")),
+        clean(state.get("back_scan_expiry", "")),
+    )
+
 
 def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis: bool = False) -> None:
     preserve = preserve or {}
@@ -753,6 +803,7 @@ def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis
         )):
             st.session_state.pop(key, None)
     if clear_analysis:
+        clear_photo_scan_state()
         for key in [
             "barcode_result",
             "front_ocr_result",
@@ -805,6 +856,8 @@ def init_analysis_state() -> None:
         "analysis_ran": False,
         "analysis_timed_out": False,
         "upload_generation": 0,
+        "front_photo_data_url": "",
+        "front_photo_hash": "",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -1221,6 +1274,32 @@ def detect_product_name(image, deadline: float | None = None) -> tuple[dict[str,
     return fields, unique_lines, debug
 
 
+def uploaded_file_data_url(file) -> str:
+    if file is None:
+        return ""
+    mime = getattr(file, "type", None) or "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(file.getvalue()).decode('ascii')}"
+
+
+def analyze_back_photo(back_image, back_hash: str) -> dict[str, Any]:
+    detected_type, detected_code, barcode_debug = detect_code(None, back_image)
+    parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
+    expiry_fields: dict[str, str] = {"expiry_date": ""}
+    expiry_debug = _empty_ocr_debug()
+    if back_image is not None:
+        expiry_fields, _back_lines, expiry_debug = detect_back_expiry_ocr(back_image, back_hash)
+    return {
+        "type": detected_type,
+        "barcode": detected_code if detected_type == "Barcode" else "",
+        "gtin": parsed_gs1.get("gtin", detected_code if detected_type == "GTIN" else ""),
+        "expiry": parsed_gs1.get("expiry_date") or expiry_fields.get("expiry_date", ""),
+        "raw_code": detected_code,
+        "parsed": parsed_gs1,
+        "barcode_debug": barcode_debug,
+        "expiry_debug": expiry_debug,
+    }
+
+
 def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str) -> None:
     cache = st.session_state.analysis_cache
     cache_key = f"{front_hash}:{back_hash}"
@@ -1237,7 +1316,11 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
         return
 
     progress = st.progress(0, text="Αναλύεται η δεύτερη φωτογραφία...")
-    detected_type, detected_code, barcode_debug = detect_code(None, back_image)
+    result = analyze_back_photo(back_image, back_hash)
+    apply_back_scan_result(st.session_state, back_hash, result)
+    detected_type = result.get("type", "Barcode")
+    detected_code = result.get("raw_code") or result.get("gtin") or result.get("barcode", "")
+    barcode_debug = result.get("barcode_debug", {})
     st.session_state.barcode_result = {"type": detected_type, "value": detected_code, "debug": barcode_debug}
 
     progress.progress(35, text="Skipping front OCR")
@@ -1250,8 +1333,8 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
     back_lines: list[str] = []
     back_debug = _empty_ocr_debug()
     if back_image is not None:
-        expiry_fields, back_lines, back_debug = detect_back_expiry_ocr(back_image, back_hash)
-        back_fields.update(expiry_fields)
+        back_debug = result.get("expiry_debug", _empty_ocr_debug())
+        back_fields.update({"expiry_date": st.session_state.get("back_scan_expiry", "")})
     else:
         back_debug["skipped"] = "no_back_image"
     st.session_state.back_ocr_result = {"fields": back_fields, "lines": back_lines, "debug": back_debug}
@@ -1559,7 +1642,9 @@ def main():
         st.subheader("Καταχώρηση")
         init_analysis_state()
         generation = st.session_state.upload_generation
-        front_file = None
+        front_file = st.camera_input("Πρώτη/μπροστινή φωτογραφία αναφοράς (προαιρετική)", key=f"front_camera_{generation}") or st.file_uploader(
+            "Ή ανέβασε πρώτη/μπροστινή φωτογραφία αναφοράς (προαιρετική)", ["jpg", "jpeg", "png"], key=f"front_image_{generation}"
+        )
         back_file = st.camera_input("Δεύτερη/πίσω φωτογραφία για barcode και λήξη", key=f"back_camera_{generation}") or st.file_uploader(
             "Ή ανέβασε δεύτερη/πίσω φωτογραφία", ["jpg", "jpeg", "png"], key=f"back_image_{generation}"
         )
@@ -1576,6 +1661,17 @@ def main():
                 clear_analysis=True,
             )
             init_analysis_state()
+        if front_file is not None and front_hash != st.session_state.get("front_photo_hash", ""):
+            st.session_state.front_photo_hash = front_hash
+            st.session_state.front_photo_data_url = uploaded_file_data_url(front_file)
+        if back_image is not None and back_hash != st.session_state.get("back_scan_image_hash"):
+            result = analyze_back_photo(back_image, back_hash)
+            apply_back_scan_result(st.session_state, back_hash, result)
+            st.session_state.barcode_result = {"type": result.get("type", "Barcode"), "value": result.get("raw_code") or result.get("gtin") or result.get("barcode", ""), "debug": result.get("barcode_debug", {})}
+            st.session_state.back_ocr_result = {"fields": {"expiry_date": st.session_state.get("back_scan_expiry", "")}, "lines": [], "debug": result.get("expiry_debug", {})}
+            st.session_state.front_image_hash = front_hash
+            st.session_state.back_image_hash = back_hash
+            st.session_state.analysis_ran = True
 
         reset_col, clear_col = st.columns(2)
         with reset_col:
@@ -1586,7 +1682,7 @@ def main():
                 init_analysis_state()
                 st.rerun()
         with clear_col:
-            if st.button("Καθαρισμός φωτογραφίας", use_container_width=True):
+            if st.button("Καθαρισμός φωτογραφιών", use_container_width=True):
                 st.session_state.upload_generation += 1
                 reset_lookup_state(clear_analysis=True)
                 init_analysis_state()
@@ -1680,8 +1776,10 @@ def main():
                 st.write("Greek result count", st.session_state.get("greek_lookup_debug", {}).get("total_results", 0))
 
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
-        detected_gtin = parsed_gs1.get("gtin", "")
-        detected_expiry = parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", "")
+        barcode_value, gtin_value, expiry_value = back_scan_values(st.session_state)
+        detected_gtin = gtin_value or parsed_gs1.get("gtin", "")
+        detected_expiry = expiry_value
+        detected_code = detected_gtin or barcode_value or detected_code
         image_context = _lookup_context_key(back_hash, detected_code, detected_gtin)
 
         code_input = st.text_input(
@@ -1703,7 +1801,7 @@ def main():
                     "lookup_scanned_barcode": barcode,
                     "lookup_detected_code": code_input,
                     "lookup_detected_gtin": gtin,
-                    "lookup_front_image_hash": "",
+                    "lookup_front_image_hash": front_hash,
                     "lookup_back_image_hash": back_hash,
                     "lookup_qr_datamatrix_result": parsed_gs1,
                     "lookup_expiry_result": detected_expiry,
@@ -1759,7 +1857,7 @@ def main():
         lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number", ""), key=f"lot_number_{image_context}")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
-        quantity = st.number_input("Quantity to add", min_value=1, value=1, step=1)
+        quantity = st.number_input("Quantity to add", min_value=1, value=DEFAULT_STOCK_ADD_QUANTITY, step=1)
         note = st.text_input("Σημείωση")
 
         current_stock_total = local_product.get("stock", 0) if local_product else 0
@@ -1835,6 +1933,8 @@ def main():
                     delta=int(quantity),
                     note=" | ".join(filter(None, [clean(note), f"lot_number={clean(lot_number)}" if clean(lot_number) else "", f"expiry_date={clean(normalized_expiry)}" if clean(normalized_expiry) else "no_expiry=true"])),
                     transaction_id=st.session_state.pending_transaction_id,
+                    front_photo_url=st.session_state.get("front_photo_data_url", ""),
+                    back_photo_url="",
                 )
                 status = append_stock_transaction(worksheet(), row)
                 if status == "duplicate":
