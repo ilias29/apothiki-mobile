@@ -367,3 +367,92 @@ def test_gtin_validation_warns_without_changing_digits():
     assert app.validate_barcode_gtin("5206087700017") == ["Το barcode έχει μη έγκυρο check digit."]
     assert app.validate_barcode_gtin(gtin="01234567890129") == ["Το GTIN έχει μη έγκυρο check digit."]
     assert app.validate_barcode_gtin(gtin="01234567890128") == []
+
+
+def test_first_photo_uploader_exists_and_reference_image_is_preserved():
+    source = open("app_inventory_search.py", encoding="utf-8").read()
+    assert "Πρώτη/μπροστινή φωτογραφία αναφοράς (προαιρετική)" in source
+    assert "front_photo_url=st.session_state.get(\"front_photo_data_url\", \"\")" in source
+    row = app.make_transaction(
+        code_type="Barcode",
+        code_value="123",
+        barcode="123",
+        brand="Brand",
+        product="Product",
+        category="Φάρμακο",
+        location_id=0,
+        movement="Παραλαβή (+)",
+        quantity=1,
+        delta=1,
+        front_photo_url="data:image/jpeg;base64,abc",
+    )
+    assert row["FrontPhotoUrl"] == "data:image/jpeg;base64,abc"
+
+
+def test_detected_barcode_remains_after_another_form_field_changes():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_barcode": "5201234567890"}
+    state["lookup_product_any"] = "Changed name"
+    assert app.back_scan_values(state)[0] == "5201234567890"
+
+
+def test_detected_expiry_remains_after_another_form_field_changes():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_expiry": "2027-02-28"}
+    state["lookup_brand_any"] = "Changed brand"
+    assert app.back_scan_values(state)[2] == "2027-02-28"
+
+
+def test_empty_rerun_result_cannot_overwrite_previously_detected_values():
+    state = {
+        "back_scan_image_hash": "hash-a",
+        "back_scan_barcode": "5201234567890",
+        "back_scan_gtin": "05201234567890",
+        "back_scan_expiry": "2027-02-28",
+    }
+    app.apply_back_scan_result(state, "hash-a", {"barcode": "", "gtin": "", "expiry": ""})
+    assert app.back_scan_values(state) == ("5201234567890", "05201234567890", "2027-02-28")
+
+
+def test_new_back_image_hash_clears_only_previous_second_photo_scan():
+    state = {
+        "front_photo_data_url": "data:image/jpeg;base64,front",
+        "front_photo_hash": "front-hash",
+        "back_scan_image_hash": "hash-a",
+        "back_scan_barcode": "5201234567890",
+        "back_scan_expiry": "2027-02-28",
+    }
+    app.apply_back_scan_result(state, "hash-b", {"barcode": "", "gtin": "", "expiry": ""})
+    assert state["back_scan_image_hash"] == "hash-b"
+    assert "back_scan_barcode" not in state
+    assert "back_scan_expiry" not in state
+    assert state["front_photo_data_url"] == "data:image/jpeg;base64,front"
+    assert state["front_photo_hash"] == "front-hash"
+
+
+def test_new_search_clears_both_uploaded_photos_and_all_scan_state():
+    state = {
+        "front_photo_data_url": "data:image/jpeg;base64,front",
+        "front_photo_hash": "front-hash",
+        "back_scan_image_hash": "hash-a",
+        "back_scan_barcode": "5201234567890",
+        "back_scan_expiry": "2027-02-28",
+    }
+    app.clear_photo_scan_state(state)
+    assert not any(key in state for key in ["front_photo_data_url", "front_photo_hash", *app.BACK_SCAN_STATE_KEYS])
+
+
+def test_existing_product_confirmation_adds_exactly_plus_one_by_default():
+    row = app.make_transaction(
+        code_type="Barcode",
+        code_value="123",
+        barcode="123",
+        brand="Brand",
+        product="Product",
+        category="Φάρμακο",
+        location_id=0,
+        movement="Παραλαβή (+)",
+        quantity=app.DEFAULT_STOCK_ADD_QUANTITY,
+        delta=app.DEFAULT_STOCK_ADD_QUANTITY,
+    )
+    assert app.DEFAULT_STOCK_ADD_QUANTITY == 1
+    assert row["Ποσότητα"] == 1
+    assert row["DeltaQty"] == 1
