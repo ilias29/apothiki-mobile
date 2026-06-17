@@ -1687,6 +1687,9 @@ def main():
         else:
             online_candidates, greek_lookup_debug = [], {"attempted": [], "total_results": 0, "skipped": "local_found" if local_product else "no_code"}
         st.session_state.greek_lookup_debug = greek_lookup_debug
+        greek_provider_trace = st.session_state.get(
+            "greek_lookup_debug", {}
+        ).get("attempted", [])
         online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
         if local_product and product_matches_current_lookup(local_product, lookup_code, code_input if code_type == "Barcode" else "", detected_gtin):
             st.session_state.lookup_selected_product = local_product
@@ -1704,7 +1707,10 @@ def main():
                 suggested_strength = online_suggestion.get("strength") or suggested_strength
                 suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
             elif clean(lookup_code):
-                provider_errors = [t for t in greek_provider_trace if t.get("error")]
+                provider_errors = [
+                    item for item in greek_provider_trace
+                    if item.get("error")
+                ]
                 if provider_errors:
                     st.warning("Σφάλμα σε ελληνικό provider, συνεχίστηκε η ροή με χειροκίνητη καταχώρηση.")
                 st.warning("Δεν βρέθηκε ελληνική online πρόταση. Άνοιξε χειροκίνητη καταχώρηση με προσυμπληρωμένο barcode.")
@@ -1739,9 +1745,18 @@ def main():
             st.write("Detected code type", selected_debug.get("type", detected_type))
             st.write("Detected barcode value", selected_debug.get("value", detected_code))
             st.write("Barcode checksum result", selected_debug.get("checksum"))
-            st.write("Local lookup result", barcode_debug.get("local_lookup_result", "not_attempted"))
+            st.write(
+                "Local lookup result",
+                st.session_state.get("local_lookup_debug", "not_run"),
+            )
             st.write("Greek providers attempted", greek_provider_trace)
-            st.write("Result count per provider", {t.get("provider"): t.get("count", 0) for t in greek_provider_trace})
+            st.write(
+                "Result count per provider",
+                {
+                    item.get("provider"): item.get("count", 0)
+                    for item in greek_provider_trace
+                },
+            )
         with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
             product = st.text_input("Όνομα προϊόντος", value=suggested_product, key=f"lookup_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
             brand = st.text_input("Μάρκα", value=suggested_brand, key=f"lookup_brand_{_lookup_context_key(lookup_code, gtin, image_context)}")
