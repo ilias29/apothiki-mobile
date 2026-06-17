@@ -20,6 +20,12 @@ class FakeWorksheet:
     def get_all_records(self):
         return list(self.records)
 
+    def delete_columns(self, start, end):
+        del self.headers[start - 1:end]
+        for row in self.records:
+            for header in app.DEPRECATED_COLUMNS:
+                row.pop(header, None)
+
     def append_row(self, values, value_input_option=None):
         row = dict(zip(self.headers, values))
         self.records.append(row)
@@ -62,6 +68,34 @@ def test_missing_headers_are_appended_and_unknown_preserved():
     assert "PCCode" in headers
     assert "SerialNumber" in headers
     assert unknown == ["LegacyColumn"]
+
+
+def test_deprecated_headers_are_removed_and_not_unknown():
+    ws = FakeWorksheet(headers=["TransactionId", "LookupSource", "PackageSize", "LegacyColumn", "LookupTimestamp"])
+    headers, unknown = app.validate_and_migrate_headers(ws)
+    assert "LookupSource" not in headers
+    assert "LookupTimestamp" not in headers
+    assert "PackageSize" not in headers
+    assert unknown == ["LegacyColumn"]
+    assert "LegacyColumn" in ws.headers
+
+
+def test_deprecated_record_fields_are_ignored_and_product_fields_normalized():
+    row = base_row(
+        Προϊόν="Depon odis",
+        Μάρκα="disperse pharma",
+        DosageForm="Dispersible tablets",
+        Strength="500 mg",
+        LookupSource="old",
+        LookupTimestamp="old",
+        PackageSize="old",
+    )
+    df = app.records_to_dataframe([row])
+    assert df.iloc[0]["Προϊόν"] == "DEPON ODIS"
+    assert df.iloc[0]["Μάρκα"] == "DISPERSE PHARMA"
+    assert df.iloc[0]["DosageForm"] == "DISPERSIBLE TABLETS"
+    assert df.iloc[0]["Strength"] == "500 MG"
+    assert not any(column in df.columns for column in app.DEPRECATED_COLUMNS)
 
 
 def test_duplicate_headers_rejected():
