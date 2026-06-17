@@ -42,10 +42,9 @@ WS_NAME = "Transactions"
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
-FRONT_OCR_TIMEOUT_SECONDS = 12
 GREEK_PROVIDER_TIMEOUT_SECONDS = 4
 BACK_OCR_TIMEOUT_SECONDS = 8
-MAX_FRONT_OCR_CALLS = 2
+MAX_FRONT_OCR_CALLS = 0
 MAX_BACK_EXPIRY_OCR_CALLS = 4
 MIN_VALID_EXPIRY_YEAR = 2020
 
@@ -668,13 +667,13 @@ def search_stock(stock: pd.DataFrame, query: str) -> tuple[pd.DataFrame, str]:
     query = clean(query).lower()
     if not query or stock.empty:
         return stock, ""
-    searchable = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "PCCode", "SerialNumber", "LotNumber", "QRRawData", "DataMatrixRawData", "CodeValue", "Κατηγορία"]
+    searchable = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "LotNumber", "QRRawData", "DataMatrixRawData", "CodeValue", "Κατηγορία"]
     mask = pd.Series(False, index=stock.index)
     for column in searchable:
         mask |= stock[column].astype(str).str.lower().str.contains(query, na=False, regex=False)
     matches = stock[mask]
     if not matches.empty:
-        return matches, "Βρέθηκε με όνομα, μάρκα, barcode, GTIN, PC, SN, lot ή raw QR/DataMatrix"
+        return matches, "Βρέθηκε με όνομα, μάρκα, barcode, GTIN, lot ή raw QR/DataMatrix"
     return stock.iloc[0:0], "Δεν βρέθηκε αποτέλεσμα"
 
 
@@ -937,8 +936,8 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
         "rejected_checksum_values": [], "dimensions": {}, "exif_orientation_applied": True,
         "rotations_attempted": [], "crops_attempted": [], "variants_attempted": [],
     }
-    # Back/second photo remains the primary source; front is only a rescue path.
-    for source, image in [("back", back), ("front", front)]:
+    # The second/back photo is the only image used for barcode detection.
+    for source, image in [("back", back)]:
         if image is None:
             continue
         debug["dimensions"][source] = {"width": int(image.shape[1]), "height": int(image.shape[0])}
@@ -1238,7 +1237,7 @@ def run_photo_analysis(front_image, back_image, front_hash: str, back_hash: str)
         return
 
     progress = st.progress(0, text="Αναλύεται η δεύτερη φωτογραφία...")
-    detected_type, detected_code, barcode_debug = detect_code(front_image, back_image)
+    detected_type, detected_code, barcode_debug = detect_code(None, back_image)
     st.session_state.barcode_result = {"type": detected_type, "value": detected_code, "debug": barcode_debug}
 
     progress.progress(35, text="Skipping front OCR")
@@ -1427,12 +1426,8 @@ def lookup_traceability_exact(stock: pd.DataFrame, pc_code: str = "", serial_num
 
 
 GREEK_PROVIDER_DOMAINS = [
-    "skroutz.gr",
-    "eof.gr",
-    "galinos.gr",
-    "ofarmakopoiosmou.gr",
+    "discountpharmacy.gr",
     "pharmacy295.gr",
-    "vita4you.gr",
 ]
 
 
@@ -1462,12 +1457,8 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
         return []
     quoted = requests.utils.quote(query)
     return [
-        ("skroutz.gr", f"https://www.skroutz.gr/search?keyphrase={quoted}"),
-        ("galinos.gr", f"https://www.galinos.gr/web/drugs/main/search?q={quoted}"),
-        ("ofarmakopoiosmou.gr", f"https://www.ofarmakopoiosmou.gr/el/search?search={quoted}"),
+        ("discountpharmacy.gr", f"https://www.discountpharmacy.gr/search?search={quoted}"),
         ("pharmacy295.gr", f"https://www.pharmacy295.gr/search?controller=search&s={quoted}"),
-        ("vita4you.gr", f"https://www.vita4you.gr/catalogsearch/result/?q={quoted}"),
-        ("eof.gr", f"https://www.eof.gr/?s={quoted}"),
     ]
 
 
@@ -1511,14 +1502,16 @@ def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[di
 
 
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
-    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": ""}
+    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "barcode": "", "gtin": "", "image_url": "", "provider": ""}
     providers = []
     for result in [r for r in results if r]:
         providers.append(result.get("provider", ""))
         normalized = normalize_product_fields(result)
-        for key in ["product_name", "brand", "category", "strength", "dosage_form"]:
+        for key in ["product_name", "brand", "category", "strength", "dosage_form", "barcode", "gtin"]:
             if not clean(merged[key]) and clean(normalized.get(key, "")):
                 merged[key] = normalized[key]
+        if not clean(merged["image_url"]):
+            merged["image_url"] = clean(result.get("image_url", result.get("image", "")))
     merged["provider"] = ", ".join([provider for provider in providers if provider])
     return merged
 
@@ -1556,7 +1549,7 @@ def worksheet():
 def main():
     st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη Φαρμακείου")
-    st.caption("Barcode/QR, fallback PC/SN, αναζήτηση, OCR και ασφαλές ιστορικό κινήσεων.")
+    st.caption("Μία καθαρή ροή: δεύτερη φωτογραφία → barcode/GTIN + λήξη → επιβεβαίωση → +1 stock.")
 
     entry_tab, search_tab, reports_tab, sales_tab, data_tab, reversal_tab = st.tabs(
         ["➕ Καταχώρηση", "🔎 Search", "⚠️ Λήξεις / Reports", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
@@ -1564,17 +1557,12 @@ def main():
 
     with entry_tab:
         st.subheader("Καταχώρηση")
-        left, right = st.columns(2)
         init_analysis_state()
         generation = st.session_state.upload_generation
-        with left:
-            front_file = st.camera_input("Φωτογραφία πρόσοψης", key=f"front_camera_{generation}") or st.file_uploader(
-                "Ή ανέβασε πρόσοψη", ["jpg", "jpeg", "png"], key=f"front_image_{generation}"
-            )
-        with right:
-            back_file = st.camera_input("Φωτογραφία πίσω / Barcode / QR", key=f"back_camera_{generation}") or st.file_uploader(
-                "Ή ανέβασε πίσω", ["jpg", "jpeg", "png"], key=f"back_image_{generation}"
-            )
+        front_file = None
+        back_file = st.camera_input("Δεύτερη/πίσω φωτογραφία για barcode και λήξη", key=f"back_camera_{generation}") or st.file_uploader(
+            "Ή ανέβασε δεύτερη/πίσω φωτογραφία", ["jpg", "jpeg", "png"], key=f"back_image_{generation}"
+        )
         front_hash = file_hash(front_file)
         back_hash = file_hash(back_file)
         front_image = to_img(front_file) if front_file else None
@@ -1598,13 +1586,13 @@ def main():
                 init_analysis_state()
                 st.rerun()
         with clear_col:
-            if st.button("Καθαρισμός φωτογραφιών", use_container_width=True):
+            if st.button("Καθαρισμός φωτογραφίας", use_container_width=True):
                 st.session_state.upload_generation += 1
                 reset_lookup_state(clear_analysis=True)
                 init_analysis_state()
                 st.rerun()
 
-        if st.button("Ανάλυση φωτογραφιών", type="primary", use_container_width=True, disabled=front_image is None and back_image is None):
+        if st.button("Ανάλυση φωτογραφίας", type="primary", use_container_width=True, disabled=back_image is None):
             run_photo_analysis(front_image, back_image, front_hash, back_hash)
 
         barcode_result = st.session_state.barcode_result
@@ -1625,8 +1613,8 @@ def main():
             and st.session_state.back_image_hash == back_hash
         )
 
-        if (front_image is not None or back_image is not None) and not has_current_analysis:
-            st.info("Ανέβηκαν φωτογραφίες. Πάτησε «Ανάλυση φωτογραφιών» για barcode/OCR.")
+        if back_image is not None and not has_current_analysis:
+            st.info("Ανέβηκε δεύτερη φωτογραφία. Πάτησε «Ανάλυση φωτογραφίας» για barcode και λήξη.")
 
         if has_current_analysis and st.session_state.analysis_timed_out:
             st.warning("Η ανάλυση καθυστέρησε. Δοκίμασε πιο καθαρή φωτογραφία.")
@@ -1635,31 +1623,12 @@ def main():
             st.success(f"Βρέθηκε barcode: {detected_code}")
         elif has_current_analysis and back_image is not None:
             st.warning("Δεν εντοπίστηκε barcode στη δεύτερη φωτογραφία.")
-        elif has_current_analysis and front_image is not None:
-            st.warning("Δεν διαβάστηκε barcode. Δοκίμασε πιο κοντινή και καθαρή φωτογραφία.")
 
-        if has_current_analysis and front_image is not None:
-            st.info("Δεν τρέχει αυτόματα OCR πρόσοψης. Συμπλήρωσε ή επιβεβαίωσε τα στοιχεία χειροκίνητα.")
-
-        if has_current_analysis and front_image is not None and front_suggestions:
-            with st.expander("Επεξεργάσιμες προτάσεις από OCR πρόσοψης", expanded=True):
-                product_value = front_suggestions.get("product_name", "")
-                if not clean(product_value) and clean(ocr_debug.get("raw_text", "")):
-                    product_value = clean(ocr_debug.get("raw_text", ""))[:240]
-                suggested_product = st.text_area("OCR text / product name candidate", value=product_value, height=100)
-                suggested_brand = st.text_input("Προτεινόμενη μάρκα", value=front_suggestions.get("brand", ""))
-                suggested_strength = st.text_input("Προτεινόμενη περιεκτικότητα", value=front_suggestions.get("strength", ""))
-                suggested_dosage_form = st.text_input("Προτεινόμενη μορφή", value=front_suggestions.get("dosage_form", ""))
-                if not clean(suggested_product) and clean(ocr_debug.get("raw_text", "")):
-                    st.info("Δεν βρέθηκε δομημένο όνομα προϊόντος, αλλά υπάρχει raw OCR κείμενο. Αντέγραψε ή γράψε χειροκίνητα το σωστό όνομα.")
-                    st.text_area("Raw OCR για χειροκίνητη επιλογή ονόματος", value=ocr_debug.get("raw_text", ""), height=140)
-                extraction_confirmed = st.checkbox("Επιβεβαιώνω τις προτάσεις πριν την αποθήκευση")
-        else:
-            suggested_product = detected_product if has_current_analysis else ""
-            suggested_brand = detected_brand if has_current_analysis else ""
-            suggested_strength = front_suggestions.get("strength", "") if has_current_analysis else ""
-            suggested_dosage_form = front_suggestions.get("dosage_form", "") if has_current_analysis else ""
-            extraction_confirmed = not (has_current_analysis and front_image is not None and bool(front_suggestions))
+        suggested_product = ""
+        suggested_brand = ""
+        suggested_strength = ""
+        suggested_dosage_form = ""
+        extraction_confirmed = True
 
         if front_image is not None or back_image is not None:
             with st.expander("Debug OCR / Barcode", expanded=False):
@@ -1712,196 +1681,171 @@ def main():
 
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
         detected_gtin = parsed_gs1.get("gtin", "")
-        image_context = _lookup_context_key(front_hash, back_hash, detected_code, detected_gtin)
-        code_type_options = ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"]
-        default_code_type = "Barcode" if detected_type in {"EAN-8", "EAN-13", "CODE128"} else detected_type
-        code_type = st.selectbox(
-            "Τύπος βασικού κωδικού", code_type_options,
-            index=code_type_options.index(default_code_type if default_code_type in code_type_options else "Other"),
-            key=f"code_type_{image_context}",
+        detected_expiry = parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", "")
+        image_context = _lookup_context_key(back_hash, detected_code, detected_gtin)
+
+        code_input = st.text_input(
+            "Barcode / GTIN",
+            value=detected_gtin or detected_code,
+            key=f"code_input_{image_context}",
+            help="Αν δεν εντοπίστηκε barcode, συμπλήρωσέ το χειροκίνητα. Η ροή δεν μπλοκάρει.",
         )
-        code_input = st.text_input("Barcode / QR / Other", value=detected_code, key=f"code_input_{image_context}")
-        if has_current_analysis and not detected_code:
-            code_input = st.text_input("Χειροκίνητο barcode", value=code_input, key=f"lookup_manual_barcode_{image_context}")
-        lookup_code = clean(parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else ""))
+        lookup_code = clean(detected_gtin or code_input)
+        code_type = "GTIN" if len(lookup_code) == 14 else "Barcode"
+        gtin = detected_gtin or (lookup_code if code_type == "GTIN" else "")
+        barcode = lookup_code if code_type == "Barcode" else ""
+
         if lookup_code != st.session_state.get("lookup_last_search_value", ""):
             reset_lookup_state(
                 preserve={
                     "lookup_last_search_value": lookup_code,
                     "lookup_query": lookup_code,
-                    "lookup_scanned_barcode": code_input if code_type == "Barcode" else "",
+                    "lookup_scanned_barcode": barcode,
                     "lookup_detected_code": code_input,
-                    "lookup_detected_gtin": detected_gtin or (code_input if code_type == "GTIN" else ""),
-                    "lookup_front_image_hash": front_hash,
+                    "lookup_detected_gtin": gtin,
+                    "lookup_front_image_hash": "",
                     "lookup_back_image_hash": back_hash,
-                    "lookup_qr_datamatrix_result": parsed_gs1 if code_type in {"QR", "DataMatrix"} else {},
-                    "lookup_expiry_result": parsed_gs1.get("expiry_date", ""),
-                    "lookup_ocr_result": {"front": front_result, "back": back_result},
+                    "lookup_qr_datamatrix_result": parsed_gs1,
+                    "lookup_expiry_result": detected_expiry,
+                    "lookup_ocr_result": {"back": back_result},
                 }
             )
+
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
         st.session_state.local_lookup_debug = "found" if local_product else "not_found" if clean(lookup_code) else "no_code"
-        refresh_online = st.button("Νέα ελληνική online αναζήτηση", disabled=not clean(lookup_code) or bool(local_product))
         if clean(lookup_code) and not local_product:
-            online_candidates, greek_lookup_debug = online_lookup_candidates(lookup_code, detected_product)
+            online_candidates, greek_lookup_debug = online_lookup_candidates(lookup_code, "")
         else:
             online_candidates, greek_lookup_debug = [], {"attempted": [], "total_results": 0, "skipped": "local_found" if local_product else "no_code"}
         st.session_state.greek_lookup_debug = greek_lookup_debug
-        greek_provider_trace = st.session_state.get(
-            "greek_lookup_debug", {}
-        ).get("attempted", [])
         online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
-        if local_product and product_matches_current_lookup(local_product, lookup_code, code_input if code_type == "Barcode" else "", detected_gtin):
+
+        if local_product and product_matches_current_lookup(local_product, lookup_code, barcode, gtin):
             st.session_state.lookup_selected_product = local_product
-            st.success(f"Βρέθηκε τοπικά: {local_product.get('product_name')} | stock: {local_product.get('stock')}")
-            suggested_product = local_product.get("product_name", suggested_product)
-            suggested_brand = local_product.get("brand", suggested_brand)
-            suggested_strength = local_product.get("strength", suggested_strength)
-            suggested_dosage_form = local_product.get("dosage_form", suggested_dosage_form)
+            suggested_product = local_product.get("product_name", "")
+            suggested_brand = local_product.get("brand", "")
+            suggested_strength = local_product.get("strength", "")
+            suggested_dosage_form = local_product.get("dosage_form", "")
         else:
             st.session_state.lookup_selected_product = None
-            if online_suggestion.get("provider"):
-                st.info("Βρέθηκε ελληνική online πρόταση. Η πηγή φαίνεται προσωρινά εδώ και χρειάζεται επιβεβαίωση.")
-                suggested_product = online_suggestion.get("product_name") or suggested_product
-                suggested_brand = online_suggestion.get("brand") or suggested_brand
-                suggested_strength = online_suggestion.get("strength") or suggested_strength
-                suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
-            elif clean(lookup_code):
-                provider_errors = [
-                    item for item in greek_provider_trace
-                    if item.get("error")
-                ]
-                if provider_errors:
-                    st.warning("Σφάλμα σε ελληνικό provider, συνεχίστηκε η ροή με χειροκίνητη καταχώρηση.")
-                st.warning("Δεν βρέθηκε ελληνική online πρόταση. Άνοιξε χειροκίνητη καταχώρηση με προσυμπληρωμένο barcode.")
+            suggested_product = online_suggestion.get("product_name", "")
+            suggested_brand = online_suggestion.get("brand", "")
+            suggested_strength = online_suggestion.get("strength", "")
+            suggested_dosage_form = online_suggestion.get("dosage_form", "")
+            if clean(lookup_code) and not online_suggestion.get("provider"):
+                st.warning("Δεν βρέθηκε σε Discount Pharmacy ή Pharmacy295. Συμπλήρωσε χειροκίνητα το νέο προϊόν.")
 
-        st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
-        pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""), key=f"pc_code_{_lookup_context_key(lookup_code, image_context)}")
-        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=parsed_gs1.get("serial_number") or back_fields.get("serial_number", ""), key=f"serial_number_{_lookup_context_key(lookup_code, image_context)}")
-        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""), key=f"lot_number_{_lookup_context_key(lookup_code, image_context)}")
-        expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""), key=f"expiry_date_{_lookup_context_key(lookup_code, image_context)}")
-        gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""), key=f"gtin_{_lookup_context_key(lookup_code, image_context)}")
-        trace_matches = lookup_traceability_exact(stock_for_lookup, pc_code, serial_number)
-        if not trace_matches.empty:
-            st.info(f"Βρέθηκαν {len(trace_matches)} τοπικές κινήσεις με ακριβές PC/SN (μόνο για traceability, όχι ταυτότητα προϊόντος).")
-        with st.expander("Επιβεβαίωση ανίχνευσης πριν την αποθήκευση", expanded=True):
-            st.write({
-                "detected_barcode": code_input if code_type == "Barcode" else "",
-                "detected_gtin": gtin,
-                "pc_code": pc_code,
-                "serial_number": serial_number,
-                "lot_number": lot_number,
-                "proposed_expiry_date": expiry_date,
-            })
-            with st.expander("Raw QR/DataMatrix debug", expanded=False):
-                st.text_area("Raw decoded value", value=code_input if code_type in {"QR", "DataMatrix"} else "", height=100)
-        for warning in validate_barcode_gtin(code_input if code_type == "Barcode" else "", gtin):
+        for warning in validate_barcode_gtin(barcode, gtin):
             st.warning(warning)
-        if online_candidates:
-            st.write("Ελληνικές online προτάσεις (έως 3) — η πηγή εμφανίζεται μόνο εδώ για έγκριση")
-            st.dataframe(pd.DataFrame(online_candidates), use_container_width=True)
-        with st.expander("Debug ελληνικής αναζήτησης", expanded=False):
-            selected_debug = barcode_debug.get("selected", {})
-            st.write("Detected code type", selected_debug.get("type", detected_type))
-            st.write("Detected barcode value", selected_debug.get("value", detected_code))
-            st.write("Barcode checksum result", selected_debug.get("checksum"))
-            st.write(
-                "Local lookup result",
-                st.session_state.get("local_lookup_debug", "not_run"),
-            )
-            st.write("Greek providers attempted", greek_provider_trace)
-            st.write(
-                "Result count per provider",
-                {
-                    item.get("provider"): item.get("count", 0)
-                    for item in greek_provider_trace
-                },
-            )
-        with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
-            product = st.text_input("Όνομα προϊόντος", value=suggested_product, key=f"lookup_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
-            brand = st.text_input("Μάρκα", value=suggested_brand, key=f"lookup_brand_{_lookup_context_key(lookup_code, gtin, image_context)}")
-            strength = st.text_input("Περιεκτικότητα", value=suggested_strength, key=f"lookup_strength_{_lookup_context_key(lookup_code, gtin, image_context)}")
-            dosage_form = st.text_input("Μορφή", value=suggested_dosage_form, key=f"lookup_dosage_form_{_lookup_context_key(lookup_code, gtin, image_context)}")
-            confirmed_product = st.checkbox("Επιβεβαιώνω τα στοιχεία", key=f"lookup_confirmed_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
-        category = st.selectbox("Κατηγορία", CATEGORIES)
+
+        product_key = _lookup_context_key(lookup_code, gtin, image_context)
+        if local_product:
+            product = suggested_product
+            brand = suggested_brand
+            strength = suggested_strength
+            dosage_form = suggested_dosage_form
+            category = local_product.get("category", "") or "Φάρμακο"
+            st.info(f"Υπάρχον προϊόν: {product}")
+        else:
+            product = st.text_input("Product name", value=suggested_product, key=f"lookup_product_{product_key}")
+            brand = st.text_input("Brand / Company", value=suggested_brand, key=f"lookup_brand_{product_key}")
+            strength = st.text_input("Strength", value=suggested_strength, key=f"lookup_strength_{product_key}")
+            dosage_form = st.text_input("Dosage form", value=suggested_dosage_form, key=f"lookup_dosage_form_{product_key}")
+            category = st.selectbox("Κατηγορία", CATEGORIES)
+
+        expiry_date = st.text_input("Expiry date", value=detected_expiry, key=f"expiry_date_{image_context}")
+        no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης", key=f"no_expiry_{image_context}")
+        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number", ""), key=f"lot_number_{image_context}")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
-        movement = st.selectbox("Κίνηση", ["Παραλαβή (+)", "Πώληση (-)", "Διόρθωση (+)", "Διόρθωση (-)"])
-        quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1)
+        quantity = st.number_input("Quantity to add", min_value=1, value=1, step=1)
         note = st.text_input("Σημείωση")
+
+        current_stock_total = local_product.get("stock", 0) if local_product else 0
+        st.markdown("### Scan result")
+        st.write({
+            "Barcode / GTIN": lookup_code,
+            "Product name": product,
+            "Expiry date": expiry_date if clean(expiry_date) else ("Χωρίς λήξη" if no_expiry else ""),
+            "Current stock": current_stock_total,
+            "Quantity to add": int(quantity),
+        })
+        confirmed_product = st.checkbox("Επιβεβαιώνω product name, barcode/GTIN, expiry/no-expiry και ποσότητα", key=f"lookup_confirmed_product_{product_key}")
+
+        with st.expander("Debug σαρωμένης καταχώρησης", expanded=False):
+            selected_debug = barcode_debug.get("selected", {})
+            st.write("Barcode decoder attempts", barcode_debug.get("attempts"))
+            st.write("Barcode decoder selected", selected_debug)
+            st.write("Expiry OCR attempts", back_ocr_debug.get("attempts"))
+            st.write("Expiry OCR selected", back_ocr_debug.get("selected_candidate"))
+            attempted = st.session_state.get("greek_lookup_debug", {}).get("attempted", [])
+            st.write("Discount Pharmacy result", [item for item in attempted if item.get("provider") == "discountpharmacy.gr"])
+            st.write("Pharmacy295 result", [item for item in attempted if item.get("provider") == "pharmacy295.gr"])
+            st.write("Local inventory match", st.session_state.get("local_lookup_debug", "not_run"))
 
         if "pending_transaction_id" not in st.session_state:
             st.session_state.pending_transaction_id = str(uuid.uuid4())
 
-        if st.button("💾 Αποθήκευση", use_container_width=True):
+        if st.button("✅ Επιβεβαίωση και προσθήκη stock", use_container_width=True):
             try:
-                resolved_type, code_value, barcode = resolve_identity(
-                    code_type, code_input, pc_code, serial_number
-                )
-                if front_image is not None and front_suggestions and not extraction_confirmed:
-                    raise InventoryError("Επιβεβαίωσε τις προτάσεις OCR πριν την αποθήκευση.")
+                if not clean(lookup_code):
+                    raise InventoryError("Χρειάζεται barcode ή GTIN πριν την αποθήκευση.")
                 if not clean(product):
                     raise InventoryError("Βάλε όνομα προϊόντος.")
                 if not confirmed_product:
-                    raise InventoryError("Επιβεβαίωσε τα στοιχεία προϊόντος πριν την αποθήκευση.")
-                validation_warnings = validate_barcode_gtin(barcode, gtin or parsed_gs1.get("gtin", ""))
+                    raise InventoryError("Επιβεβαίωσε τα στοιχεία πριν την αποθήκευση.")
+                validation_warnings = validate_barcode_gtin(barcode, gtin)
                 if validation_warnings:
                     raise InventoryError(" ".join(validation_warnings))
-                normalized_product = normalize_product_fields(
-                    {
-                        "product_name": product,
-                        "brand": brand,
-                        "strength": strength,
-                        "dosage_form": dosage_form,
-                        "barcode": barcode,
-                        "gtin": gtin or parsed_gs1.get("gtin", ""),
-                    }
-                )
-                normalized_expiry = parse_expiry_date(expiry_date) if clean(expiry_date) else ""
-                if category == "Φάρμακο" and movement in {"Παραλαβή (+)", "Διόρθωση (+)"} and not normalized_expiry:
-                    st.warning("Δεν υπάρχει ημερομηνία λήξης. Συνεχίζω με κενό πεδίο για χειροκίνητη συμπλήρωση αργότερα.")
-                delta = int(quantity) if movement in {"Παραλαβή (+)", "Διόρθωση (+)"} else -int(quantity)
+                if clean(expiry_date):
+                    normalized_expiry = parse_expiry_date(expiry_date)
+                elif no_expiry:
+                    normalized_expiry = ""
+                else:
+                    raise InventoryError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι το προϊόν δεν έχει ημερομηνία λήξης.")
+
+                normalized_product = normalize_product_fields({
+                    "product_name": product,
+                    "brand": brand,
+                    "strength": strength,
+                    "dosage_form": dosage_form,
+                    "barcode": barcode,
+                    "gtin": gtin,
+                })
+                resolved_type = "GTIN" if clean(normalized_product["gtin"]) and not clean(normalized_product["barcode"]) else "Barcode"
+                code_value = normalized_product["gtin"] if resolved_type == "GTIN" else normalized_product["barcode"]
                 row = make_transaction(
                     code_type=resolved_type,
                     code_value=code_value,
                     barcode=normalized_product["barcode"],
-                    pc_code=pc_code,
                     gtin=normalized_product["gtin"],
-                    serial_number=serial_number,
                     lot_number=lot_number,
                     expiry_date=normalized_expiry,
-                    qr_raw_data=code_input if code_type == "QR" else "",
-                    datamatrix_raw_data=code_input if code_type == "DataMatrix" else "",
+                    qr_raw_data=code_input if detected_type == "QR" else "",
+                    datamatrix_raw_data=code_input if detected_type == "DataMatrix" else "",
                     strength=normalized_product["strength"],
                     dosage_form=normalized_product["dosage_form"],
                     brand=normalized_product["brand"],
                     product=normalized_product["product_name"],
                     category=category,
                     location_id=location_id,
-                    movement=movement,
+                    movement="Παραλαβή (+)",
                     quantity=int(quantity),
-                    delta=delta,
-                    note=" | ".join(filter(None, [
-                        clean(note),
-                        f"strength={normalized_product['strength']}" if normalized_product["strength"] else "",
-                        f"dosage_form={normalized_product['dosage_form']}" if normalized_product["dosage_form"] else "",
-                        f"lot_number={clean(lot_number)}" if clean(lot_number) else "",
-                        f"expiry_date={clean(normalized_expiry)}" if clean(normalized_expiry) else "",
-                    ])),
+                    delta=int(quantity),
+                    note=" | ".join(filter(None, [clean(note), f"lot_number={clean(lot_number)}" if clean(lot_number) else "", f"expiry_date={clean(normalized_expiry)}" if clean(normalized_expiry) else "no_expiry=true"])),
                     transaction_id=st.session_state.pending_transaction_id,
                 )
                 status = append_stock_transaction(worksheet(), row)
                 if status == "duplicate":
                     st.info("Η ίδια υποβολή έχει ήδη καταχωρηθεί.")
-                elif status == "compensated":
-                    st.error(
-                        "Εντοπίστηκε ταυτόχρονη μεταβολή stock. Η κίνηση "
-                        "αντισταθμίστηκε αυτόματα και δεν εφαρμόστηκε."
-                    )
                 else:
-                    st.success("Αποθηκεύτηκε στο Google Sheets.")
-                st.session_state.pending_transaction_id = str(uuid.uuid4())
+                    st.success(f"Αποθηκεύτηκε. Το stock αυξήθηκε κατά +{int(quantity)}.")
+                    st.session_state.pending_transaction_id = str(uuid.uuid4())
+                    st.session_state.upload_generation += 1
+                    reset_lookup_state(clear_analysis=True)
+                    init_analysis_state()
+                    st.rerun()
             except InventoryError as exc:
                 st.error(str(exc))
 
@@ -1910,7 +1854,7 @@ def main():
             reset_lookup_state(clear_analysis=True)
             st.session_state["search_query_source_of_truth"] = ""
             st.rerun()
-        query = st.text_input("Αναζήτηση: Barcode, QR, PC, SN, μάρκα ή όνομα", key="search_query_source_of_truth")
+        query = st.text_input("Αναζήτηση: Barcode, GTIN, μάρκα ή όνομα", key="search_query_source_of_truth")
         current_query = clean(query)
         if current_query != st.session_state.get("lookup_last_search_value", ""):
             reset_lookup_state(preserve={"lookup_last_search_value": current_query, "lookup_query": current_query})
@@ -1956,6 +1900,29 @@ def main():
                         f"Stock: {row.get('Σύνολο', 0)} | Lot: {row.get('LotNumber', '')} | "
                         f"Εξάμηνο: {row.get('Semester', '') or '-'}"
                     )
+                    detail_key = _lookup_context_key(row.get("CodeType", ""), row.get("CodeValue", ""), row.get("Barcode", ""), row.get("GTIN", ""))
+                    if st.button(f"Άνοιγμα {row.get('Barcode', '') or row.get('GTIN', '') or row.get('Προϊόν', '')}", key=f"open_product_{detail_key}"):
+                        st.session_state["selected_search_product"] = {"CodeType": row.get("CodeType", ""), "CodeValue": row.get("CodeValue", ""), "Barcode": row.get("Barcode", ""), "GTIN": row.get("GTIN", "")}
+            selected = st.session_state.get("selected_search_product", {})
+            if selected:
+                mask = (data["CodeType"].astype(str).eq(clean(selected.get("CodeType"))) & data["CodeValue"].astype(str).eq(clean(selected.get("CodeValue"))))
+                if clean(selected.get("Barcode")):
+                    mask |= data["Barcode"].astype(str).str.strip().eq(clean(selected.get("Barcode")))
+                if clean(selected.get("GTIN")):
+                    mask |= data["GTIN"].astype(str).str.strip().eq(clean(selected.get("GTIN")))
+                batches = active_movements(data[mask])
+                with st.expander("Λεπτομέρειες επιλεγμένου προϊόντος", expanded=True):
+                    if not batches.empty:
+                        latest = batches.sort_values("Timestamp").iloc[-1]
+                        st.markdown(f"**{latest.get('Προϊόν', '')}**")
+                        st.write(f"Τρέχον stock: {int(batches['DeltaQty'].sum())}")
+                        batch_table = batches.groupby(["LotNumber", "ExpiryDate"], dropna=False)["DeltaQty"].sum().reset_index().rename(columns={"DeltaQty": "Stock"})
+                        st.dataframe(batch_table, use_container_width=True)
+                        image_url = clean(latest.get("FrontPhotoUrl", ""))
+                        if image_url:
+                            st.image(image_url, caption="Αποθηκευμένη εικόνα αναφοράς προϊόντος")
+                    else:
+                        st.info("Δεν βρέθηκαν κινήσεις για το επιλεγμένο προϊόν.")
         st.dataframe(results, use_container_width=True)
 
     with reports_tab:
