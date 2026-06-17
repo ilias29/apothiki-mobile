@@ -655,6 +655,93 @@ def file_hash(file) -> str:
     return hashlib.sha256(file.getvalue()).hexdigest()
 
 
+
+LOOKUP_STATE_KEYS = {
+    "lookup_query",
+    "lookup_scanned_barcode",
+    "lookup_detected_code",
+    "lookup_detected_gtin",
+    "lookup_selected_product",
+    "lookup_local_product",
+    "lookup_online_candidates",
+    "lookup_online_error",
+    "lookup_approved_product",
+    "lookup_front_image_hash",
+    "lookup_back_image_hash",
+    "lookup_ocr_result",
+    "lookup_expiry_result",
+    "lookup_qr_datamatrix_result",
+    "lookup_stock_entry_product",
+    "lookup_context",
+    "lookup_last_search_value",
+}
+
+APPROVAL_FORM_KEYS = {
+    "lookup_product",
+    "lookup_brand",
+    "lookup_strength",
+    "lookup_dosage_form",
+    "lookup_confirmed_product",
+}
+
+
+def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis: bool = False) -> None:
+    preserve = preserve or {}
+    for key in LOOKUP_STATE_KEYS | APPROVAL_FORM_KEYS:
+        if key not in preserve:
+            st.session_state.pop(key, None)
+    # Remove dynamic approval/widget values tied to old barcode/GTIN/image/query contexts.
+    for key in list(st.session_state.keys()):
+        if key.startswith((
+            "lookup_product_",
+            "lookup_brand_",
+            "lookup_strength_",
+            "lookup_dosage_form_",
+            "lookup_confirmed_product_",
+            "code_type_",
+            "code_input_",
+            "pc_code_",
+            "serial_number_",
+            "lot_number_",
+            "expiry_date_",
+            "gtin_",
+            "online_refresh_",
+        )):
+            st.session_state.pop(key, None)
+    if clear_analysis:
+        for key in [
+            "barcode_result",
+            "front_ocr_result",
+            "back_ocr_result",
+            "parsed_product_fields",
+            "front_image_hash",
+            "back_image_hash",
+            "analysis_ran",
+            "analysis_timed_out",
+        ]:
+            st.session_state.pop(key, None)
+    for key, value in preserve.items():
+        st.session_state[key] = value
+
+
+def _lookup_context_key(*parts: str) -> str:
+    raw = "|".join(clean(part).lower() for part in parts if clean(part)) or "blank"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def product_matches_current_lookup(product: dict[str, Any], query: str, scanned_code: str = "", gtin: str = "") -> bool:
+    query = clean(query).lower()
+    if not query:
+        return False
+    barcode_value = clean(product.get("barcode", ""))
+    gtin_value = clean(product.get("gtin", ""))
+    product_text = " ".join(clean(product.get(k, "")).lower() for k in ["product_name", "brand", "category", "strength", "dosage_form"])
+    if clean(scanned_code) and clean(scanned_code) not in {barcode_value, gtin_value, clean(product.get("code_value", ""))}:
+        return False
+    if clean(gtin) and gtin_value and clean(gtin) != gtin_value:
+        return False
+    return query in product_text or query in {barcode_value.lower(), gtin_value.lower(), clean(product.get("code_value", "")).lower()}
+
 def init_analysis_state() -> None:
     defaults = {
         "front_image_hash": "",
@@ -1334,6 +1421,21 @@ def main():
         front_image = to_img(front_file) if front_file else None
         back_image = to_img(back_file) if back_file else None
 
+        previous_image_context = f"{st.session_state.get('lookup_front_image_hash', '')}:{st.session_state.get('lookup_back_image_hash', '')}"
+        current_image_context = f"{front_hash}:{back_hash}"
+        if current_image_context != previous_image_context and (front_hash or back_hash):
+            reset_lookup_state(
+                preserve={"lookup_front_image_hash": front_hash, "lookup_back_image_hash": back_hash},
+                clear_analysis=True,
+            )
+            init_analysis_state()
+
+        if st.button("Νέα αναζήτηση", use_container_width=True):
+            reset_lookup_state(clear_analysis=True)
+            st.session_state["search_query_source_of_truth"] = ""
+            init_analysis_state()
+            st.rerun()
+
         if st.button("Ανάλυση φωτογραφιών", type="primary", use_container_width=True, disabled=front_image is None and back_image is None):
             run_photo_analysis(front_image, back_image, front_hash, back_hash)
 
@@ -1424,39 +1526,71 @@ def main():
                 st.write("Back OCR extracted logistics", back_fields)
 
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
+        detected_gtin = parsed_gs1.get("gtin", "")
+        image_context = _lookup_context_key(front_hash, back_hash, detected_code, detected_gtin)
         code_type = st.selectbox(
             "Τύπος βασικού κωδικού", ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"],
             index=["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"].index(detected_type if detected_type in ["Barcode", "GTIN", "QR", "DataMatrix", "PC", "Other"] else "Other"),
+            key=f"code_type_{image_context}",
         )
-        code_input = st.text_input("Barcode / QR / Other", value=detected_code)
-        lookup_code = parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else "")
+        code_input = st.text_input("Barcode / QR / Other", value=detected_code, key=f"code_input_{image_context}")
+        lookup_code = clean(parsed_gs1.get("gtin") or (code_input if code_type in {"Barcode", "GTIN"} else ""))
+        if lookup_code != st.session_state.get("lookup_last_search_value", ""):
+            reset_lookup_state(
+                preserve={
+                    "lookup_last_search_value": lookup_code,
+                    "lookup_query": lookup_code,
+                    "lookup_scanned_barcode": code_input if code_type == "Barcode" else "",
+                    "lookup_detected_code": code_input,
+                    "lookup_detected_gtin": detected_gtin or (code_input if code_type == "GTIN" else ""),
+                    "lookup_front_image_hash": front_hash,
+                    "lookup_back_image_hash": back_hash,
+                    "lookup_qr_datamatrix_result": parsed_gs1 if code_type in {"QR", "DataMatrix"} else {},
+                    "lookup_expiry_result": parsed_gs1.get("expiry_date", ""),
+                    "lookup_ocr_result": {"front": front_result, "back": back_result},
+                }
+            )
         stock_for_lookup = stock_table(load_data(worksheet())[0])
-        local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
-        refresh_online = st.button("Νέα online αναζήτηση", disabled=not clean(lookup_code))
-        online_candidates = online_lookup_candidates(lookup_code) if clean(lookup_code) and (not local_product or refresh_online) else []
+        local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if lookup_code else None
+        st.session_state.lookup_local_product = local_product
+        refresh_online = st.button("Νέα online αναζήτηση", disabled=not lookup_code or bool(local_product), key=f"online_refresh_{_lookup_context_key(lookup_code, detected_gtin)}")
+        online_error = ""
+        try:
+            online_candidates = online_lookup_candidates(lookup_code) if lookup_code and not local_product else []
+        except Exception as exc:
+            online_candidates = []
+            online_error = f"Online provider error: {type(exc).__name__}: {exc}"
+        st.session_state.lookup_online_candidates = online_candidates
+        st.session_state.lookup_online_error = online_error
         online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
-        if local_product and not online_suggestion:
+        if local_product and product_matches_current_lookup(local_product, lookup_code, code_input if code_type == "Barcode" else "", detected_gtin):
+            st.session_state.lookup_selected_product = local_product
             st.success(f"Βρέθηκε τοπικά: {local_product.get('product_name')} | stock: {local_product.get('stock')}")
             suggested_product = local_product.get("product_name", suggested_product)
             suggested_brand = local_product.get("brand", suggested_brand)
             suggested_strength = local_product.get("strength", suggested_strength)
             suggested_dosage_form = local_product.get("dosage_form", suggested_dosage_form)
         else:
+            st.session_state.lookup_selected_product = None
             if online_suggestion.get("provider"):
                 st.info("Τα online αποτελέσματα είναι μόνο προτάσεις και χρειάζονται επιβεβαίωση.")
                 suggested_product = online_suggestion.get("product_name") or suggested_product
                 suggested_brand = online_suggestion.get("brand") or suggested_brand
                 suggested_strength = online_suggestion.get("strength") or suggested_strength
                 suggested_dosage_form = online_suggestion.get("dosage_form") or suggested_dosage_form
-            elif clean(lookup_code):
-                st.warning("Δεν βρέθηκε online πρόταση. Χρησιμοποίησε χειροκίνητη καταχώρηση.")
+            elif lookup_code:
+                if online_error:
+                    st.error(online_error)
+                else:
+                    display_query = lookup_code
+                    st.warning(f"Δεν βρέθηκε το {display_query} στην τοπική βάση ή στις διαθέσιμες online πηγές.")
 
         st.caption("Αν δεν διαβάζεται το QR/DataMatrix, συμπλήρωσε PC και/ή SN. Τα πεδία είναι προαιρετικά μεμονωμένα.")
-        pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""))
-        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=parsed_gs1.get("serial_number") or back_fields.get("serial_number", ""))
-        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""))
-        expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""))
-        gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""))
+        pc_code = st.text_input("PC code (προαιρετικό)", value=parsed_gs1.get("pc_code") or back_fields.get("pc_code", "") or (code_input if code_type == "PC" else ""), key=f"pc_code_{_lookup_context_key(lookup_code, image_context)}")
+        serial_number = st.text_input("Serial Number / SN (προαιρετικό)", value=parsed_gs1.get("serial_number") or back_fields.get("serial_number", ""), key=f"serial_number_{_lookup_context_key(lookup_code, image_context)}")
+        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number") or back_fields.get("lot_number", ""), key=f"lot_number_{_lookup_context_key(lookup_code, image_context)}")
+        expiry_date = st.text_input("Expiry date", value=parsed_gs1.get("expiry_date") or back_fields.get("expiry_date", ""), key=f"expiry_date_{_lookup_context_key(lookup_code, image_context)}")
+        gtin = st.text_input("GTIN", value=parsed_gs1.get("gtin") or (code_input if code_type == "GTIN" else ""), key=f"gtin_{_lookup_context_key(lookup_code, image_context)}")
         trace_matches = lookup_traceability_exact(stock_for_lookup, pc_code, serial_number)
         if not trace_matches.empty:
             st.info(f"Βρέθηκαν {len(trace_matches)} τοπικές κινήσεις με ακριβές PC/SN (μόνο για traceability, όχι ταυτότητα προϊόντος).")
@@ -1477,11 +1611,11 @@ def main():
             st.write("Online προτάσεις (έως 3)")
             st.dataframe(pd.DataFrame(online_candidates), use_container_width=True)
         with st.expander("Προτεινόμενο προϊόν", expanded=bool(online_suggestion.get("provider"))):
-            product = st.text_input("Όνομα προϊόντος", value=suggested_product)
-            brand = st.text_input("Μάρκα", value=suggested_brand)
-            strength = st.text_input("Περιεκτικότητα", value=suggested_strength)
-            dosage_form = st.text_input("Μορφή", value=suggested_dosage_form)
-            confirmed_product = st.checkbox("Επιβεβαιώνω τα στοιχεία")
+            product = st.text_input("Όνομα προϊόντος", value=suggested_product, key=f"lookup_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
+            brand = st.text_input("Μάρκα", value=suggested_brand, key=f"lookup_brand_{_lookup_context_key(lookup_code, gtin, image_context)}")
+            strength = st.text_input("Περιεκτικότητα", value=suggested_strength, key=f"lookup_strength_{_lookup_context_key(lookup_code, gtin, image_context)}")
+            dosage_form = st.text_input("Μορφή", value=suggested_dosage_form, key=f"lookup_dosage_form_{_lookup_context_key(lookup_code, gtin, image_context)}")
+            confirmed_product = st.checkbox("Επιβεβαιώνω τα στοιχεία", key=f"lookup_confirmed_product_{_lookup_context_key(lookup_code, gtin, image_context)}")
         category = st.selectbox("Κατηγορία", CATEGORIES)
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
@@ -1564,15 +1698,31 @@ def main():
                 st.error(str(exc))
 
     with search_tab:
-        data, unknown = load_data(worksheet())
+        if st.button("Νέα αναζήτηση", key="search_new_lookup", use_container_width=True):
+            reset_lookup_state(clear_analysis=True)
+            st.session_state["search_query_source_of_truth"] = ""
+            st.rerun()
+        query = st.text_input("Αναζήτηση: Barcode, QR, PC, SN, μάρκα ή όνομα", key="search_query_source_of_truth")
+        current_query = clean(query)
+        if current_query != st.session_state.get("lookup_last_search_value", ""):
+            reset_lookup_state(preserve={"lookup_last_search_value": current_query, "lookup_query": current_query})
+        try:
+            data, unknown = load_data(worksheet())
+        except Exception as exc:
+            st.error(f"Google Sheets error: {type(exc).__name__}: {exc}")
+            data = empty_dataframe()
+            unknown = []
         if unknown:
             st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
         stock = stock_table(data)
-        query = st.text_input("Αναζήτηση: Barcode, QR, PC, SN, μάρκα ή όνομα")
-        results, message = search_stock(stock, query)
-        if message:
+        results, message = search_stock(stock, current_query) if current_query else (stock.iloc[0:0], "")
+        if current_query and message:
             st.info(message)
-        if not results.empty:
+        if not current_query:
+            st.info("Συμπλήρωσε αναζήτηση για να εμφανιστούν προϊόντα.")
+        elif results.empty:
+            st.warning(f"Δεν βρέθηκε το {current_query} στην τοπική βάση ή στις διαθέσιμες online πηγές.")
+        else:
             warning_counts = results["ExpiryStatus"].value_counts().to_dict() if "ExpiryStatus" in results else {}
             if warning_counts.get("expired", 0):
                 st.error(f"{warning_counts['expired']} προϊόν(τα) έχουν λήξει.")
