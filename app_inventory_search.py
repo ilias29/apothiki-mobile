@@ -47,6 +47,7 @@ GREEK_PROVIDER_TIMEOUT_SECONDS = 4
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 0
 MAX_BACK_EXPIRY_OCR_CALLS = 4
+MAX_BARCODE_DECODER_ATTEMPTS = 120
 MIN_VALID_EXPIRY_YEAR = 2020
 DEFAULT_STOCK_ADD_QUANTITY = 1
 
@@ -721,6 +722,17 @@ LOOKUP_STATE_KEYS = {
     "lookup_context",
     "lookup_last_search_value",
     "lookup_manual_barcode",
+    "active_scan_session_id",
+    "stock_save_in_progress",
+    "code_input_active_scan",
+    "expiry_date_active_scan",
+    "no_expiry_active_scan",
+    "lot_number_active_scan",
+    "lookup_product_active_scan",
+    "lookup_brand_active_scan",
+    "lookup_strength_active_scan",
+    "lookup_dosage_form_active_scan",
+    "lookup_confirmed_product_active_scan",
 }
 
 APPROVAL_FORM_KEYS = {
@@ -815,7 +827,6 @@ def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis
             "lookup_dosage_form_",
             "lookup_confirmed_product_",
             "code_type_",
-            "code_input_",
             "pc_code_",
             "serial_number_",
             "lot_number_",
@@ -1006,6 +1017,62 @@ def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
     return values
 
 
+def decode_ean13_bars_fallback(image: np.ndarray) -> str:
+    """Small deterministic EAN-13 bar fallback for clean OCR/decoder misses."""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    black = binary < 128
+    rows = np.where(black.mean(axis=1) > 0.05)[0]
+    cols = np.where(black[rows, :].mean(axis=0) > 0.2)[0] if rows.size else np.array([])
+    if cols.size < 50:
+        return ""
+    x0, x1 = int(cols.min()), int(cols.max()) + 1
+    col_black = black[rows.min(): rows.max() + 1, x0:x1].mean(axis=0) > 0.5
+    runs: list[tuple[bool, int]] = []
+    for value in col_black:
+        if not runs or runs[-1][0] != bool(value):
+            runs.append((bool(value), 1))
+        else:
+            runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+    if len(runs) < 20:
+        return ""
+    module = max(1.0, float(np.median([length for _, length in runs[:10] + runs[-10:]])))
+    bits = "".join(("1" if is_black else "0") * max(1, int(round(length / module))) for is_black, length in runs)
+    start = bits.find("101")
+    end = bits.rfind("101")
+    if start < 0 or end <= start:
+        return ""
+    bits = bits[start:end + 3]
+    if len(bits) < 95:
+        return ""
+    bits = bits[:95]
+    l = {"0001101":"0","0011001":"1","0010011":"2","0111101":"3","0100011":"4","0110001":"5","0101111":"6","0111011":"7","0110111":"8","0001011":"9"}
+    g = {"0100111":"0","0110011":"1","0011011":"2","0100001":"3","0011101":"4","0111001":"5","0000101":"6","0010001":"7","0001001":"8","0010111":"9"}
+    r = {"1110010":"0","1100110":"1","1101100":"2","1000010":"3","1011100":"4","1001110":"5","1010000":"6","1000100":"7","1001000":"8","1110100":"9"}
+    parity_to_first = {"LLLLLL":"0","LLGLGG":"1","LLGGLG":"2","LLGGGL":"3","LGLLGG":"4","LGGLLG":"5","LGGGLL":"6","LGLGLG":"7","LGLGGL":"8","LGGLGL":"9"}
+    left = bits[3:45]
+    right = bits[50:92]
+    digits = ""
+    parity = ""
+    for i in range(0, 42, 7):
+        chunk = left[i:i+7]
+        if chunk in l:
+            digits += l[chunk]; parity += "L"
+        elif chunk in g:
+            digits += g[chunk]; parity += "G"
+        else:
+            return ""
+    if parity not in parity_to_first:
+        return ""
+    out = parity_to_first[parity] + digits
+    for i in range(0, 42, 7):
+        chunk = right[i:i+7]
+        if chunk not in r:
+            return ""
+        out += r[chunk]
+    return out if is_valid_gtin_check_digit(out) else ""
+
+
 def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
     debug: dict[str, Any] = {
         "decoders": decoder_status(), "attempts": [], "errors": [], "raw_values": [],
@@ -1027,6 +1094,18 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                     debug["variants_attempted"].append(f"{source}:{rotation}:{crop_name}:{variant_name}")
                     location = f"{source}:{rotation}:{crop_name}:{variant_name}"
                     for decoder_name in ("pyzbar", "opencv_barcode", "opencv_qr"):
+                        if len(debug["attempts"]) >= MAX_BARCODE_DECODER_ATTEMPTS:
+                            debug["attempt_limit_reached"] = MAX_BARCODE_DECODER_ATTEMPTS
+                            fallback = decode_ean13_bars_fallback(image)
+                            if fallback:
+                                candidate = classify_barcode_value("Barcode", fallback)
+                                candidate.update({"decoder": "ocr_bar_fallback", "source": "back"})
+                                debug["raw_values"].append(candidate)
+                            selected = choose_detected_code(debug["raw_values"])
+                            debug["selected"] = selected
+                            debug["candidates"] = [c for c in debug["raw_values"] if c.get("valid")]
+                            debug["ambiguous"] = selected.get("ambiguous", False)
+                            return selected.get("type", "Barcode"), selected.get("value", ""), debug
                         try:
                             values = []
                             if decoder_name == "pyzbar":
@@ -1056,6 +1135,12 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                         except Exception as exc:
                             debug["attempts"].append(f"{decoder_name}:{location}:failed")
                             debug["errors"].append(f"{decoder_name} {location}: {exc}")
+    if back is not None:
+        fallback = decode_ean13_bars_fallback(back)
+        if fallback:
+            candidate = classify_barcode_value("Barcode", fallback)
+            candidate.update({"decoder": "ocr_bar_fallback", "source": "back"})
+            debug["raw_values"].append(candidate)
     selected = choose_detected_code(debug["raw_values"])
     debug["selected"] = selected
     debug["candidates"] = [c for c in debug["raw_values"] if c.get("valid")]
@@ -1536,6 +1621,39 @@ GREEK_PROVIDER_DOMAINS = [
     "pharmacy295.gr",
 ]
 
+GENERIC_PROVIDER_TITLES = {
+    "pharmacy295",
+    "discount pharmacy",
+    "search",
+    "αναζήτηση",
+    "αποτελέσματα αναζήτησης",
+}
+
+
+def is_rejected_provider_product_name(name: Any, provider: str = "") -> tuple[bool, str]:
+    text = normalize_spaces(name)
+    lowered = text.lower().strip(" -|–—")
+    provider_label = provider.replace(".gr", "").replace("295", "295").replace("discountpharmacy", "discount pharmacy")
+    provider_tokens = {provider.lower(), provider_label.lower(), provider.replace(".gr", "").lower()}
+    generic = GENERIC_PROVIDER_TITLES | provider_tokens
+    if not lowered:
+        return True, "empty_product_name"
+    if lowered in generic:
+        return True, "generic_or_provider_title"
+    if any(part.strip().lower() in generic for part in re.split(r"[|—–-]", lowered)) and len(lowered) <= 40:
+        return True, "search_or_provider_page_title"
+    return False, ""
+
+
+def provider_barcode_verified(product: dict[str, Any], requested_code: str) -> tuple[bool, str]:
+    requested = clean(requested_code)
+    provider_codes = {clean(product.get("barcode", "")), clean(product.get("gtin", ""))} - {""}
+    if requested in provider_codes:
+        return True, "verified"
+    if provider_codes:
+        return False, "provider_barcode_mismatch"
+    return False, "provider_barcode_unverified"
+
 
 def _extract_jsonld_product(html: str) -> dict[str, Any]:
     for match in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, flags=re.I | re.S):
@@ -1569,7 +1687,7 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
 
 
 def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    debug = {"provider": domain, "error": "", "count": 0}
+    debug = {"provider": domain, "error": "", "count": 0, "rejection_reason": "", "verified": False, "result": {}}
     try:
         response = requests.get(search_url, timeout=4, headers={"User-Agent": "Mozilla/5.0 ApothikiMobile/1.0"})
         response.raise_for_status()
@@ -1577,16 +1695,28 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
         if "captcha" in html.lower():
             debug["error"] = "blocked"
             return [], debug
+
         product = _extract_jsonld_product(html)
         if not product:
-            title = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
-            product = {"product_name": re.sub(r"\s+", " ", title.group(1)).strip() if title else ""}
-        if not clean(product.get("product_name", "")):
-            debug["count"] = 0
+            debug["rejection_reason"] = "no_product_detail_jsonld"
             return [], debug
-        product.update({"provider": domain, "barcode": clean(code) if len(clean(code)) in {8, 13} else product.get("barcode", ""), "gtin": clean(code) if len(clean(code)) in {8, 13, 14} else ""})
-        normalized = normalize_product_fields(product) | {"provider": domain, "local": False}
+
+        rejected, reason = is_rejected_provider_product_name(product.get("product_name", ""), domain)
+        if rejected:
+            debug["rejection_reason"] = reason
+            debug["result"] = {"product_name": product.get("product_name", "")}
+            return [], debug
+
+        verified, reason = provider_barcode_verified(product, code)
+        debug["verified"] = verified
+        if not verified:
+            debug["rejection_reason"] = reason
+            debug["result"] = {"product_name": product.get("product_name", ""), "barcode": product.get("barcode", ""), "gtin": product.get("gtin", "")}
+            return [], debug
+
+        normalized = product_text_fields_from_lookup(product) | {"provider": domain, "local": False, "verified": True}
         debug["count"] = 1
+        debug["result"] = normalized
         return [normalized], debug
     except requests.RequestException as exc:
         debug["error"] = f"connection: {exc}"
@@ -1608,16 +1738,14 @@ def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[di
 
 
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
-    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "barcode": "", "gtin": "", "image_url": "", "provider": ""}
+    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "provider": ""}
     providers = []
     for result in [r for r in results if r]:
         providers.append(result.get("provider", ""))
         normalized = normalize_product_fields(result)
-        for key in ["product_name", "brand", "category", "strength", "dosage_form", "barcode", "gtin"]:
+        for key in ["product_name", "brand", "category", "strength", "dosage_form"]:
             if not clean(merged[key]) and clean(normalized.get(key, "")):
                 merged[key] = normalized[key]
-        if not clean(merged["image_url"]):
-            merged["image_url"] = clean(result.get("image_url", result.get("image", "")))
     merged["provider"] = ", ".join([provider for provider in providers if provider])
     return merged
 
@@ -1688,6 +1816,7 @@ def main():
             st.session_state.front_photo_hash = front_hash
             st.session_state.front_photo_data_url = uploaded_file_data_url(front_file)
         if back_image is not None and back_hash != st.session_state.get("back_scan_image_hash"):
+            st.session_state.active_scan_session_id = _lookup_context_key(back_hash)
             result = analyze_back_photo(back_image, back_hash)
             apply_back_scan_result(st.session_state, back_hash, result)
             st.session_state.barcode_result = {"type": result.get("type", "Barcode"), "value": result.get("raw_code") or result.get("gtin") or result.get("barcode", ""), "debug": result.get("barcode_debug", {})}
@@ -1805,8 +1934,8 @@ def main():
         detected_gtin = gtin_value or parsed_gs1.get("gtin", "")
         detected_expiry = expiry_value
         detected_code = detected_gtin or scanned_barcode or detected_code
-        image_context = _lookup_context_key(back_hash, detected_code, detected_gtin)
-        code_input_key = f"code_input_{image_context}"
+        image_context = st.session_state.get("active_scan_session_id") or _lookup_context_key(back_hash)
+        code_input_key = "code_input_active_scan"
         if scanned_barcode:
             # On every rerun, initialize the barcode input from the persisted
             # detected barcode before any online provider result is considered.
@@ -1826,21 +1955,18 @@ def main():
             lookup_code = preserve_scanned_barcode_state(st.session_state, barcode)
 
         if lookup_code != previous_lookup_value:
-            reset_lookup_state(
-                preserve={
-                    "lookup_last_search_value": lookup_code,
-                    "lookup_query": lookup_code,
-                    "lookup_scanned_barcode": barcode,
-                    "back_scan_barcode": barcode,
-                    "lookup_detected_code": code_input,
-                    "lookup_detected_gtin": gtin,
-                    "lookup_front_image_hash": front_hash,
-                    "lookup_back_image_hash": back_hash,
-                    "lookup_qr_datamatrix_result": parsed_gs1,
-                    "lookup_expiry_result": detected_expiry,
-                    "lookup_ocr_result": {"back": back_result},
-                }
-            )
+            st.session_state.lookup_last_search_value = lookup_code
+            st.session_state.lookup_query = lookup_code
+            st.session_state.lookup_scanned_barcode = barcode
+            if barcode:
+                st.session_state.back_scan_barcode = barcode
+            st.session_state.lookup_detected_code = code_input
+            st.session_state.lookup_detected_gtin = gtin
+            st.session_state.lookup_front_image_hash = front_hash
+            st.session_state.lookup_back_image_hash = back_hash
+            st.session_state.lookup_qr_datamatrix_result = parsed_gs1
+            st.session_state.lookup_expiry_result = detected_expiry
+            st.session_state.lookup_ocr_result = {"back": back_result}
 
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
@@ -1872,7 +1998,7 @@ def main():
         for warning in validate_barcode_gtin(barcode, gtin):
             st.warning(warning)
 
-        product_key = _lookup_context_key(lookup_code, gtin, image_context)
+        product_key = image_context
         if local_product:
             product = suggested_product
             brand = suggested_brand
@@ -1881,15 +2007,20 @@ def main():
             category = local_product.get("category", "") or "Φάρμακο"
             st.info(f"Υπάρχον προϊόν: {product}")
         else:
-            product = st.text_input("Product name", value=suggested_product, key=f"lookup_product_{product_key}")
-            brand = st.text_input("Brand / Company", value=suggested_brand, key=f"lookup_brand_{product_key}")
-            strength = st.text_input("Strength", value=suggested_strength, key=f"lookup_strength_{product_key}")
-            dosage_form = st.text_input("Dosage form", value=suggested_dosage_form, key=f"lookup_dosage_form_{product_key}")
+            for field_key, suggested_value in [("lookup_product_active_scan", suggested_product), ("lookup_brand_active_scan", suggested_brand), ("lookup_strength_active_scan", suggested_strength), ("lookup_dosage_form_active_scan", suggested_dosage_form)]:
+                if field_key not in st.session_state and clean(suggested_value):
+                    st.session_state[field_key] = suggested_value
+            product = st.text_input("Product name", value=suggested_product, key="lookup_product_active_scan")
+            brand = st.text_input("Brand / Company", value=suggested_brand, key="lookup_brand_active_scan")
+            strength = st.text_input("Strength", value=suggested_strength, key="lookup_strength_active_scan")
+            dosage_form = st.text_input("Dosage form", value=suggested_dosage_form, key="lookup_dosage_form_active_scan")
             category = st.selectbox("Κατηγορία", CATEGORIES)
 
-        expiry_date = st.text_input("Expiry date", value=detected_expiry, key=f"expiry_date_{image_context}")
-        no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης", key=f"no_expiry_{image_context}")
-        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number", ""), key=f"lot_number_{image_context}")
+        if "expiry_date_active_scan" not in st.session_state and clean(detected_expiry):
+            st.session_state.expiry_date_active_scan = detected_expiry
+        expiry_date = st.text_input("Expiry date", value=detected_expiry, key="expiry_date_active_scan")
+        no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης", key="no_expiry_active_scan")
+        lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number", ""), key="lot_number_active_scan")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
         quantity = st.number_input("Quantity to add", min_value=1, value=DEFAULT_STOCK_ADD_QUANTITY, step=1)
@@ -1904,23 +2035,34 @@ def main():
             "Current stock": current_stock_total,
             "Quantity to add": int(quantity),
         })
-        confirmed_product = st.checkbox("Επιβεβαιώνω product name, barcode/GTIN, expiry/no-expiry και ποσότητα", key=f"lookup_confirmed_product_{product_key}")
+        confirmed_product = st.checkbox("Επιβεβαιώνω product name, barcode/GTIN, expiry/no-expiry και ποσότητα", key="lookup_confirmed_product_active_scan")
 
         with st.expander("Debug σαρωμένης καταχώρησης", expanded=False):
             selected_debug = barcode_debug.get("selected", {})
-            st.write("Barcode decoder attempts", barcode_debug.get("attempts"))
-            st.write("Barcode decoder selected", selected_debug)
-            st.write("Expiry OCR attempts", back_ocr_debug.get("attempts"))
-            st.write("Expiry OCR selected", back_ocr_debug.get("selected_candidate"))
             attempted = st.session_state.get("greek_lookup_debug", {}).get("attempted", [])
-            st.write("Discount Pharmacy result", [item for item in attempted if item.get("provider") == "discountpharmacy.gr"])
-            st.write("Pharmacy295 result", [item for item in attempted if item.get("provider") == "pharmacy295.gr"])
-            st.write("Local inventory match", st.session_state.get("local_lookup_debug", "not_run"))
+            discount_result = [item for item in attempted if item.get("provider") == "discountpharmacy.gr"]
+            pharmacy295_result = [item for item in attempted if item.get("provider") == "pharmacy295.gr"]
+            st.write({
+                "detected_barcode": selected_debug.get("value", detected_code),
+                "barcode_source": selected_debug.get("decoder", "manual" if clean(code_input) and not selected_debug.get("value") else "decoder"),
+                "session_state_barcode": st.session_state.get("back_scan_barcode", ""),
+                "local_lookup_result": st.session_state.get("local_lookup_debug", "not_run"),
+                "discount_pharmacy_result": discount_result,
+                "pharmacy295_result": pharmacy295_result,
+                "selected_online_product": online_suggestion,
+                "provider_rejection_reason": [item.get("rejection_reason", "") for item in attempted if item.get("rejection_reason")],
+                "expiry_ocr_candidate": back_ocr_debug.get("selected_candidate", detected_expiry),
+                "current_expiry_form_value": expiry_date,
+            })
 
         if "pending_transaction_id" not in st.session_state:
             st.session_state.pending_transaction_id = str(uuid.uuid4())
 
-        if st.button("✅ Επιβεβαίωση και προσθήκη stock", use_container_width=True):
+        if st.button("✅ Επιβεβαίωση και προσθήκη stock", use_container_width=True, disabled=st.session_state.get("stock_save_in_progress", False)):
+            if st.session_state.get("stock_save_in_progress", False):
+                st.info("Η αποθήκευση είναι ήδη σε εξέλιξη.")
+                st.stop()
+            st.session_state.stock_save_in_progress = True
             try:
                 if not clean(lookup_code):
                     raise InventoryError("Χρειάζεται barcode ή GTIN πριν την αποθήκευση.")
@@ -1982,7 +2124,11 @@ def main():
                     init_analysis_state()
                     st.rerun()
             except InventoryError as exc:
+                st.session_state.stock_save_in_progress = False
                 st.error(str(exc))
+            except Exception:
+                st.session_state.stock_save_in_progress = False
+                raise
 
     with search_tab:
         if st.button("Νέα αναζήτηση", key="search_new_lookup", use_container_width=True):

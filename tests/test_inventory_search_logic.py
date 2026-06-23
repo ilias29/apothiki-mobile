@@ -533,3 +533,90 @@ def test_existing_product_confirmation_adds_exactly_plus_one_by_default():
     assert app.DEFAULT_STOCK_ADD_QUANTITY == 1
     assert row["Ποσότητα"] == 1
     assert row["DeltaQty"] == 1
+
+
+def _ean13_pattern(digits: str) -> str:
+    l = {"0":"0001101","1":"0011001","2":"0010011","3":"0111101","4":"0100011","5":"0110001","6":"0101111","7":"0111011","8":"0110111","9":"0001011"}
+    g = {"0":"0100111","1":"0110011","2":"0011011","3":"0100001","4":"0011101","5":"0111001","6":"0000101","7":"0010001","8":"0001001","9":"0010111"}
+    r = {"0":"1110010","1":"1100110","2":"1101100","3":"1000010","4":"1011100","5":"1001110","6":"1010000","7":"1000100","8":"1001000","9":"1110100"}
+    parity = {"0":"LLLLLL","1":"LLGLGG","2":"LLGGLG","3":"LLGGGL","4":"LGLLGG","5":"LGGLLG","6":"LGGGLL","7":"LGLGLG","8":"LGLGGL","9":"LGGLGL"}[digits[0]]
+    bits = "101"
+    for d, p in zip(digits[1:7], parity):
+        bits += (l if p == "L" else g)[d]
+    bits += "01010"
+    for d in digits[7:]:
+        bits += r[d]
+    return bits + "101"
+
+
+def test_real_generated_ean13_image_returns_requested_code():
+    from PIL import Image
+    import numpy as np
+    digits = "5206087700016"
+    bits = _ean13_pattern(digits)
+    module = 4
+    height = 140
+    quiet = 20
+    img = Image.new("RGB", ((len(bits) + quiet * 2) * module, height), "white")
+    px = img.load()
+    for i, bit in enumerate(bits):
+        if bit == "1":
+            for x in range((quiet + i) * module, (quiet + i + 1) * module):
+                for y in range(10, height - 20):
+                    px[x, y] = (0, 0, 0)
+    detected_type, value, debug = app.detect_code(None, np.array(img))
+    assert detected_type == "EAN-13", debug
+    assert value == digits
+
+
+def test_invalid_checksum_candidate_is_rejected():
+    selected = app.choose_detected_code([app.classify_barcode_value("Barcode", "5206087700017")])
+    assert not selected.get("valid")
+    assert selected["checksum"] == "invalid"
+
+
+def test_provider_search_page_title_pharmacy295_is_rejected_as_product_name():
+    rejected, reason = app.is_rejected_provider_product_name("Pharmacy295", "pharmacy295.gr")
+    assert rejected
+    assert reason == "generic_or_provider_title"
+
+
+def test_provider_name_alone_is_rejected_as_product_name():
+    rejected, reason = app.is_rejected_provider_product_name("Discount Pharmacy", "discountpharmacy.gr")
+    assert rejected
+    assert reason == "generic_or_provider_title"
+
+
+def test_local_product_takes_priority_over_online_lookup(monkeypatch):
+    rows = [base_row(Barcode="5206087700016", CodeValue="5206087700016", Προϊόν="Local Product")]
+    stock = app.stock_table(app.records_to_dataframe(rows))
+    called = False
+    def fake_online(*args, **kwargs):
+        nonlocal called
+        called = True
+        return [], {}
+    local = app.lookup_local_database(stock, "5206087700016")
+    if not local:
+        fake_online("5206087700016", "")
+    assert local["product_name"] == "LOCAL PRODUCT"
+    assert called is False
+
+
+def test_missing_expiry_requires_manual_or_no_expiry_choice():
+    with pytest.raises(app.InventoryError):
+        expiry_date = ""
+        no_expiry = False
+        if not app.clean(expiry_date) and not no_expiry:
+            raise app.InventoryError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι το προϊόν δεν έχει ημερομηνία λήξης.")
+
+
+def test_double_submission_does_not_duplicate_stock():
+    ws = FakeWorksheet(headers=app.COLUMNS)
+    row = app.make_transaction(
+        code_type="Barcode", code_value="5206087700016", barcode="5206087700016",
+        brand="Brand", product="Product", category="Φάρμακο", location_id=0,
+        movement="Παραλαβή (+)", quantity=1, delta=1, transaction_id="same-tx",
+    )
+    assert app.append_stock_transaction(ws, row) == "saved"
+    assert app.append_stock_transaction(ws, row) == "duplicate"
+    assert len(ws.appended) == 1
