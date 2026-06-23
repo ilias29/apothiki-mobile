@@ -533,3 +533,78 @@ def test_existing_product_confirmation_adds_exactly_plus_one_by_default():
     assert app.DEFAULT_STOCK_ADD_QUANTITY == 1
     assert row["Ποσότητα"] == 1
     assert row["DeltaQty"] == 1
+
+
+def test_verified_online_product_name_is_shown_for_confirmation(monkeypatch):
+    class Response:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    search_html = '<a href="/product/depon-500mg.html">Depon</a>'
+    detail_html = """
+    <html><head><script type="application/ld+json">
+    {"@type":"Product","name":"Depon 500mg 20 tabs","brand":{"name":"Bristol"},"gtin13":"5201234567890"}
+    </script></head></html>
+    """
+
+    def fake_get(url, **kwargs):
+        return Response(detail_html if "depon-500mg" in url else search_html)
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+
+    candidates, debug = app.online_lookup_candidates("5201234567890")
+
+    assert candidates[0]["product_name"] == "DEPON 500MG 20 TABS"
+    assert candidates[0]["provider"] == "discountpharmacy.gr"
+    assert debug["total_results"] >= 1
+
+
+def test_pharmacy295_alone_is_rejected_as_product_name(monkeypatch):
+    class Response:
+        text = """
+        <html><head><script type="application/ld+json">
+        {"@type":"Product","name":"Pharmacy295"}
+        </script></head></html>
+        """
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(app.requests, "get", lambda *args, **kwargs: Response())
+
+    found, debug = app._lookup_greek_provider(
+        "pharmacy295.gr",
+        "https://www.pharmacy295.gr/product/example.html",
+        "5201234567890",
+    )
+
+    assert found == []
+    assert debug["error"] == "no_verified_detail_product_name"
+
+
+def test_rejecting_online_suggestion_opens_manual_editing():
+    state = app.online_name_confirmation_state(
+        "Depon 500mg 20 tabs",
+        "Όχι, θα τη διορθώσω",
+        "5201234567890",
+        "",
+    )
+
+    assert state["manual_editing"] is True
+    assert state["name_confirmed"] is False
+    assert state["product_name"] == ""
+
+
+def test_accepting_online_suggestion_preserves_barcode():
+    state = app.online_name_confirmation_state(
+        "Depon 500mg 20 tabs",
+        "Ναι, είναι σωστή",
+        "5201234567890",
+    )
+
+    assert state["name_confirmed"] is True
+    assert state["product_name"] == "Depon 500mg 20 tabs"
+    assert state["barcode"] == "5201234567890"

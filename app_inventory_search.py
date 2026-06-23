@@ -1557,6 +1557,57 @@ def _extract_jsonld_product(html: str) -> dict[str, Any]:
     return {}
 
 
+def _is_rejected_online_product_name(name: str, provider: str = "") -> bool:
+    normalized = re.sub(r"\s+", " ", clean(name)).strip(" -|")
+    normalized_lower = normalized.lower()
+    provider_tokens = {
+        "discountpharmacy.gr",
+        "discount pharmacy",
+        "pharmacy295.gr",
+        "pharmacy295",
+        clean(provider).lower(),
+    }
+    generic_titles = {
+        "",
+        "search",
+        "αναζήτηση",
+        "products",
+        "προϊόντα",
+        "online pharmacy",
+        "φαρμακείο",
+    }
+    if normalized_lower in provider_tokens | generic_titles:
+        return True
+    if normalized_lower.startswith(("search ", "αναζήτηση ")) or "search results" in normalized_lower:
+        return True
+    return False
+
+
+def _same_provider_product_links(html: str, domain: str) -> list[str]:
+    links: list[str] = []
+    for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I):
+        absolute = requests.compat.urljoin(f"https://www.{domain}/", href)
+        parsed = requests.utils.urlparse(absolute)
+        if domain not in parsed.netloc:
+            continue
+        path = parsed.path.lower()
+        if any(skip in path for skip in ["/search", "controller=search", "/cart", "/login", "/account"]):
+            continue
+        if not re.search(r"\.(html?|php)$|/[a-z0-9][a-z0-9-]+/?$", path):
+            continue
+        if absolute not in links:
+            links.append(absolute)
+    return links[:5]
+
+
+def _extract_verified_product_from_detail_page(html: str, domain: str) -> dict[str, Any]:
+    product = _extract_jsonld_product(html)
+    name = clean(product.get("product_name", ""))
+    if not name or _is_rejected_online_product_name(name, domain):
+        return {}
+    return product | {"verified_detail_page": True}
+
+
 def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str]]:
     query = clean(code) or clean(product_name)
     if not query:
@@ -1577,12 +1628,19 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
         if "captcha" in html.lower():
             debug["error"] = "blocked"
             return [], debug
-        product = _extract_jsonld_product(html)
-        if not product:
-            title = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.I | re.S)
-            product = {"product_name": re.sub(r"\s+", " ", title.group(1)).strip() if title else ""}
+        product = _extract_verified_product_from_detail_page(html, domain)
+        detail_urls = [] if product else _same_provider_product_links(html, domain)
+        debug["detail_urls"] = detail_urls
+        for detail_url in detail_urls:
+            detail_response = requests.get(detail_url, timeout=4, headers={"User-Agent": "Mozilla/5.0 ApothikiMobile/1.0"})
+            detail_response.raise_for_status()
+            product = _extract_verified_product_from_detail_page(detail_response.text, domain)
+            if product:
+                debug["detail_url"] = detail_url
+                break
         if not clean(product.get("product_name", "")):
             debug["count"] = 0
+            debug["error"] = "no_verified_detail_product_name"
             return [], debug
         product.update({"provider": domain, "barcode": clean(code) if len(clean(code)) in {8, 13} else product.get("barcode", ""), "gtin": clean(code) if len(clean(code)) in {8, 13, 14} else ""})
         normalized = normalize_product_fields(product) | {"provider": domain, "local": False}
@@ -1620,6 +1678,18 @@ def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]
             merged["image_url"] = clean(result.get("image_url", result.get("image", "")))
     merged["provider"] = ", ".join([provider for provider in providers if provider])
     return merged
+
+
+def online_name_confirmation_state(suggested_name: str, decision: str, scanned_barcode: str, manual_name: str = "") -> dict[str, Any]:
+    accepted = decision == "Ναι, είναι σωστή" and clean(suggested_name)
+    rejected = decision == "Όχι, θα τη διορθώσω"
+    product_name = suggested_name if accepted else manual_name
+    return {
+        "product_name": clean(product_name),
+        "name_confirmed": bool(accepted or (rejected and clean(manual_name))),
+        "manual_editing": rejected,
+        "barcode": clean(scanned_barcode),
+    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -1881,11 +1951,42 @@ def main():
             category = local_product.get("category", "") or "Φάρμακο"
             st.info(f"Υπάρχον προϊόν: {product}")
         else:
-            product = st.text_input("Product name", value=suggested_product, key=f"lookup_product_{product_key}")
+            name_confirmed = False
+            if clean(suggested_product):
+                st.write("Βρέθηκε online ονομασία:")
+                st.info(suggested_product)
+                name_decision = st.radio(
+                    "Είναι σωστή η ονομασία του προϊόντος;",
+                    ["Ναι, είναι σωστή", "Όχι, θα τη διορθώσω"],
+                    key=f"lookup_online_name_confirmation_{product_key}",
+                    horizontal=True,
+                )
+                confirmation = online_name_confirmation_state(suggested_product, name_decision, lookup_code)
+                if confirmation["manual_editing"]:
+                    product = st.text_input(
+                        "Product name (διόρθωση)",
+                        value="",
+                        key=f"lookup_manual_product_{product_key}",
+                    )
+                    name_confirmed = bool(clean(product))
+                else:
+                    product = st.text_input(
+                        "Product name",
+                        value=confirmation["product_name"],
+                        key=f"lookup_product_{product_key}",
+                    )
+                    name_confirmed = bool(clean(product))
+            elif clean(lookup_code):
+                st.warning("Δεν βρέθηκε επιβεβαιωμένη ονομασία online.")
+                product = st.text_input("Product name", value="", key=f"lookup_product_{product_key}")
+            else:
+                product = st.text_input("Product name", value="", key=f"lookup_product_{product_key}")
             brand = st.text_input("Brand / Company", value=suggested_brand, key=f"lookup_brand_{product_key}")
             strength = st.text_input("Strength", value=suggested_strength, key=f"lookup_strength_{product_key}")
             dosage_form = st.text_input("Dosage form", value=suggested_dosage_form, key=f"lookup_dosage_form_{product_key}")
             category = st.selectbox("Κατηγορία", CATEGORIES)
+            if not clean(suggested_product):
+                name_confirmed = bool(clean(product))
 
         expiry_date = st.text_input("Expiry date", value=detected_expiry, key=f"expiry_date_{image_context}")
         no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης", key=f"no_expiry_{image_context}")
@@ -1926,6 +2027,8 @@ def main():
                     raise InventoryError("Χρειάζεται barcode ή GTIN πριν την αποθήκευση.")
                 if not clean(product):
                     raise InventoryError("Βάλε όνομα προϊόντος.")
+                if not local_product and not name_confirmed:
+                    raise InventoryError("Επιβεβαίωσε την online ονομασία ή συμπλήρωσε χειροκίνητα όνομα προϊόντος.")
                 if not confirmed_product:
                     raise InventoryError("Επιβεβαίωσε τα στοιχεία πριν την αποθήκευση.")
                 validation_warnings = validate_barcode_gtin(barcode, gtin)
