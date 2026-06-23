@@ -778,6 +778,23 @@ def back_scan_values(state: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def expiry_entry_completed(expiry_date: Any, no_expiry: bool) -> bool:
+    """Return True only when the user resolved the expiry requirement."""
+    return bool(clean(expiry_date) or no_expiry)
+
+
+def expiry_entry_guidance(detected_expiry: Any, has_current_analysis: bool) -> str:
+    if clean(detected_expiry):
+        return ""
+    if has_current_analysis:
+        return (
+            "Δεν εντοπίστηκε ορατή ημερομηνία λήξης στην πίσω φωτογραφία. "
+            "Το barcode και το αποτέλεσμα αναζήτησης διατηρούνται· συμπλήρωσε τη λήξη χειροκίνητα "
+            "ή επίλεξε «Το προϊόν δεν έχει ημερομηνία λήξης» για να συνεχίσεις."
+        )
+    return "Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι το προϊόν δεν έχει ημερομηνία λήξης πριν την τελική αποθήκευση."
+
+
 def preserve_scanned_barcode_state(state: dict[str, Any], scanned_barcode: str) -> str:
     """Keep the detected/confirmed barcode as the source of truth for lookup state."""
     scanned_barcode = clean(scanned_barcode)
@@ -1887,8 +1904,17 @@ def main():
             dosage_form = st.text_input("Dosage form", value=suggested_dosage_form, key=f"lookup_dosage_form_{product_key}")
             category = st.selectbox("Κατηγορία", CATEGORIES)
 
-        expiry_date = st.text_input("Expiry date", value=detected_expiry, key=f"expiry_date_{image_context}")
+        expiry_date = st.text_input(
+            "Expiry date",
+            value=detected_expiry,
+            key=f"expiry_date_{image_context}",
+            help="Αν η λήξη δεν διαβάστηκε από την πίσω φωτογραφία, συμπλήρωσέ τη χειροκίνητα.",
+        )
         no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης", key=f"no_expiry_{image_context}")
+        expiry_completed = expiry_entry_completed(expiry_date, no_expiry)
+        expiry_guidance = expiry_entry_guidance(detected_expiry, has_current_analysis)
+        if not expiry_completed and expiry_guidance:
+            st.warning(expiry_guidance)
         lot_number = st.text_input("Lot number (προαιρετικό)", value=parsed_gs1.get("lot_number", ""), key=f"lot_number_{image_context}")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()])
         location_id = int(location_label.split("-")[0].strip())
@@ -1920,7 +1946,8 @@ def main():
         if "pending_transaction_id" not in st.session_state:
             st.session_state.pending_transaction_id = str(uuid.uuid4())
 
-        if st.button("✅ Επιβεβαίωση και προσθήκη stock", use_container_width=True):
+        save_blocked_by_expiry = not expiry_completed
+        if st.button("✅ Επιβεβαίωση και προσθήκη stock", use_container_width=True, disabled=save_blocked_by_expiry):
             try:
                 if not clean(lookup_code):
                     raise InventoryError("Χρειάζεται barcode ή GTIN πριν την αποθήκευση.")

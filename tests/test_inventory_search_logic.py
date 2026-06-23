@@ -533,3 +533,24 @@ def test_existing_product_confirmation_adds_exactly_plus_one_by_default():
     assert app.DEFAULT_STOCK_ADD_QUANTITY == 1
     assert row["Ποσότητα"] == 1
     assert row["DeltaQty"] == 1
+
+
+def test_missing_back_expiry_does_not_clear_barcode_or_block_lookup_state():
+    state = {"back_scan_image_hash": "hash-a"}
+    app.apply_back_scan_result(state, "hash-a", {"barcode": "5201234567890", "gtin": "", "expiry": ""})
+    barcode, gtin, expiry = app.back_scan_values(state)
+    lookup_code = app.preserve_scanned_barcode_state(state, barcode)
+
+    assert lookup_code == "5201234567890"
+    assert gtin == ""
+    assert expiry == ""
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert app.expiry_entry_completed(expiry, False) is False
+
+
+def test_expiry_requirement_is_resolved_by_manual_date_or_explicit_no_expiry():
+    assert app.expiry_entry_completed("", False) is False
+    assert app.expiry_entry_completed("2027-02-28", False) is True
+    assert app.expiry_entry_completed("", True) is True
+    assert "διατηρούνται" in app.expiry_entry_guidance("", True)
