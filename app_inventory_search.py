@@ -778,6 +778,29 @@ def back_scan_values(state: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def preserve_scanned_barcode_state(state: dict[str, Any], scanned_barcode: str) -> str:
+    """Keep the detected/confirmed barcode as the source of truth for lookup state."""
+    scanned_barcode = clean(scanned_barcode)
+    if not scanned_barcode:
+        return ""
+    state["back_scan_barcode"] = scanned_barcode
+    state["lookup_last_search_value"] = scanned_barcode
+    state["lookup_query"] = scanned_barcode
+    state["lookup_scanned_barcode"] = scanned_barcode
+    return scanned_barcode
+
+
+def product_text_fields_from_lookup(provider_result: dict[str, Any] | None) -> dict[str, str]:
+    """Return only product text fields from online/local lookup results.
+
+    Provider barcodes are intentionally ignored because the scanned barcode is
+    the authoritative package identifier for the current back-photo workflow.
+    """
+    provider_result = provider_result or {}
+    normalized = normalize_product_fields(provider_result)
+    return {key: normalized.get(key, "") for key in ["product_name", "brand", "strength", "dosage_form"]}
+
+
 def reset_lookup_state(*, preserve: dict[str, Any] | None = None, clear_analysis: bool = False) -> None:
     preserve = preserve or {}
     for key in LOOKUP_STATE_KEYS | APPROVAL_FORM_KEYS:
@@ -1777,28 +1800,38 @@ def main():
 
         parsed_gs1 = parse_machine_readable_fields(detected_code) if detected_type in {"QR", "DataMatrix"} and detected_code else {}
         barcode_value, gtin_value, expiry_value = back_scan_values(st.session_state)
+        previous_lookup_value = st.session_state.get("lookup_last_search_value", "")
+        scanned_barcode = preserve_scanned_barcode_state(st.session_state, barcode_value)
         detected_gtin = gtin_value or parsed_gs1.get("gtin", "")
         detected_expiry = expiry_value
-        detected_code = detected_gtin or barcode_value or detected_code
+        detected_code = detected_gtin or scanned_barcode or detected_code
         image_context = _lookup_context_key(back_hash, detected_code, detected_gtin)
+        code_input_key = f"code_input_{image_context}"
+        if scanned_barcode:
+            # On every rerun, initialize the barcode input from the persisted
+            # detected barcode before any online provider result is considered.
+            st.session_state[code_input_key] = scanned_barcode
 
         code_input = st.text_input(
             "Barcode / GTIN",
-            value=detected_gtin or detected_code,
-            key=f"code_input_{image_context}",
+            value=detected_gtin or scanned_barcode or detected_code,
+            key=code_input_key,
             help="Αν δεν εντοπίστηκε barcode, συμπλήρωσέ το χειροκίνητα. Η ροή δεν μπλοκάρει.",
         )
-        lookup_code = clean(detected_gtin or code_input)
+        lookup_code = clean(scanned_barcode or detected_gtin or code_input)
         code_type = "GTIN" if len(lookup_code) == 14 else "Barcode"
         gtin = detected_gtin or (lookup_code if code_type == "GTIN" else "")
-        barcode = lookup_code if code_type == "Barcode" else ""
+        barcode = scanned_barcode or (lookup_code if code_type == "Barcode" else "")
+        if barcode:
+            lookup_code = preserve_scanned_barcode_state(st.session_state, barcode)
 
-        if lookup_code != st.session_state.get("lookup_last_search_value", ""):
+        if lookup_code != previous_lookup_value:
             reset_lookup_state(
                 preserve={
                     "lookup_last_search_value": lookup_code,
                     "lookup_query": lookup_code,
                     "lookup_scanned_barcode": barcode,
+                    "back_scan_barcode": barcode,
                     "lookup_detected_code": code_input,
                     "lookup_detected_gtin": gtin,
                     "lookup_front_image_hash": front_hash,
@@ -1821,16 +1854,18 @@ def main():
 
         if local_product and product_matches_current_lookup(local_product, lookup_code, barcode, gtin):
             st.session_state.lookup_selected_product = local_product
-            suggested_product = local_product.get("product_name", "")
-            suggested_brand = local_product.get("brand", "")
-            suggested_strength = local_product.get("strength", "")
-            suggested_dosage_form = local_product.get("dosage_form", "")
+            text_fields = product_text_fields_from_lookup(local_product)
+            suggested_product = text_fields["product_name"]
+            suggested_brand = text_fields["brand"]
+            suggested_strength = text_fields["strength"]
+            suggested_dosage_form = text_fields["dosage_form"]
         else:
             st.session_state.lookup_selected_product = None
-            suggested_product = online_suggestion.get("product_name", "")
-            suggested_brand = online_suggestion.get("brand", "")
-            suggested_strength = online_suggestion.get("strength", "")
-            suggested_dosage_form = online_suggestion.get("dosage_form", "")
+            text_fields = product_text_fields_from_lookup(online_suggestion)
+            suggested_product = text_fields["product_name"]
+            suggested_brand = text_fields["brand"]
+            suggested_strength = text_fields["strength"]
+            suggested_dosage_form = text_fields["dosage_form"]
             if clean(lookup_code) and not online_suggestion.get("provider"):
                 st.warning("Δεν βρέθηκε σε Discount Pharmacy ή Pharmacy295. Συμπλήρωσε χειροκίνητα το νέο προϊόν.")
 

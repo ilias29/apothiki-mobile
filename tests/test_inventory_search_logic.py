@@ -395,10 +395,87 @@ def test_detected_barcode_remains_after_another_form_field_changes():
     assert app.back_scan_values(state)[0] == "5201234567890"
 
 
+def test_detected_barcode_remains_after_online_lookup():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_barcode": "5201234567890"}
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+    fields = app.product_text_fields_from_lookup(
+        {
+            "product_name": "Online Product",
+            "brand": "Online Brand",
+            "strength": "20 mg",
+            "dosage_form": "Tablet",
+            "barcode": "5209999999999",
+        }
+    )
+    state.update(fields)
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert state["lookup_query"] == "5201234567890"
+    assert state["lookup_scanned_barcode"] == "5201234567890"
+    assert state["product_name"] == "ONLINE PRODUCT"
+    assert state["brand"] == "ONLINE BRAND"
+    assert state["strength"] == "20 MG"
+    assert state["dosage_form"] == "TABLET"
+
+
+def test_detected_barcode_remains_when_provider_returns_no_barcode():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_barcode": "5201234567890"}
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+    fields = app.product_text_fields_from_lookup({"product_name": "Online Product", "barcode": ""})
+    state.update(fields)
+
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert state["lookup_query"] == "5201234567890"
+    assert state["lookup_scanned_barcode"] == "5201234567890"
+    assert "barcode" not in fields
+
+
+def test_detected_barcode_remains_when_provider_returns_different_barcode():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_barcode": "5201234567890"}
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+    fields = app.product_text_fields_from_lookup({"product_name": "Other Product", "barcode": "5209999999999"})
+    state.update(fields)
+
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert state["lookup_query"] == "5201234567890"
+    assert state["lookup_scanned_barcode"] == "5201234567890"
+    assert "barcode" not in fields
+
+
 def test_detected_expiry_remains_after_another_form_field_changes():
     state = {"back_scan_image_hash": "hash-a", "back_scan_expiry": "2027-02-28"}
     state["lookup_brand_any"] = "Changed brand"
     assert app.back_scan_values(state)[2] == "2027-02-28"
+
+
+def test_changing_product_name_does_not_clear_barcode():
+    state = {"back_scan_image_hash": "hash-a", "back_scan_barcode": "5201234567890"}
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+    state["product_name"] = "Manual Product Name"
+
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert state["lookup_query"] == "5201234567890"
+    assert state["lookup_scanned_barcode"] == "5201234567890"
+
+
+def test_changing_expiry_does_not_clear_barcode():
+    state = {
+        "back_scan_image_hash": "hash-a",
+        "back_scan_barcode": "5201234567890",
+        "back_scan_expiry": "2027-02-28",
+    }
+    app.preserve_scanned_barcode_state(state, state["back_scan_barcode"])
+    state["back_scan_expiry"] = "2028-03-31"
+
+    assert state["back_scan_barcode"] == "5201234567890"
+    assert state["lookup_last_search_value"] == "5201234567890"
+    assert state["lookup_query"] == "5201234567890"
+    assert state["lookup_scanned_barcode"] == "5201234567890"
 
 
 def test_empty_rerun_result_cannot_overwrite_previously_detected_values():
