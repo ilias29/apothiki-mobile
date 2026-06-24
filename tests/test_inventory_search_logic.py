@@ -620,3 +620,111 @@ def test_double_submission_does_not_duplicate_stock():
     assert app.append_stock_transaction(ws, row) == "saved"
     assert app.append_stock_transaction(ws, row) == "duplicate"
     assert len(ws.appended) == 1
+
+SEARCH_HTML = '''
+<html><body>
+<div class="product-miniature"><a class="product-title" href="/product/depon-123">Depon 500</a><span>5201234567890</span></div>
+<script type="application/ld+json">{"@type":"ItemList","itemListElement":[{"@type":"ListItem","item":{"url":"/product/jsonld-123"}}]}</script>
+<a href="/search?s=5201234567890">Search</a><a href="/cart">Cart</a>
+</body></html>
+'''
+
+DETAIL_HTML = '''
+<html><head><script type="application/ld+json">{"@type":"Product","name":"Product Name | Pharmacy295","brand":{"name":"Acme"},"gtin13":"5201234567890","sku":"SKU1"}</script></head>
+<body><h1>Fallback Name</h1><dl><dt>Strength:</dt><dd>500 mg</dd><dt>Dosage form:</dt><dd>Tablet</dd></dl></body></html>
+'''
+
+
+def test_search_page_returns_product_detail_link():
+    links = app.extract_provider_search_candidates(SEARCH_HTML, "https://www.pharmacy295.gr/search?controller=search&s=5201234567890", "5201234567890", "pharmacy295.gr")
+    assert "https://www.pharmacy295.gr/product/depon-123" in links
+
+
+def test_relative_product_link_becomes_absolute():
+    links = app.extract_provider_search_candidates(SEARCH_HTML, "https://www.discountpharmacy.gr/search?search=5201234567890", "5201234567890", "discountpharmacy.gr")
+    assert links[0].startswith("https://www.discountpharmacy.gr/")
+
+
+def test_generic_provider_page_title_is_rejected():
+    rejected, reason = app.is_rejected_provider_product_name("Pharmacy295", "pharmacy295.gr")
+    assert rejected
+    assert reason == "generic_or_provider_title"
+
+
+def test_provider_suffix_is_removed_from_product_name():
+    assert app.strip_provider_title_suffix("Product Name | Pharmacy295", "pharmacy295.gr") == "Product Name"
+
+
+def test_exact_requested_barcode_detail_page_is_accepted():
+    product = app.extract_provider_detail_product(DETAIL_HTML, "https://www.pharmacy295.gr/product/depon-123", "5201234567890", "pharmacy295.gr")
+    assert product["verified"] is True
+    assert product["product_name"] == "Product Name"
+    assert product["barcode_found"] == "5201234567890"
+
+
+def test_different_barcode_detail_page_is_rejected():
+    product = app.extract_provider_detail_product(DETAIL_HTML.replace("5201234567890", "5209999999999"), "https://www.pharmacy295.gr/product/depon-123", "5201234567890", "pharmacy295.gr")
+    assert product["verified"] is False
+    assert product["rejection_reason"] == "provider_barcode_mismatch"
+
+
+def test_missing_barcode_detail_page_is_unverified():
+    html = '<html><body><h1>Real Product</h1><p>Nice product description</p></body></html>'
+    product = app.extract_provider_detail_product(html, "https://www.pharmacy295.gr/product/real", "5201234567890", "pharmacy295.gr")
+    assert product["verified"] is False
+    assert product["rejection_reason"] == "provider_barcode_unverified"
+
+
+def test_provider_barcode_never_overwrites_scanned_barcode():
+    fields = app.product_text_fields_from_lookup({"product_name": "Online Product", "barcode_found": "5209999999999"})
+    assert "barcode" not in fields
+
+
+def test_local_product_prevents_online_requests():
+    assert app.should_run_online_lookup("5201234567890", {"product_name": "LOCAL"}) is False
+
+
+def test_manual_product_entry_remains_available_after_lookup_failure():
+    assert app.should_run_online_lookup("", None) is False
+    assert app.product_text_fields_from_lookup({}) == {"product_name": "", "brand": "", "strength": "", "dosage_form": ""}
+
+
+def test_online_lookup_result_is_cached_and_not_repeated_on_normal_rerun(monkeypatch):
+    app.online_lookup_candidates.clear()
+    calls = {"n": 0}
+
+    def fake_lookup(domain, url, code):
+        calls["n"] += 1
+        return ([{"product_name": "Cached Product", "provider": domain, "verified": True}], {"provider": domain})
+
+    monkeypatch.setattr(app, "_lookup_greek_provider", fake_lookup)
+    first, _ = app.online_lookup_candidates("5201234567890", "")
+    second, _ = app.online_lookup_candidates("5201234567890", "")
+    assert first == second
+    assert calls["n"] == 2  # one per provider only on first cached invocation
+
+
+@pytest.mark.parametrize("status", [403, 429, 500])
+def test_timeout_403_429_5xx_does_not_crash_app(monkeypatch, status):
+    class FakeResponse:
+        status_code = status
+        text = ""
+        url = "https://www.pharmacy295.gr/search"
+
+    def fake_get(*args, **kwargs):
+        return FakeResponse()
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    found, debug = app._lookup_greek_provider("pharmacy295.gr", "https://www.pharmacy295.gr/search?s=5201234567890", "5201234567890")
+    assert found == []
+    assert debug["error"] == f"http_{status}"
+
+
+def test_timeout_does_not_crash_app(monkeypatch):
+    def fake_get(*args, **kwargs):
+        raise app.requests.Timeout("slow")
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    found, debug = app._lookup_greek_provider("pharmacy295.gr", "https://www.pharmacy295.gr/search?s=5201234567890", "5201234567890")
+    assert found == []
+    assert "connection" in debug["error"]
