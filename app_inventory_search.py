@@ -2,9 +2,11 @@ import base64
 import hashlib
 import re
 import calendar
+import html
 import shutil
 import time
 import uuid
+from urllib.parse import urljoin, urlparse
 from datetime import date, datetime
 from typing import Any
 
@@ -44,6 +46,7 @@ WS_NAME = "Transactions"
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
 GREEK_PROVIDER_TIMEOUT_SECONDS = 4
+GREEK_PROVIDER_CACHE_TTL_SECONDS = 600
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 0
 MAX_BACK_EXPIRY_OCR_CALLS = 4
@@ -1624,9 +1627,14 @@ GREEK_PROVIDER_DOMAINS = [
 GENERIC_PROVIDER_TITLES = {
     "pharmacy295",
     "discount pharmacy",
+    "discountpharmacy",
+    "discountpharmacy.gr",
+    "pharmacy295.gr",
     "search",
     "αναζήτηση",
     "αποτελέσματα αναζήτησης",
+    "homepage",
+    "home",
 }
 
 
@@ -1642,7 +1650,179 @@ def is_rejected_provider_product_name(name: Any, provider: str = "") -> tuple[bo
         return True, "generic_or_provider_title"
     if any(part.strip().lower() in generic for part in re.split(r"[|—–-]", lowered)) and len(lowered) <= 40:
         return True, "search_or_provider_page_title"
+    meaningful = re.sub(r"[\W_]+", "", lowered, flags=re.UNICODE)
+    if len(meaningful) < 4:
+        return True, "too_short_product_name"
     return False, ""
+
+
+def strip_provider_title_suffix(name: str, provider: str) -> str:
+    text = normalize_spaces(html.unescape(clean(name)))
+    if not text:
+        return ""
+    provider_bits = [
+        provider,
+        provider.replace(".gr", ""),
+        "Pharmacy295",
+        "Discount Pharmacy",
+        "DiscountPharmacy",
+    ]
+    for sep in ["|", " - ", " – ", " — "]:
+        parts = [p.strip() for p in text.split(sep)]
+        if len(parts) > 1 and any(parts[-1].lower() == bit.lower() for bit in provider_bits):
+            return normalize_spaces(sep.join(parts[:-1]) if sep.strip() not in {"|"} else " | ".join(parts[:-1]))
+    return text
+
+
+def _html_text(value: str) -> str:
+    return normalize_spaces(re.sub(r"<[^>]+>", " ", html.unescape(value or "")))
+
+
+def _attr(tag: str, attr: str) -> str:
+    match = re.search(rf'\b{re.escape(attr)}\s*=\s*([\'"])(.*?)\1', tag or "", flags=re.I | re.S)
+    return html.unescape(match.group(2).strip()) if match else ""
+
+
+def _jsonld_objects(html_text: str) -> list[dict[str, Any]]:
+    objects: list[dict[str, Any]] = []
+    for match in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_text, flags=re.I | re.S):
+        try:
+            payload = requests.models.complexjson.loads(html.unescape(match.group(1).strip()))
+        except Exception:
+            continue
+        stack = payload if isinstance(payload, list) else [payload]
+        while stack:
+            item = stack.pop(0)
+            if isinstance(item, dict):
+                objects.append(item)
+                for key in ("@graph", "itemListElement"):
+                    value = item.get(key, [])
+                    if isinstance(value, list):
+                        stack.extend(value)
+                    elif isinstance(value, dict):
+                        stack.append(value)
+                if isinstance(item.get("item"), dict):
+                    stack.append(item["item"])
+            elif isinstance(item, list):
+                stack.extend(item)
+    return objects
+
+
+def _is_product_detail_url(url: str, provider: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.strip("/").lower()
+    query = parsed.query.lower()
+    if provider not in parsed.netloc.lower():
+        return False
+    if not path:
+        return False
+    blocked = ("login", "cart", "basket", "account", "category", "categories", "search", "αναζητηση", "contact", "privacy", "terms")
+    if any(b in path or b in query for b in blocked):
+        return False
+    return True
+
+
+def extract_provider_search_candidates(search_html: str, search_url: str, code: str, provider: str) -> list[str]:
+    candidates: list[str] = []
+    for obj in _jsonld_objects(search_html):
+        url_value = obj.get("url") or (obj.get("item", {}) if isinstance(obj.get("item"), dict) else {}).get("url", "")
+        if url_value:
+            candidates.append(urljoin(search_url, str(url_value)))
+    for match in re.finditer(r"<a\b[^>]*href\s*=\s*([\'\"])(.*?)\1[^>]*>(.*?)</a>", search_html, flags=re.I | re.S):
+        href = html.unescape(match.group(2).strip())
+        anchor_html = match.group(3)
+        surrounding = search_html[max(0, match.start() - 500):match.end() + 500]
+        text = _html_text(anchor_html)
+        classes = _attr(match.group(0), "class").lower()
+        context = _html_text(surrounding)
+        looks_product = (
+            clean(code) in href
+            or clean(code) in context
+            or any(word in classes for word in ["product", "item", "result"])
+            or (len(text) >= 4 and not re.search(r"\b(login|cart|search|account)\b", text, flags=re.I))
+        )
+        if looks_product:
+            candidates.append(urljoin(search_url, href))
+    deduped: list[str] = []
+    seen = set()
+    for url in candidates:
+        clean_url = url.split("#", 1)[0]
+        if clean_url not in seen and _is_product_detail_url(clean_url, provider):
+            seen.add(clean_url)
+            deduped.append(clean_url)
+    return deduped
+
+
+def _extract_first_meta(html_text: str, *, property_name: str = "", itemprop: str = "") -> str:
+    if property_name:
+        pattern = rf'<meta[^>]+property=["\']{re.escape(property_name)}["\'][^>]*>'
+    else:
+        pattern = rf'<[^>]+itemprop=["\']{re.escape(itemprop)}["\'][^>]*>'
+    for match in re.finditer(pattern, html_text, flags=re.I | re.S):
+        tag = match.group(0)
+        return _attr(tag, "content") or _html_text(tag)
+    return ""
+
+
+def extract_provider_detail_product(detail_html: str, detail_url: str, code: str, provider: str) -> dict[str, Any]:
+    product: dict[str, Any] = {"product_page_url": detail_url, "provider": provider, "barcode_found": "", "verified": False, "rejection_reason": ""}
+    product_types = {"Product", "product"}
+    for obj in _jsonld_objects(detail_html):
+        kind = obj.get("@type", "")
+        kinds = set(kind if isinstance(kind, list) else [kind])
+        if kinds & product_types:
+            brand = obj.get("brand", "")
+            if isinstance(brand, dict):
+                brand = brand.get("name", "")
+            for key in ["gtin", "gtin8", "gtin12", "gtin13", "gtin14", "sku"]:
+                if clean(obj.get(key, "")) and not product.get("barcode_found"):
+                    product["barcode_found"] = clean(obj.get(key, ""))
+            product.update({"product_name": obj.get("name", ""), "brand": brand, "gtin": product.get("barcode_found", "")})
+            break
+    if not clean(product.get("product_name", "")):
+        product["product_name"] = _extract_first_meta(detail_html, itemprop="name")
+    if not product.get("barcode_found"):
+        product["barcode_found"] = _extract_first_meta(detail_html, itemprop="gtin") or _extract_first_meta(detail_html, itemprop="sku")
+    if not clean(product.get("product_name", "")) and _is_product_detail_url(detail_url, provider):
+        product["product_name"] = _extract_first_meta(detail_html, property_name="og:title")
+    if not clean(product.get("product_name", "")):
+        h1 = re.search(r"<h1\b[^>]*>(.*?)</h1>", detail_html, flags=re.I | re.S)
+        if h1:
+            product["product_name"] = _html_text(h1.group(1))
+    text = _html_text(detail_html)
+    if not product.get("barcode_found"):
+        spec_match = re.search(r"(?:barcode|ean|gtin|sku)\D{0,30}(\d{8,14})", text, flags=re.I)
+        if spec_match:
+            product["barcode_found"] = spec_match.group(1)
+    for field, labels in {
+        "brand": ["brand", "company", "εταιρεία", "μάρκα"],
+        "strength": ["strength", "περιεκτικότητα"],
+        "dosage_form": ["dosage form", "μορφή"],
+    }.items():
+        if not clean(product.get(field, "")):
+            for label in labels:
+                match = re.search(rf"{re.escape(label)}\s*[:：]\s*([^|,\n\r]{{2,80}})", text, flags=re.I)
+                if match:
+                    product[field] = match.group(1)
+                    break
+    product["product_name"] = strip_provider_title_suffix(product.get("product_name", ""), provider)
+    rejected, reason = is_rejected_provider_product_name(product.get("product_name", ""), provider)
+    if rejected:
+        product["rejection_reason"] = reason
+        return product
+    requested = clean(code)
+    found = clean(product.get("barcode_found", ""))
+    if found and found != requested:
+        product["rejection_reason"] = "provider_barcode_mismatch"
+        return product
+    if found == requested:
+        product["verified"] = True
+    elif requested and re.search(rf"(?:barcode|ean|gtin|sku|κωδ)\D{{0,60}}{re.escape(requested)}|{re.escape(requested)}\D{{0,60}}(?:barcode|ean|gtin|sku|κωδ)", text, flags=re.I):
+        product["verified"] = True
+        product["barcode_found"] = requested
+    else:
+        product["rejection_reason"] = "provider_barcode_unverified"
+    return product
 
 
 def provider_barcode_verified(product: dict[str, Any], requested_code: str) -> tuple[bool, str]:
@@ -1687,37 +1867,83 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
 
 
 def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    debug = {"provider": domain, "error": "", "count": 0, "rejection_reason": "", "verified": False, "result": {}}
+    debug = {
+        "provider": domain,
+        "search_url": search_url,
+        "http_status": None,
+        "candidate_detail_urls": [],
+        "detail_pages_inspected": [],
+        "product_name_extracted": "",
+        "barcode_found": "",
+        "verified": False,
+        "rejection_reason": "",
+        "selected_result": {},
+        "error": "",
+        "count": 0,
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 ApothikiMobile/1.0"}
     try:
-        response = requests.get(search_url, timeout=4, headers={"User-Agent": "Mozilla/5.0 ApothikiMobile/1.0"})
-        response.raise_for_status()
+        response = requests.get(search_url, timeout=GREEK_PROVIDER_TIMEOUT_SECONDS, headers=headers, allow_redirects=True)
+        debug["http_status"] = response.status_code
+        if response.status_code in {403, 404, 429} or response.status_code >= 500:
+            debug["error"] = f"http_{response.status_code}"
+            return [], debug
         html = response.text
-        if "captcha" in html.lower():
+        if re.search(r"captcha|access denied|cloudflare|robot check", html, flags=re.I):
             debug["error"] = "blocked"
             return [], debug
-
-        product = _extract_jsonld_product(html)
-        if not product:
-            debug["rejection_reason"] = "no_product_detail_jsonld"
-            return [], debug
-
-        rejected, reason = is_rejected_provider_product_name(product.get("product_name", ""), domain)
-        if rejected:
-            debug["rejection_reason"] = reason
-            debug["result"] = {"product_name": product.get("product_name", "")}
-            return [], debug
-
-        verified, reason = provider_barcode_verified(product, code)
-        debug["verified"] = verified
-        if not verified:
-            debug["rejection_reason"] = reason
-            debug["result"] = {"product_name": product.get("product_name", ""), "barcode": product.get("barcode", ""), "gtin": product.get("gtin", "")}
-            return [], debug
-
-        normalized = product_text_fields_from_lookup(product) | {"provider": domain, "local": False, "verified": True}
-        debug["count"] = 1
-        debug["result"] = normalized
-        return [normalized], debug
+        candidates = extract_provider_search_candidates(html, search_url, code, domain)[:5]
+        debug["candidate_detail_urls"] = candidates
+        results: list[dict[str, Any]] = []
+        for detail_url in candidates:
+            inspected = {"url": detail_url, "http_status": None, "product_name_extracted": "", "barcode_found": "", "verified": False, "rejection_reason": ""}
+            try:
+                detail_response = requests.get(detail_url, timeout=GREEK_PROVIDER_TIMEOUT_SECONDS, headers=headers, allow_redirects=True)
+                inspected["http_status"] = detail_response.status_code
+                if detail_response.status_code in {403, 404, 429} or detail_response.status_code >= 500:
+                    inspected["rejection_reason"] = f"http_{detail_response.status_code}"
+                    debug["detail_pages_inspected"].append(inspected)
+                    continue
+                if re.search(r"captcha|access denied|cloudflare|robot check", detail_response.text, flags=re.I):
+                    inspected["rejection_reason"] = "blocked"
+                    debug["detail_pages_inspected"].append(inspected)
+                    continue
+                product = extract_provider_detail_product(detail_response.text, detail_response.url or detail_url, code, domain)
+                inspected.update({
+                    "product_name_extracted": product.get("product_name", ""),
+                    "barcode_found": product.get("barcode_found", ""),
+                    "verified": product.get("verified", False),
+                    "rejection_reason": product.get("rejection_reason", ""),
+                })
+                debug["detail_pages_inspected"].append(inspected)
+                normalized = product_text_fields_from_lookup(product) | {
+                    "provider": domain,
+                    "product_page_url": product.get("product_page_url", detail_url),
+                    "verified": bool(product.get("verified")),
+                    "local": False,
+                }
+                if clean(normalized.get("product_name", "")) and not product.get("rejection_reason") == "provider_barcode_mismatch":
+                    results.append(normalized)
+            except requests.RequestException as exc:
+                inspected["rejection_reason"] = f"connection: {exc}"
+                debug["detail_pages_inspected"].append(inspected)
+        ranked = sorted(
+            results,
+            key=lambda item: (
+                1 if item.get("verified") else 0,
+                1 if clean(item.get("product_name", "")) else 0,
+                sum(1 for k in ["product_name", "brand", "strength", "dosage_form"] if clean(item.get(k, ""))),
+            ),
+            reverse=True,
+        )
+        if ranked:
+            selected = ranked[0]
+            debug["count"] = len(ranked)
+            debug["selected_result"] = selected
+            debug["verified"] = bool(selected.get("verified"))
+            debug["product_name_extracted"] = selected.get("product_name", "")
+            return ranked, debug
+        debug["rejection_reason"] = "no_verified_product_detail"
     except requests.RequestException as exc:
         debug["error"] = f"connection: {exc}"
     except Exception as exc:
@@ -1725,16 +1951,30 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
     return [], debug
 
 
+@st.cache_data(ttl=GREEK_PROVIDER_CACHE_TTL_SECONDS, show_spinner=False)
 def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     attempts = []
-    for domain, url in _greek_search_urls(code, product_name):
+    for provider_order, (domain, url) in enumerate(_greek_search_urls(code, product_name)):
         found, info = _lookup_greek_provider(domain, url, code)
+        info["provider_order"] = provider_order
         attempts.append(info)
         candidates.extend(found)
-        if len(candidates) >= 3:
-            break
-    return candidates[:3], {"attempted": attempts, "total_results": len(candidates[:3])}
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            1 if item.get("verified") else 0,
+            1 if clean(item.get("product_name", "")) else 0,
+            sum(1 for k in ["product_name", "brand", "strength", "dosage_form"] if clean(item.get(k, ""))),
+            -next((i for i, (domain, _) in enumerate(_greek_search_urls(code, product_name)) if domain == item.get("provider")), 99),
+        ),
+        reverse=True,
+    )
+    return ranked[:3], {"attempted": attempts, "total_results": len(ranked[:3]), "selected_result": ranked[0] if ranked else {}}
+
+
+def should_run_online_lookup(code: str, local_product: dict[str, Any] | None) -> bool:
+    return bool(clean(code)) and not local_product
 
 
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
@@ -1971,12 +2211,13 @@ def main():
         stock_for_lookup = stock_table(load_data(worksheet())[0])
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
         st.session_state.local_lookup_debug = "found" if local_product else "not_found" if clean(lookup_code) else "no_code"
-        if clean(lookup_code) and not local_product:
+        if should_run_online_lookup(lookup_code, local_product):
             online_candidates, greek_lookup_debug = online_lookup_candidates(lookup_code, "")
         else:
             online_candidates, greek_lookup_debug = [], {"attempted": [], "total_results": 0, "skipped": "local_found" if local_product else "no_code"}
         st.session_state.greek_lookup_debug = greek_lookup_debug
-        online_suggestion = merge_lookup_results(online_candidates) if online_candidates else {}
+        verified_online_candidates = [candidate for candidate in online_candidates if candidate.get("verified")]
+        online_suggestion = merge_lookup_results(verified_online_candidates) if verified_online_candidates else {}
 
         if local_product and product_matches_current_lookup(local_product, lookup_code, barcode, gtin):
             st.session_state.lookup_selected_product = local_product
@@ -1993,7 +2234,7 @@ def main():
             suggested_strength = text_fields["strength"]
             suggested_dosage_form = text_fields["dosage_form"]
             if clean(lookup_code) and not online_suggestion.get("provider"):
-                st.warning("Δεν βρέθηκε σε Discount Pharmacy ή Pharmacy295. Συμπλήρωσε χειροκίνητα το νέο προϊόν.")
+                st.warning("Δεν βρέθηκε επιβεβαιωμένη ονομασία online.")
 
         for warning in validate_barcode_gtin(barcode, gtin):
             st.warning(warning)
@@ -2007,6 +2248,15 @@ def main():
             category = local_product.get("category", "") or "Φάρμακο"
             st.info(f"Υπάρχον προϊόν: {product}")
         else:
+            if online_suggestion.get("provider") and clean(suggested_product):
+                st.info(f"Βρέθηκε online ονομασία:\n\n{suggested_product}")
+                confirmation = st.radio(
+                    "Είναι σωστή η ονομασία του προϊόντος;",
+                    ["Ναι, είναι σωστή", "Όχι, θα τη διορθώσω"],
+                    key="lookup_confirmed_product_active_scan",
+                )
+                if confirmation != "Ναι, είναι σωστή":
+                    suggested_product = ""
             for field_key, suggested_value in [("lookup_product_active_scan", suggested_product), ("lookup_brand_active_scan", suggested_brand), ("lookup_strength_active_scan", suggested_strength), ("lookup_dosage_form_active_scan", suggested_dosage_form)]:
                 if field_key not in st.session_state and clean(suggested_value):
                     st.session_state[field_key] = suggested_value
