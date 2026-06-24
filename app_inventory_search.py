@@ -345,13 +345,97 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pd.DataFrame:
     return df[COLUMNS]
 
 
-def load_data(ws) -> tuple[pd.DataFrame, list[str]]:
-    _, unknown = validate_and_migrate_headers(ws)
+GOOGLE_READ_CACHE_TTL_SECONDS = 15
+GOOGLE_TEMPORARY_STATUS_CODES = {429, 500, 502, 503, 504}
+_GOOGLE_READ_CACHE: dict[int, dict[str, Any]] = {}
+_GOOGLE_DEBUG: dict[str, Any] = {
+    "cached": False,
+    "read_attempts": 0,
+    "last_temporary_error_type": "",
+    "row_count": 0,
+}
+
+
+def initialize_schema(ws) -> tuple[list[str], list[str]]:
+    return validate_and_migrate_headers(ws)
+
+
+def _worksheet_cache_key(ws) -> int:
+    return id(ws)
+
+
+def _google_error_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) or getattr(response, "status", None)
+    if status is None:
+        match = re.search(r"\b(429|500|502|503|504)\b", str(exc))
+        status = int(match.group(1)) if match else None
     try:
-        records = ws.get_all_records()
-    except Exception as exc:
-        raise InventoryError("Δεν ήταν δυνατή η ανάγνωση των κινήσεων.") from exc
-    return records_to_dataframe(records), unknown
+        return int(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def _is_temporary_google_error(exc: Exception) -> bool:
+    return _google_error_status(exc) in GOOGLE_TEMPORARY_STATUS_CODES
+
+
+def google_sheets_debug() -> dict[str, Any]:
+    return dict(_GOOGLE_DEBUG)
+
+
+def invalidate_data_cache(ws=None) -> None:
+    if ws is None:
+        _GOOGLE_READ_CACHE.clear()
+    else:
+        _GOOGLE_READ_CACHE.pop(_worksheet_cache_key(ws), None)
+    try:
+        load_data_cached.clear()
+    except Exception:
+        pass
+
+
+def _read_records_with_retry(ws, *, max_attempts: int = 3) -> list[dict[str, Any]]:
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        _GOOGLE_DEBUG["read_attempts"] = attempt
+        try:
+            return ws.get_all_records()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_temporary_google_error(exc):
+                raise InventoryError("Δεν ήταν δυνατή η ανάγνωση των κινήσεων από το Google Sheets.") from exc
+            _GOOGLE_DEBUG["last_temporary_error_type"] = f"http_{_google_error_status(exc)}"
+            if attempt >= max_attempts:
+                break
+            time.sleep(0.25 * (2 ** (attempt - 1)))
+    raise InventoryError("Προσωρινό πρόβλημα σύνδεσης με το Google Sheets. Δοκίμασε ξανά σε λίγο.") from last_exc
+
+
+def load_data(ws) -> tuple[pd.DataFrame, list[str]]:
+    # Ordinary reads do not mutate/migrate schema. Schema initialization is explicit.
+    # Avoid an extra Google API call on ordinary reads; worksheet() or initialize_schema() validates live headers.
+    headers = [clean(h) for h in getattr(ws, "headers", COLUMNS.copy())]
+    duplicates = sorted({h for h in headers if h and headers.count(h) > 1})
+    if duplicates:
+        raise SchemaError("Υπάρχουν διπλές επικεφαλίδες στο Google Sheet: " + ", ".join(duplicates))
+    unknown = [header for header in headers if header and header not in COLUMNS and header not in DEPRECATED_COLUMNS]
+    records = _read_records_with_retry(ws)
+    df = records_to_dataframe(records)
+    _GOOGLE_DEBUG.update({"cached": False, "row_count": len(df)})
+    return df.copy(deep=True), list(unknown)
+
+
+def load_data_cached(ws, *, ttl_seconds: int = GOOGLE_READ_CACHE_TTL_SECONDS) -> tuple[pd.DataFrame, list[str]]:
+    key = _worksheet_cache_key(ws)
+    cached = _GOOGLE_READ_CACHE.get(key)
+    now = time.monotonic()
+    if cached and now - cached["timestamp"] <= ttl_seconds:
+        _GOOGLE_DEBUG.update({"cached": True, "read_attempts": 0, "row_count": len(cached["data"])})
+        return cached["data"].copy(deep=True), list(cached["unknown"])
+    data, unknown = load_data(ws)
+    _GOOGLE_READ_CACHE[key] = {"timestamp": now, "data": data.copy(deep=True), "unknown": list(unknown)}
+    return data.copy(deep=True), list(unknown)
 
 
 def append_row(ws, row: dict[str, Any]) -> None:
@@ -492,6 +576,7 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             )
 
     append_row(ws, row)
+    invalidate_data_cache(ws)
     if delta >= 0:
         return "saved"
 
@@ -530,6 +615,7 @@ def append_stock_transaction(ws, row: dict[str, Any]) -> str:
             movement_kind=COMPENSATION,
         )
         append_row(ws, compensation)
+        invalidate_data_cache(ws)
     return "compensated"
 
 
@@ -1764,8 +1850,37 @@ def _extract_first_meta(html_text: str, *, property_name: str = "", itemprop: st
     return ""
 
 
+def _extract_provider_identifiers(detail_html: str) -> list[str]:
+    identifiers: list[str] = []
+
+    def add(value: Any) -> None:
+        text = clean(value)
+        if text and text.isdigit() and text not in identifiers:
+            identifiers.append(text)
+
+    for obj in _jsonld_objects(detail_html):
+        kind = obj.get("@type", "") if isinstance(obj, dict) else ""
+        kinds = {str(k).lower() for k in (kind if isinstance(kind, list) else [kind])}
+        if "product" in kinds:
+            for key in ["gtin", "gtin8", "gtin12", "gtin13", "gtin14", "sku"]:
+                add(obj.get(key, ""))
+    for itemprop in ["barcode", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "sku"]:
+        add(_extract_first_meta(detail_html, itemprop=itemprop))
+    text = _html_text(detail_html)
+    for match in re.finditer(r"(?:barcode|ean|gtin|sku|κωδ(?:ικός)?)\D{0,40}(\d{8,14})", text, flags=re.I):
+        add(match.group(1))
+    return identifiers
+
+
 def extract_provider_detail_product(detail_html: str, detail_url: str, code: str, provider: str) -> dict[str, Any]:
-    product: dict[str, Any] = {"product_page_url": detail_url, "provider": provider, "barcode_found": "", "verified": False, "rejection_reason": ""}
+    product: dict[str, Any] = {
+        "product_page_url": detail_url,
+        "provider": provider,
+        "barcode_found": "",
+        "identifiers_found": [],
+        "verified": False,
+        "rejection_reason": "",
+    }
     product_types = {"Product", "product"}
     for obj in _jsonld_objects(detail_html):
         kind = obj.get("@type", "")
@@ -1774,15 +1889,10 @@ def extract_provider_detail_product(detail_html: str, detail_url: str, code: str
             brand = obj.get("brand", "")
             if isinstance(brand, dict):
                 brand = brand.get("name", "")
-            for key in ["gtin", "gtin8", "gtin12", "gtin13", "gtin14", "sku"]:
-                if clean(obj.get(key, "")) and not product.get("barcode_found"):
-                    product["barcode_found"] = clean(obj.get(key, ""))
-            product.update({"product_name": obj.get("name", ""), "brand": brand, "gtin": product.get("barcode_found", "")})
+            product.update({"product_name": obj.get("name", ""), "brand": brand})
             break
     if not clean(product.get("product_name", "")):
         product["product_name"] = _extract_first_meta(detail_html, itemprop="name")
-    if not product.get("barcode_found"):
-        product["barcode_found"] = _extract_first_meta(detail_html, itemprop="gtin") or _extract_first_meta(detail_html, itemprop="sku")
     if not clean(product.get("product_name", "")) and _is_product_detail_url(detail_url, provider):
         product["product_name"] = _extract_first_meta(detail_html, property_name="og:title")
     if not clean(product.get("product_name", "")):
@@ -1790,10 +1900,6 @@ def extract_provider_detail_product(detail_html: str, detail_url: str, code: str
         if h1:
             product["product_name"] = _html_text(h1.group(1))
     text = _html_text(detail_html)
-    if not product.get("barcode_found"):
-        spec_match = re.search(r"(?:barcode|ean|gtin|sku)\D{0,30}(\d{8,14})", text, flags=re.I)
-        if spec_match:
-            product["barcode_found"] = spec_match.group(1)
     for field, labels in {
         "brand": ["brand", "company", "εταιρεία", "μάρκα"],
         "strength": ["strength", "περιεκτικότητα"],
@@ -1805,21 +1911,20 @@ def extract_provider_detail_product(detail_html: str, detail_url: str, code: str
                 if match:
                     product[field] = match.group(1)
                     break
+    product["identifiers_found"] = _extract_provider_identifiers(detail_html)
+    product["barcode_found"] = product["identifiers_found"][0] if product["identifiers_found"] else ""
     product["product_name"] = strip_provider_title_suffix(product.get("product_name", ""), provider)
     rejected, reason = is_rejected_provider_product_name(product.get("product_name", ""), provider)
     if rejected:
         product["rejection_reason"] = reason
         return product
     requested = clean(code)
-    found = clean(product.get("barcode_found", ""))
-    if found and found != requested:
-        product["rejection_reason"] = "provider_barcode_mismatch"
-        return product
-    if found == requested:
-        product["verified"] = True
-    elif requested and re.search(rf"(?:barcode|ean|gtin|sku|κωδ)\D{{0,60}}{re.escape(requested)}|{re.escape(requested)}\D{{0,60}}(?:barcode|ean|gtin|sku|κωδ)", text, flags=re.I):
+    identifiers = set(product["identifiers_found"])
+    if requested and requested in identifiers:
         product["verified"] = True
         product["barcode_found"] = requested
+    elif identifiers:
+        product["rejection_reason"] = "provider_barcode_mismatch"
     else:
         product["rejection_reason"] = "provider_barcode_unverified"
     return product
@@ -1870,11 +1975,11 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
     debug = {
         "provider": domain,
         "search_url": search_url,
-        "http_status": None,
+        "search_status": None,
         "candidate_detail_urls": [],
         "detail_pages_inspected": [],
         "product_name_extracted": "",
-        "barcode_found": "",
+        "identifiers_found": [],
         "verified": False,
         "rejection_reason": "",
         "selected_result": {},
@@ -1884,7 +1989,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36 ApothikiMobile/1.0"}
     try:
         response = requests.get(search_url, timeout=GREEK_PROVIDER_TIMEOUT_SECONDS, headers=headers, allow_redirects=True)
-        debug["http_status"] = response.status_code
+        debug["search_status"] = response.status_code
         if response.status_code in {403, 404, 429} or response.status_code >= 500:
             debug["error"] = f"http_{response.status_code}"
             return [], debug
@@ -1896,7 +2001,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
         debug["candidate_detail_urls"] = candidates
         results: list[dict[str, Any]] = []
         for detail_url in candidates:
-            inspected = {"url": detail_url, "http_status": None, "product_name_extracted": "", "barcode_found": "", "verified": False, "rejection_reason": ""}
+            inspected = {"url": detail_url, "http_status": None, "product_name_extracted": "", "identifiers_found": [], "verified": False, "rejection_reason": ""}
             try:
                 detail_response = requests.get(detail_url, timeout=GREEK_PROVIDER_TIMEOUT_SECONDS, headers=headers, allow_redirects=True)
                 inspected["http_status"] = detail_response.status_code
@@ -1911,7 +2016,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
                 product = extract_provider_detail_product(detail_response.text, detail_response.url or detail_url, code, domain)
                 inspected.update({
                     "product_name_extracted": product.get("product_name", ""),
-                    "barcode_found": product.get("barcode_found", ""),
+                    "identifiers_found": product.get("identifiers_found", []),
                     "verified": product.get("verified", False),
                     "rejection_reason": product.get("rejection_reason", ""),
                 })
@@ -1942,6 +2047,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
             debug["selected_result"] = selected
             debug["verified"] = bool(selected.get("verified"))
             debug["product_name_extracted"] = selected.get("product_name", "")
+            debug["identifiers_found"] = next((p.get("identifiers_found", []) for p in debug["detail_pages_inspected"] if p.get("verified")), [])
             return ranked, debug
         debug["rejection_reason"] = "no_verified_product_detail"
     except requests.RequestException as exc:
@@ -2005,7 +2111,7 @@ def worksheet():
         worksheet_name = st.secrets.get("WORKSHEET_NAME" , WS_NAME)
         sheet = client.open(sheet_name)
         ws = sheet.worksheet(worksheet_name)
-        validate_and_migrate_headers(ws)
+        initialize_schema(ws)
         return ws
     except (gspread.SpreadsheetNotFound, gspread.WorksheetNotFound):
         st.error(
@@ -2024,6 +2130,14 @@ def main():
     st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη Φαρμακείου")
     st.caption("Μία καθαρή ροή: δεύτερη φωτογραφία → barcode/GTIN + λήξη → επιβεβαίωση → +1 stock.")
+
+
+    ws = worksheet()
+    try:
+        app_data, app_unknown = load_data_cached(ws)
+    except InventoryError as exc:
+        st.error(str(exc))
+        app_data, app_unknown = empty_dataframe(), []
 
     entry_tab, search_tab, reports_tab, sales_tab, data_tab, reversal_tab = st.tabs(
         ["➕ Καταχώρηση", "🔎 Search", "⚠️ Λήξεις / Reports", "📅 Πωλήσεις", "📄 Δεδομένα", "↩️ Αναστροφή"]
@@ -2208,7 +2322,7 @@ def main():
             st.session_state.lookup_expiry_result = detected_expiry
             st.session_state.lookup_ocr_result = {"back": back_result}
 
-        stock_for_lookup = stock_table(load_data(worksheet())[0])
+        stock_for_lookup = stock_table(app_data)
         local_product = lookup_local_database(stock_for_lookup, lookup_code, parsed_gs1) if clean(lookup_code) else None
         st.session_state.local_lookup_debug = "found" if local_product else "not_found" if clean(lookup_code) else "no_code"
         if should_run_online_lookup(lookup_code, local_product):
@@ -2253,9 +2367,12 @@ def main():
                 confirmation = st.radio(
                     "Είναι σωστή η ονομασία του προϊόντος;",
                     ["Ναι, είναι σωστή", "Όχι, θα τη διορθώσω"],
-                    key="lookup_confirmed_product_active_scan",
+                    key="lookup_online_name_confirmation_active_scan",
                 )
-                if confirmation != "Ναι, είναι σωστή":
+                if confirmation == "Ναι, είναι σωστή":
+                    st.session_state["lookup_product_active_scan"] = suggested_product
+                else:
+                    st.session_state["lookup_product_active_scan"] = ""
                     suggested_product = ""
             for field_key, suggested_value in [("lookup_product_active_scan", suggested_product), ("lookup_brand_active_scan", suggested_brand), ("lookup_strength_active_scan", suggested_strength), ("lookup_dosage_form_active_scan", suggested_dosage_form)]:
                 if field_key not in st.session_state and clean(suggested_value):
@@ -2301,6 +2418,8 @@ def main():
                 "pharmacy295_result": pharmacy295_result,
                 "selected_online_product": online_suggestion,
                 "provider_rejection_reason": [item.get("rejection_reason", "") for item in attempted if item.get("rejection_reason")],
+                "Google Sheets": google_sheets_debug(),
+                "Online provider": attempted,
                 "expiry_ocr_candidate": back_ocr_debug.get("selected_candidate", detected_expiry),
                 "current_expiry_form_value": expiry_date,
             })
@@ -2363,7 +2482,7 @@ def main():
                     front_photo_url=st.session_state.get("front_photo_data_url", ""),
                     back_photo_url="",
                 )
-                status = append_stock_transaction(worksheet(), row)
+                status = append_stock_transaction(ws, row)
                 if status == "duplicate":
                     st.info("Η ίδια υποβολή έχει ήδη καταχωρηθεί.")
                 else:
@@ -2390,7 +2509,7 @@ def main():
         if current_query != st.session_state.get("lookup_last_search_value", ""):
             reset_lookup_state(preserve={"lookup_last_search_value": current_query, "lookup_query": current_query})
         try:
-            data, unknown = load_data(worksheet())
+            data, unknown = app_data.copy(deep=True), app_unknown
         except Exception as exc:
             st.error(f"Google Sheets error: {type(exc).__name__}: {exc}")
             data = empty_dataframe()
@@ -2457,7 +2576,7 @@ def main():
         st.dataframe(results, use_container_width=True)
 
     with reports_tab:
-        data, unknown = load_data(worksheet())
+        data, unknown = app_data.copy(deep=True), app_unknown
         if unknown:
             st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
         stock = stock_table(data)
@@ -2479,7 +2598,7 @@ def main():
             st.dataframe(selected, use_container_width=True)
 
     with sales_tab:
-        data, _ = load_data(worksheet())
+        data, _ = app_data.copy(deep=True), app_unknown
         data = active_movements(data)
         data["Timestamp_dt"] = pd.to_datetime(data["Timestamp"], errors="coerce")
         start_col, end_col = st.columns(2)
@@ -2501,13 +2620,13 @@ def main():
             st.dataframe(report, use_container_width=True)
 
     with data_tab:
-        data, unknown = load_data(worksheet())
+        data, unknown = app_data.copy(deep=True), app_unknown
         if unknown:
             st.warning("Άγνωστες στήλες στο Sheet: " + ", ".join(unknown))
         st.dataframe(data, use_container_width=True)
 
     with reversal_tab:
-        data, _ = load_data(worksheet())
+        data, _ = app_data.copy(deep=True), app_unknown
         candidates = reversible_rows(data)
         if candidates.empty:
             st.info("Δεν υπάρχουν διαθέσιμες κινήσεις για αναστροφή.")
@@ -2529,7 +2648,7 @@ def main():
                 else:
                     try:
                         original = candidates[candidates["TransactionId"].eq(selected_id)].iloc[0]
-                        status = append_reversal(worksheet(), original, reason)
+                        status = append_reversal(ws, original, reason)
                         if status == "duplicate":
                             st.info("Η κίνηση έχει ήδη αναστραφεί.")
                         elif status == "compensated":

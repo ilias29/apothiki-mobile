@@ -9,6 +9,7 @@ class FakeWorksheet:
         self.headers = list(headers or [])
         self.records = list(records or [])
         self.appended = []
+        self.read_count = 0
 
     def row_values(self, row):
         return list(self.headers)
@@ -18,6 +19,7 @@ class FakeWorksheet:
         self.headers = list(values[0])
 
     def get_all_records(self):
+        self.read_count += 1
         return list(self.records)
 
     def delete_columns(self, start, end):
@@ -30,6 +32,24 @@ class FakeWorksheet:
         row = dict(zip(self.headers, values))
         self.records.append(row)
         self.appended.append(row)
+
+
+class TemporaryGoogleError(Exception):
+    def __init__(self, status):
+        self.response = type("Response", (), {"status_code": status})()
+        super().__init__(f"HTTP {status}")
+
+
+class FlakyWorksheet(FakeWorksheet):
+    def __init__(self, statuses, **kwargs):
+        super().__init__(**kwargs)
+        self.statuses = list(statuses)
+
+    def get_all_records(self):
+        self.read_count += 1
+        if self.statuses:
+            raise TemporaryGoogleError(self.statuses.pop(0))
+        return list(self.records)
 
 
 def base_row(**overrides):
@@ -50,6 +70,71 @@ def base_row(**overrides):
     )
     row.update(overrides)
     return row
+
+
+def test_one_normal_ui_data_load_is_reused_in_cache():
+    app.invalidate_data_cache()
+    ws = FakeWorksheet(headers=app.COLUMNS, records=[base_row()])
+    first, _ = app.load_data_cached(ws)
+    second, _ = app.load_data_cached(ws)
+    first.loc[:, "Προϊόν"] = "MUTATED"
+    third, _ = app.load_data_cached(ws)
+    assert ws.read_count == 1
+    assert second.iloc[0]["Προϊόν"] == "PRODUCT"
+    assert third.iloc[0]["Προϊόν"] == "PRODUCT"
+
+
+def test_temporary_429_is_retried_and_then_succeeds(monkeypatch):
+    monkeypatch.setattr(app.time, "sleep", lambda *_: None)
+    ws = FlakyWorksheet([429], headers=app.COLUMNS, records=[base_row()])
+    data, _ = app.load_data(ws)
+    assert len(data) == 1
+    assert ws.read_count == 2
+    assert app.google_sheets_debug()["last_temporary_error_type"] == "http_429"
+
+
+def test_temporary_503_is_retried_and_then_succeeds(monkeypatch):
+    monkeypatch.setattr(app.time, "sleep", lambda *_: None)
+    ws = FlakyWorksheet([503], headers=app.COLUMNS, records=[base_row()])
+    data, _ = app.load_data(ws)
+    assert len(data) == 1
+    assert ws.read_count == 2
+    assert app.google_sheets_debug()["last_temporary_error_type"] == "http_503"
+
+
+def test_permanent_schema_error_is_not_retried():
+    ws = FakeWorksheet(headers=["TransactionId", "TransactionId"], records=[base_row()])
+    with pytest.raises(app.SchemaError):
+        app.load_data(ws)
+    assert ws.read_count == 0
+
+
+def test_read_failure_returns_friendly_inventory_error_not_raw_traceback():
+    ws = FlakyWorksheet([429, 429, 429], headers=app.COLUMNS, records=[])
+    with pytest.raises(app.InventoryError) as exc:
+        app.load_data(ws)
+    assert "Google Sheets" in str(exc.value)
+    assert "Traceback" not in str(exc.value)
+    assert ws.read_count == 3
+
+
+def test_successful_write_invalidates_cached_read_data():
+    app.invalidate_data_cache()
+    ws = FakeWorksheet(headers=app.COLUMNS, records=[])
+    cached, _ = app.load_data_cached(ws)
+    assert cached.empty
+    row = base_row(TransactionId="new-tx")
+    assert app.append_stock_transaction(ws, row) == "saved"
+    refreshed, _ = app.load_data_cached(ws)
+    assert ws.read_count >= 3
+    assert len(refreshed) == 1
+
+
+def test_duplicate_transaction_remains_blocked():
+    ws = FakeWorksheet(headers=app.COLUMNS, records=[base_row(TransactionId="same-tx")])
+    row = base_row(TransactionId="same-tx")
+    assert app.append_stock_transaction(ws, row) == "duplicate"
+    assert ws.appended == []
 
 
 def test_empty_sheet_initializes_headers():
