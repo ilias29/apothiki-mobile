@@ -1545,6 +1545,18 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
     ]
 
 
+ONLINE_LOOKUP_PREFILL_FIELDS = {"product_name", "brand", "brand_or_company", "strength", "dosage_form", "barcode", "gtin"}
+
+
+def online_prefill_fields(product: dict[str, Any]) -> dict[str, Any]:
+    """Keep online lookup data limited to text fields that may prefill the form.
+
+    Provider images, Open Graph images, logos, and other product metadata are intentionally
+    discarded. The user's optional first/front photo remains the only product reference image.
+    """
+    return {key: product.get(key, "") for key in ONLINE_LOOKUP_PREFILL_FIELDS if key in product}
+
+
 def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     debug = {"provider": domain, "error": "", "count": 0}
     try:
@@ -1561,8 +1573,8 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
         if not clean(product.get("product_name", "")):
             debug["count"] = 0
             return [], debug
-        product.update({"provider": domain, "barcode": clean(code) if len(clean(code)) in {8, 13} else product.get("barcode", ""), "gtin": clean(code) if len(clean(code)) in {8, 13, 14} else ""})
-        normalized = normalize_product_fields(product) | {"provider": domain, "local": False}
+        product.update({"barcode": clean(code) if len(clean(code)) in {8, 13} else product.get("barcode", ""), "gtin": clean(code) if len(clean(code)) in {8, 13, 14} else ""})
+        normalized = normalize_product_fields(online_prefill_fields(product)) | {"provider": domain, "local": False}
         debug["count"] = 1
         return [normalized], debug
     except requests.RequestException as exc:
@@ -1585,16 +1597,14 @@ def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[di
 
 
 def merge_lookup_results(results: list[dict[str, Any] | None]) -> dict[str, Any]:
-    merged = {"product_name": "", "brand": "", "category": "", "strength": "", "dosage_form": "", "barcode": "", "gtin": "", "image_url": "", "provider": ""}
+    merged = {"product_name": "", "brand": "", "strength": "", "dosage_form": "", "barcode": "", "gtin": "", "provider": ""}
     providers = []
     for result in [r for r in results if r]:
         providers.append(result.get("provider", ""))
         normalized = normalize_product_fields(result)
-        for key in ["product_name", "brand", "category", "strength", "dosage_form", "barcode", "gtin"]:
+        for key in ["product_name", "brand", "strength", "dosage_form", "barcode", "gtin"]:
             if not clean(merged[key]) and clean(normalized.get(key, "")):
                 merged[key] = normalized[key]
-        if not clean(merged["image_url"]):
-            merged["image_url"] = clean(result.get("image_url", result.get("image", "")))
     merged["provider"] = ", ".join([provider for provider in providers if provider])
     return merged
 

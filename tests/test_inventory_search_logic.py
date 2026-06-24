@@ -263,7 +263,34 @@ def test_merge_lookup_results_keeps_first_values_and_providers_normalized():
     assert merged["product_name"] == "CREAM"
     assert merged["brand"] == "BRAND"
     assert "package_size" not in merged
+    assert "category" not in merged
+    assert "image_url" not in merged
     assert merged["provider"] == "skroutz.gr, eof.gr"
+
+
+def test_online_lookup_sanitizer_drops_provider_images_and_extra_fields():
+    sanitized = app.online_prefill_fields({
+        "product_name": "Cream",
+        "brand_or_company": "BrandCo",
+        "strength": "20 mg",
+        "dosage_form": "cream",
+        "barcode": "5201234567890",
+        "gtin": "05201234567890",
+        "image_url": "https://provider.example/product.jpg",
+        "image": "https://provider.example/image.jpg",
+        "og:image": "https://provider.example/og.jpg",
+        "logo": "https://provider.example/logo.png",
+        "provider": "discountpharmacy.gr",
+        "category": "Cosmetics",
+    })
+    assert sanitized == {
+        "product_name": "Cream",
+        "brand_or_company": "BrandCo",
+        "strength": "20 mg",
+        "dosage_form": "cream",
+        "barcode": "5201234567890",
+        "gtin": "05201234567890",
+    }
 
 
 def test_barcode_candidate_prefers_valid_ean13_and_preserves_digits():
