@@ -1,12 +1,17 @@
-from datetime import datetime
+import base64
+import calendar
+import io
+from datetime import date, datetime
 import uuid
 
 import streamlit as st
 import pandas as pd
+from PIL import Image
 
 import app_inventory_search as core
 
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
+MAX_PHOTO_CELL_CHARS = 45000
 
 
 def clean(x):
@@ -47,7 +52,41 @@ def product_defaults(rows):
     }
 
 
-def make_row(code, product, brand, category, strength, form, expiry, lot, location_id, qty, note):
+def parse_expiry(value):
+    text = clean(value)
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+    match = __import__("re").fullmatch(r"(\d{1,2})[./-](\d{4})", text)
+    if match:
+        month, year = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            last_day = calendar.monthrange(year, month)[1]
+            return date(year, month, last_day).isoformat()
+    raise core.InventoryError("Η λήξη πρέπει να είναι YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY.")
+
+
+def encode_front_photo(uploaded_file):
+    if not uploaded_file:
+        return "", ""
+    image = Image.open(uploaded_file).convert("RGB")
+    image.thumbnail((640, 640))
+    for quality in (75, 65, 55, 45):
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+        data_url = f"data:image/jpeg;base64,{payload}"
+        if len(data_url) <= MAX_PHOTO_CELL_CHARS:
+            note = f"front_photo_saved=true; front_photo_chars={len(data_url)}; front_photo_quality={quality}"
+            return data_url, note
+    raise core.InventoryError("Η μπροστινή φωτογραφία είναι πολύ μεγάλη για το Google Sheet. Βάλε πιο κοντινή/κομμένη φωτογραφία.")
+
+
+def make_row(code, product, brand, category, strength, form, expiry, lot, location_id, qty, note, front_photo_url):
     code_type = "GTIN" if len(code) == 14 else "Barcode"
     barcode = "" if code_type == "GTIN" else code
     gtin = code if code_type == "GTIN" else ""
@@ -60,7 +99,7 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
         "Μάρκα": up(brand), "Προϊόν": up(product), "Κατηγορία": clean(category),
         "LocationId": location_id, "Τοποθεσία": core.LOCATIONS.get(location_id, ""),
         "Κίνηση": "Παραλαβή (+)", "Ποσότητα": int(qty), "DeltaQty": int(qty),
-        "FrontPhotoUrl": "", "BackPhotoUrl": "", "Σημείωση": clean(note),
+        "FrontPhotoUrl": front_photo_url, "BackPhotoUrl": "", "Σημείωση": clean(note),
         "Voided": "", "VoidOf": "", "MovementKind": core.NORMAL,
     }
 
@@ -68,7 +107,7 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
 def main():
     st.set_page_config(page_title="Αποθήκη Stable", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη Stable Mode")
-    st.caption("Χωρίς φωτογραφίες, OCR ή online lookup. Βαρετό, άρα επιτέλους πιθανό να δουλεύει.")
+    st.caption("Χωρίς OCR ή online lookup. Η μπροστινή φωτογραφία είναι μόνο reference.")
     data = load_data()
     code = st.text_input("Barcode / GTIN")
     rows = stock_by_code(data, code)
@@ -79,6 +118,11 @@ def main():
         st.dataframe(rows[["Προϊόν", "Μάρκα", "ExpiryDate", "LotNumber", "Τοποθεσία", "DeltaQty"]], hide_index=True, use_container_width=True)
     elif clean(code):
         st.info("Δεν υπάρχει τοπικά. Συμπλήρωσε χειροκίνητα.")
+
+    front_photo = st.file_uploader("Μπροστινή φωτογραφία προϊόντος (προαιρετική, μόνο reference)", type=["jpg", "jpeg", "png"])
+    if front_photo:
+        st.image(front_photo, caption="Μπροστινή φωτογραφία reference", width=260)
+
     options = CATEGORIES if defaults["category"] in CATEGORIES else [defaults["category"], *CATEGORIES]
     with st.form("save"):
         product = st.text_input("Product name", value=defaults["product"])
@@ -86,7 +130,8 @@ def main():
         category = st.selectbox("Κατηγορία", options)
         strength = st.text_input("Strength", value=defaults["strength"])
         form = st.text_input("Dosage form", value=defaults["form"])
-        expiry = st.text_input("Expiry date ή άστο κενό αν δεν έχει")
+        expiry = st.text_input("Ημερομηνία λήξης", help="YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY")
+        no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης")
         lot = st.text_input("Lot number")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in core.LOCATIONS.items()])
         qty = st.number_input("Quantity to add", min_value=1, value=1, step=1)
@@ -94,21 +139,27 @@ def main():
         confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία")
         submitted = st.form_submit_button("✅ Αποθήκευση + stock")
     if submitted:
-        if not clean(code).isdigit():
-            st.error("Χρειάζεται αριθμητικό Barcode ή GTIN.")
-            return
-        if not clean(product):
-            st.error("Βάλε όνομα προϊόντος.")
-            return
-        if not confirm:
-            st.error("Επιβεβαίωσε τα στοιχεία.")
-            return
-        location_id = int(location_label.split("-", 1)[0].strip())
-        row = make_row(clean(code), product, brand, category, strength, form, expiry, lot, location_id, qty, note)
-        core.append_stock_transaction(core.worksheet(), row)
-        core.invalidate_data_cache()
-        st.success("Αποθηκεύτηκε.")
-        st.rerun()
+        try:
+            raw_code = clean(code)
+            if not raw_code.isdigit():
+                raise core.InventoryError("Χρειάζεται αριθμητικό Barcode ή GTIN.")
+            if not clean(product):
+                raise core.InventoryError("Βάλε όνομα προϊόντος.")
+            if not confirm:
+                raise core.InventoryError("Επιβεβαίωσε τα στοιχεία.")
+            expiry_value = parse_expiry(expiry) if clean(expiry) else ""
+            if not expiry_value and not no_expiry:
+                raise core.InventoryError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι δεν έχει λήξη.")
+            front_photo_url, photo_note = encode_front_photo(front_photo)
+            location_id = int(location_label.split("-", 1)[0].strip())
+            note_parts = [clean(note), f"expiry_date={expiry_value}" if expiry_value else "no_expiry=true", photo_note]
+            row = make_row(raw_code, product, brand, category, strength, form, expiry_value, lot, location_id, qty, " | ".join([p for p in note_parts if p]), front_photo_url)
+            core.append_stock_transaction(core.worksheet(), row)
+            core.invalidate_data_cache()
+            st.success("Αποθηκεύτηκε.")
+            st.rerun()
+        except core.InventoryError as exc:
+            st.error(str(exc))
 
 
 if __name__ == "__main__":
