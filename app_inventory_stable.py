@@ -105,11 +105,11 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
 
 
 def main():
-    st.set_page_config(page_title="Αποθήκη Stable", page_icon="📦", layout="wide")
-    st.title("📦 Αποθήκη Stable Mode")
-    st.caption("Χωρίς OCR ή online lookup. Η μπροστινή φωτογραφία είναι μόνο reference.")
+    st.set_page_config(page_title="Αποθήκη - Απλή Καταχώρηση", page_icon="📦", layout="wide")
+    st.title("📦 Αποθήκη - Απλή Καταχώρηση")
+    st.caption("Χωρίς OCR ή online lookup. Η μπροστινή φωτογραφία είναι μόνο για αναφορά.")
     data = load_data()
-    code = st.text_input("Barcode / GTIN")
+    code = st.text_input("Barcode / GTIN (κωδικός προϊόντος)")
     rows = stock_by_code(data, code)
     defaults = product_defaults(rows)
     if clean(code) and not rows.empty:
@@ -119,22 +119,22 @@ def main():
     elif clean(code):
         st.info("Δεν υπάρχει τοπικά. Συμπλήρωσε χειροκίνητα.")
 
-    front_photo = st.file_uploader("Μπροστινή φωτογραφία προϊόντος (προαιρετική, μόνο reference)", type=["jpg", "jpeg", "png"])
+    front_photo = st.file_uploader("Μπροστινή φωτογραφία προϊόντος (προαιρετική, μόνο για αναφορά)", type=["jpg", "jpeg", "png"])
     if front_photo:
-        st.image(front_photo, caption="Μπροστινή φωτογραφία reference", width=260)
+        st.image(front_photo, caption="Μπροστινή φωτογραφία", width=260)
 
     options = CATEGORIES if defaults["category"] in CATEGORIES else [defaults["category"], *CATEGORIES]
     with st.form("save"):
-        product = st.text_input("Product name", value=defaults["product"])
-        brand = st.text_input("Brand", value=defaults["brand"])
+        product = st.text_input("Όνομα προϊόντος", value=defaults["product"])
+        brand = st.text_input("Μάρκα / Εταιρεία", value=defaults["brand"])
         category = st.selectbox("Κατηγορία", options)
-        strength = st.text_input("Strength", value=defaults["strength"])
-        form = st.text_input("Dosage form", value=defaults["form"])
+        strength = st.text_input("Περιεκτικότητα (π.χ. 1000mg, 2000 IU, SPF50)", value=defaults["strength"])
+        form = st.text_input("Μορφή προϊόντος (π.χ. κάψουλες, ταμπλέτες, κρέμα, σπρέι)", value=defaults["form"])
         expiry = st.text_input("Ημερομηνία λήξης", help="YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY")
         no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης")
-        lot = st.text_input("Lot number")
+        lot = st.text_input("Lot / Παρτίδα")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in core.LOCATIONS.items()])
-        qty = st.number_input("Quantity to add", min_value=1, value=1, step=1)
+        qty = st.number_input("Ποσότητα προσθήκης", min_value=1, value=1, step=1)
         note = st.text_input("Σημείωση")
         confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία")
         submitted = st.form_submit_button("✅ Αποθήκευση + stock")
