@@ -11,6 +11,8 @@ from PIL import Image
 import app_inventory_search as core
 
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
+LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
+TRUE_VALUES = {"true", "1", "yes", "y", "ναι", "nai"}
 MAX_PHOTO_CELL_CHARS = 45000
 
 
@@ -97,18 +99,55 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
         "SerialNumber": "", "LotNumber": up(lot), "ExpiryDate": clean(expiry),
         "QRRawData": "", "DataMatrixRawData": "", "Strength": up(strength), "DosageForm": up(form),
         "Μάρκα": up(brand), "Προϊόν": up(product), "Κατηγορία": clean(category),
-        "LocationId": location_id, "Τοποθεσία": core.LOCATIONS.get(location_id, ""),
+        "LocationId": location_id, "Τοποθεσία": LOCATIONS.get(location_id, core.LOCATIONS.get(location_id, "")),
         "Κίνηση": "Παραλαβή (+)", "Ποσότητα": int(qty), "DeltaQty": int(qty),
         "FrontPhotoUrl": front_photo_url, "BackPhotoUrl": qr_photo_url, "Σημείωση": clean(note),
         "Voided": "", "VoidOf": "", "MovementKind": core.NORMAL,
     }
 
 
-def main():
-    st.set_page_config(page_title="Αποθήκη - Απλή Καταχώρηση", page_icon="📦", layout="wide")
-    st.title("📦 Αποθήκη - Απλή Καταχώρηση")
-    st.caption("Χωρίς OCR ή online lookup. Οι φωτογραφίες είναι μόνο για αναφορά.")
-    data = load_data()
+def stock_table(data):
+    display_cols = [
+        "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm",
+        "ExpiryDate", "LotNumber", "LocationId", "Τοποθεσία", "Stock"
+    ]
+    if data.empty:
+        return pd.DataFrame(columns=display_cols)
+    df = data.copy(deep=True)
+    for col in core.COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    voided = df["Voided"].astype(str).str.lower().isin(TRUE_VALUES)
+    df = df[~voided].copy()
+    df["DeltaQty"] = pd.to_numeric(df["DeltaQty"], errors="coerce").fillna(0).astype(int)
+    df["LocationId"] = pd.to_numeric(df["LocationId"], errors="coerce").fillna(-1).astype(int)
+    for col in ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία"]:
+        df[col] = df[col].fillna("").astype(str)
+    df["Τοποθεσία"] = df.apply(
+        lambda r: LOCATIONS.get(int(r["LocationId"]), clean(r["Τοποθεσία"]) or "Άγνωστη"),
+        axis=1,
+    )
+    group_cols = ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "LocationId", "Τοποθεσία"]
+    stock = df.groupby(group_cols, dropna=False, as_index=False)["DeltaQty"].sum().rename(columns={"DeltaQty": "Stock"})
+    stock = stock[stock["Stock"] != 0].copy()
+    return stock.sort_values(["LocationId", "Προϊόν", "ExpiryDate", "LotNumber"])
+
+
+def filter_stock(stock, query, location_choice):
+    result = stock.copy(deep=True)
+    if location_choice != "Όλες":
+        location_id = int(location_choice.split("-", 1)[0].strip())
+        result = result[result["LocationId"] == location_id]
+    q = clean(query).lower()
+    if q:
+        mask = pd.Series(False, index=result.index)
+        for col in ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία"]:
+            mask |= result[col].astype(str).str.lower().str.contains(q, regex=False, na=False)
+        result = result[mask]
+    return result
+
+
+def entry_tab(data):
     code = st.text_input("Barcode / GTIN (κωδικός προϊόντος)")
     rows = stock_by_code(data, code)
     defaults = product_defaults(rows)
@@ -147,7 +186,7 @@ def main():
         expiry = st.text_input("Ημερομηνία λήξης", help="YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY")
         no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης")
         lot = st.text_input("Lot / Παρτίδα")
-        location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in core.LOCATIONS.items()])
+        location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()], index=2)
         qty = st.number_input("Ποσότητα προσθήκης", min_value=1, value=1, step=1)
         note = st.text_input("Σημείωση")
         confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία")
@@ -174,19 +213,8 @@ def main():
                 qr_photo_note,
             ]
             row = make_row(
-                raw_code,
-                product,
-                brand,
-                category,
-                strength,
-                form,
-                expiry_value,
-                lot,
-                location_id,
-                qty,
-                " | ".join([p for p in note_parts if p]),
-                front_photo_url,
-                qr_photo_url,
+                raw_code, product, brand, category, strength, form, expiry_value, lot, location_id, qty,
+                " | ".join([p for p in note_parts if p]), front_photo_url, qr_photo_url,
             )
             core.append_stock_transaction(core.worksheet(), row)
             core.invalidate_data_cache()
@@ -194,6 +222,63 @@ def main():
             st.rerun()
         except core.InventoryError as exc:
             st.error(str(exc))
+
+
+def stock_tab(data):
+    stock = stock_table(data)
+    st.subheader("📦 Stock ανά τοποθεσία")
+    st.caption("Για το stock πάνω, άσε επιλεγμένο το Πάνω / Επίπεδο 1. Μηδενική μαγεία, άρα επιτέλους χρήσιμο.")
+    choices = ["2 - Πάνω / Επίπεδο 1", "Όλες", "0 - Αποθήκη", "1 - Κάτω / Κύριο Κτήριο"]
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        location_choice = st.selectbox("Τοποθεσία", choices)
+    with c2:
+        query = st.text_input("Αναζήτηση", placeholder="π.χ. επίπεδο 1, moducare, 520..., κάψουλες, παρτίδα")
+    filtered = filter_stock(stock, query, location_choice)
+    m1, m2 = st.columns(2)
+    m1.metric("Batches", len(filtered))
+    m2.metric("Σύνολο τεμαχίων", int(filtered["Stock"].sum()) if not filtered.empty else 0)
+    if filtered.empty:
+        st.info("Δεν βρέθηκε stock με αυτά τα φίλτρα.")
+        return
+    st.dataframe(
+        filtered[["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def expiry_tab(data):
+    stock = stock_table(data)
+    if stock.empty:
+        st.info("Δεν υπάρχει stock.")
+        return
+    today = date.today()
+    frame = stock.copy(deep=True)
+    frame["DaysToExpiry"] = pd.to_datetime(frame["ExpiryDate"], errors="coerce").dt.date.map(
+        lambda exp: (exp - today).days if pd.notna(exp) else None
+    )
+    expiring = frame[frame["DaysToExpiry"].notna() & (frame["DaysToExpiry"] <= 90)].sort_values("DaysToExpiry")
+    no_expiry = frame[frame["ExpiryDate"].astype(str).str.strip().eq("")]
+    st.subheader("⚠️ Λήξεις")
+    with st.expander(f"Ληγμένα / λήγουν σε 90 ημέρες ({len(expiring)})", expanded=True):
+        st.dataframe(expiring[["Προϊόν", "Μάρκα", "ExpiryDate", "DaysToExpiry", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
+    with st.expander(f"Χωρίς λήξη ({len(no_expiry)})", expanded=False):
+        st.dataframe(no_expiry[["Προϊόν", "Μάρκα", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
+
+
+def main():
+    st.set_page_config(page_title="Αποθήκη - Απλή Καταχώρηση", page_icon="📦", layout="wide")
+    st.title("📦 Αποθήκη - Απλή Καταχώρηση")
+    st.caption("Καταχώρηση + stock ανά τοποθεσία. Οι φωτογραφίες είναι μόνο για αναφορά.")
+    data = load_data()
+    tab_entry, tab_stock, tab_expiry = st.tabs(["➕ Καταχώρηση", "📦 Stock / Πάνω", "⚠️ Λήξεις"])
+    with tab_entry:
+        entry_tab(data)
+    with tab_stock:
+        stock_tab(data)
+    with tab_expiry:
+        expiry_tab(data)
 
 
 if __name__ == "__main__":
