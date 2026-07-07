@@ -200,6 +200,9 @@ def filter_stock(stock, query, location_choice, initial_choice):
 
 def entry_tab(data):
     code = st.text_input("Barcode / GTIN (κωδικός προϊόντος)", key="stable_code")
+    effective_code = clean(code)
+    scan_result = {"code": "", "raw": "", "type": "", "gtin": "", "debug": {}}
+
     rows = stock_by_code(data, code)
     defaults = product_defaults(rows)
     if clean(code) and not rows.empty:
@@ -224,19 +227,21 @@ def entry_tab(data):
             type=["jpg", "jpeg", "png"],
             key="qr_photo_uploader",
         )
-        scan_result = scan_code_from_photo(qr_photo) if qr_photo else {"code": "", "raw": "", "type": "", "gtin": "", "debug": {}}
+        scan_result = scan_code_from_photo(qr_photo) if qr_photo else scan_result
         if qr_photo:
             st.image(qr_photo, caption="Φωτογραφία QR / barcode", width=260)
             if scan_result.get("code"):
-                st.success(f"Διαβάστηκε κωδικός: {scan_result['code']} ({scan_result.get('type') or 'code'})")
-                current_code = clean(st.session_state.get("stable_code", ""))
+                scanned_code = clean(scan_result["code"])
+                st.success(f"Διαβάστηκε κωδικός: {scanned_code} ({scan_result.get('type') or 'code'})")
+                current_code = clean(code)
                 if not current_code:
-                    st.session_state["stable_code"] = scan_result["code"]
-                    st.rerun()
-                elif current_code != scan_result["code"]:
-                    if st.button("Χρήση κωδικού από τη φωτογραφία"):
-                        st.session_state["stable_code"] = scan_result["code"]
-                        st.rerun()
+                    effective_code = scanned_code
+                    st.info(f"Θα χρησιμοποιηθεί αυτόματα στην αποθήκευση: {scanned_code}")
+                elif current_code != scanned_code:
+                    use_photo_code = st.checkbox("Χρήση κωδικού από τη φωτογραφία αντί για τον γραμμένο", key="use_photo_code")
+                    if use_photo_code:
+                        effective_code = scanned_code
+                        st.info(f"Θα αποθηκευτεί με κωδικό φωτογραφίας: {scanned_code}")
             else:
                 error = clean(scan_result.get("debug", {}).get("error", ""))
                 st.warning(error or "Δεν διαβάστηκε καθαρός QR / barcode από τη φωτογραφία. Δοκίμασε πιο κοντινή και καθαρή λήψη.")
@@ -258,7 +263,7 @@ def entry_tab(data):
         submitted = st.form_submit_button("✅ Αποθήκευση + stock")
     if submitted:
         try:
-            raw_code = clean(st.session_state.get("stable_code", code))
+            raw_code = clean(effective_code)
             if not raw_code.isdigit():
                 raise core.InventoryError("Χρειάζεται αριθμητικό Barcode ή GTIN.")
             if not clean(product):
