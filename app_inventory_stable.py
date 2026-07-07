@@ -76,7 +76,8 @@ def parse_expiry(value):
 def encode_uploaded_photo(uploaded_file, photo_kind):
     if not uploaded_file:
         return "", ""
-    image = Image.open(uploaded_file).convert("RGB")
+    data = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    image = Image.open(io.BytesIO(data)).convert("RGB")
     image.thumbnail((640, 640))
     for quality in (75, 65, 55, 45):
         buffer = io.BytesIO()
@@ -89,6 +90,30 @@ def encode_uploaded_photo(uploaded_file, photo_kind):
     raise core.InventoryError(f"Η φωτογραφία {photo_kind} είναι πολύ μεγάλη για το Google Sheet. Βάλε πιο κοντινή/κομμένη φωτογραφία.")
 
 
+def scan_code_from_photo(uploaded_file):
+    if not uploaded_file:
+        return {"code": "", "raw": "", "type": "", "gtin": "", "debug": {}}
+    try:
+        image = core.to_img(uploaded_file)
+        if image is None:
+            raise core.InventoryError("Δεν μπόρεσα να διαβάσω τη φωτογραφία QR / barcode.")
+        detected_type, raw_value, debug = core.detect_code(back=image)
+    except Exception as exc:
+        return {"code": "", "raw": "", "type": "", "gtin": "", "debug": {"error": str(exc)}}
+
+    selected = debug.get("selected", {}) if isinstance(debug, dict) else {}
+    gtin = clean(selected.get("gtin", ""))
+    raw = clean(raw_value)
+    numeric_code = gtin or (raw if raw.isdigit() else "")
+    return {
+        "code": numeric_code,
+        "raw": raw,
+        "type": clean(detected_type or selected.get("type", "")),
+        "gtin": gtin,
+        "debug": debug or {},
+    }
+
+
 def product_initial(value):
     text = up(value)
     for ch in text:
@@ -99,16 +124,20 @@ def product_initial(value):
     return ""
 
 
-def make_row(code, product, brand, category, strength, form, expiry, lot, location_id, qty, note, front_photo_url, qr_photo_url):
+def make_row(code, product, brand, category, strength, form, expiry, lot, location_id, qty, note, front_photo_url, qr_photo_url, scan_type="", scan_raw=""):
     code_type = "GTIN" if len(code) == 14 else "Barcode"
     barcode = "" if code_type == "GTIN" else code
     gtin = code if code_type == "GTIN" else ""
+    raw_type = clean(scan_type)
+    raw_value = clean(scan_raw)
     now = datetime.now().isoformat(timespec="seconds")
     return {
         "TransactionId": str(uuid.uuid4()), "Timestamp": now, "Ημερομηνία": now,
         "CodeType": code_type, "CodeValue": code, "Barcode": barcode, "PCCode": "", "GTIN": gtin,
         "SerialNumber": "", "LotNumber": up(lot), "ExpiryDate": clean(expiry),
-        "QRRawData": "", "DataMatrixRawData": "", "Strength": up(strength), "DosageForm": up(form),
+        "QRRawData": raw_value if raw_type == "QR" else "",
+        "DataMatrixRawData": raw_value if raw_type == "DataMatrix" else "",
+        "Strength": up(strength), "DosageForm": up(form),
         "Μάρκα": up(brand), "Προϊόν": up(product), "Κατηγορία": clean(category),
         "LocationId": location_id, "Τοποθεσία": LOCATIONS.get(location_id, core.LOCATIONS.get(location_id, "")),
         "Κίνηση": "Παραλαβή (+)", "Ποσότητα": int(qty), "DeltaQty": int(qty),
@@ -170,7 +199,7 @@ def filter_stock(stock, query, location_choice, initial_choice):
 
 
 def entry_tab(data):
-    code = st.text_input("Barcode / GTIN (κωδικός προϊόντος)")
+    code = st.text_input("Barcode / GTIN (κωδικός προϊόντος)", key="stable_code")
     rows = stock_by_code(data, code)
     defaults = product_defaults(rows)
     if clean(code) and not rows.empty:
@@ -191,12 +220,26 @@ def entry_tab(data):
             st.image(front_photo, caption="Μπροστινή φωτογραφία", width=260)
     with col2:
         qr_photo = st.file_uploader(
-            "Φωτογραφία QR / κωδικού φαρμάκου (προαιρετική, μόνο για αναφορά)",
+            "Φωτογραφία QR / barcode φαρμάκου (προαιρετική ανάγνωση κωδικού)",
             type=["jpg", "jpeg", "png"],
             key="qr_photo_uploader",
         )
+        scan_result = scan_code_from_photo(qr_photo) if qr_photo else {"code": "", "raw": "", "type": "", "gtin": "", "debug": {}}
         if qr_photo:
-            st.image(qr_photo, caption="Φωτογραφία QR / κωδικού", width=260)
+            st.image(qr_photo, caption="Φωτογραφία QR / barcode", width=260)
+            if scan_result.get("code"):
+                st.success(f"Διαβάστηκε κωδικός: {scan_result['code']} ({scan_result.get('type') or 'code'})")
+                current_code = clean(st.session_state.get("stable_code", ""))
+                if not current_code:
+                    st.session_state["stable_code"] = scan_result["code"]
+                    st.rerun()
+                elif current_code != scan_result["code"]:
+                    if st.button("Χρήση κωδικού από τη φωτογραφία"):
+                        st.session_state["stable_code"] = scan_result["code"]
+                        st.rerun()
+            else:
+                error = clean(scan_result.get("debug", {}).get("error", ""))
+                st.warning(error or "Δεν διαβάστηκε καθαρός QR / barcode από τη φωτογραφία. Δοκίμασε πιο κοντινή και καθαρή λήψη.")
 
     options = CATEGORIES if defaults["category"] in CATEGORIES else [defaults["category"], *CATEGORIES]
     with st.form("save"):
@@ -215,7 +258,7 @@ def entry_tab(data):
         submitted = st.form_submit_button("✅ Αποθήκευση + stock")
     if submitted:
         try:
-            raw_code = clean(code)
+            raw_code = clean(st.session_state.get("stable_code", code))
             if not raw_code.isdigit():
                 raise core.InventoryError("Χρειάζεται αριθμητικό Barcode ή GTIN.")
             if not clean(product):
@@ -231,12 +274,15 @@ def entry_tab(data):
             note_parts = [
                 clean(note),
                 f"expiry_date={expiry_value}" if expiry_value else "no_expiry=true",
+                f"scan_type={scan_result.get('type', '')}" if scan_result.get("type") else "",
+                f"scan_raw={scan_result.get('raw', '')}" if scan_result.get("raw") else "",
                 front_photo_note,
                 qr_photo_note,
             ]
             row = make_row(
                 raw_code, product, brand, category, strength, form, expiry_value, lot, location_id, qty,
                 " | ".join([p for p in note_parts if p]), front_photo_url, qr_photo_url,
+                scan_result.get("type", ""), scan_result.get("raw", ""),
             )
             core.append_stock_transaction(core.worksheet(), row)
             core.invalidate_data_cache()
