@@ -13,6 +13,7 @@ import app_inventory_search as core
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
 LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
 TRUE_VALUES = {"true", "1", "yes", "y", "ναι", "nai"}
+INITIAL_CHOICES = ["Όλα", "0-9", *list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), *list("ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ")]
 MAX_PHOTO_CELL_CHARS = 45000
 
 
@@ -88,6 +89,16 @@ def encode_uploaded_photo(uploaded_file, photo_kind):
     raise core.InventoryError(f"Η φωτογραφία {photo_kind} είναι πολύ μεγάλη για το Google Sheet. Βάλε πιο κοντινή/κομμένη φωτογραφία.")
 
 
+def product_initial(value):
+    text = up(value)
+    for ch in text:
+        if ch.isalpha():
+            return ch
+        if ch.isdigit():
+            return "0-9"
+    return ""
+
+
 def make_row(code, product, brand, category, strength, form, expiry, lot, location_id, qty, note, front_photo_url, qr_photo_url):
     code_type = "GTIN" if len(code) == 14 else "Barcode"
     barcode = "" if code_type == "GTIN" else code
@@ -109,7 +120,7 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
 def stock_table(data):
     display_cols = [
         "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm",
-        "ExpiryDate", "LotNumber", "LocationId", "Τοποθεσία", "Stock"
+        "ExpiryDate", "LotNumber", "LocationId", "Τοποθεσία", "Stock", "Αρχικό"
     ]
     if data.empty:
         return pd.DataFrame(columns=display_cols)
@@ -130,21 +141,32 @@ def stock_table(data):
     group_cols = ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "LocationId", "Τοποθεσία"]
     stock = df.groupby(group_cols, dropna=False, as_index=False)["DeltaQty"].sum().rename(columns={"DeltaQty": "Stock"})
     stock = stock[stock["Stock"] != 0].copy()
-    return stock.sort_values(["LocationId", "Προϊόν", "ExpiryDate", "LotNumber"])
+    stock["Αρχικό"] = stock["Προϊόν"].map(product_initial)
+    stock["SortName"] = stock["Προϊόν"].map(up)
+    return stock.sort_values(["LocationId", "SortName", "ExpiryDate", "LotNumber"])
 
 
-def filter_stock(stock, query, location_choice):
+def filter_stock(stock, query, location_choice, initial_choice):
     result = stock.copy(deep=True)
     if location_choice != "Όλες":
         location_id = int(location_choice.split("-", 1)[0].strip())
         result = result[result["LocationId"] == location_id]
+    if initial_choice != "Όλα":
+        result = result[result["Αρχικό"] == initial_choice]
     q = clean(query).lower()
     if q:
-        mask = pd.Series(False, index=result.index)
-        for col in ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία"]:
-            mask |= result[col].astype(str).str.lower().str.contains(q, regex=False, na=False)
-        result = result[mask]
-    return result
+        if len(q) == 1 and q.isalpha():
+            letter = q.upper()
+            result = result[
+                result["Προϊόν"].astype(str).map(up).str.startswith(letter)
+                | result["Μάρκα"].astype(str).map(up).str.startswith(letter)
+            ]
+        else:
+            mask = pd.Series(False, index=result.index)
+            for col in ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία"]:
+                mask |= result[col].astype(str).str.lower().str.contains(q, regex=False, na=False)
+            result = result[mask]
+    return result.sort_values(["LocationId", "SortName", "ExpiryDate", "LotNumber"])
 
 
 def entry_tab(data):
@@ -227,14 +249,16 @@ def entry_tab(data):
 def stock_tab(data):
     stock = stock_table(data)
     st.subheader("📦 Stock ανά τοποθεσία")
-    st.caption("Για το stock πάνω, άσε επιλεγμένο το Πάνω / Επίπεδο 1. Μηδενική μαγεία, άρα επιτέλους χρήσιμο.")
+    st.caption("Για το stock πάνω, άσε επιλεγμένο το Πάνω / Επίπεδο 1. Τα προϊόντα εμφανίζονται αλφαβητικά, γιατί το χάος έχει ήδη αρκετούς εκπροσώπους.")
     choices = ["2 - Πάνω / Επίπεδο 1", "Όλες", "0 - Αποθήκη", "1 - Κάτω / Κύριο Κτήριο"]
-    c1, c2 = st.columns([1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
         location_choice = st.selectbox("Τοποθεσία", choices)
     with c2:
-        query = st.text_input("Αναζήτηση", placeholder="π.χ. επίπεδο 1, moducare, 520..., κάψουλες, παρτίδα")
-    filtered = filter_stock(stock, query, location_choice)
+        initial_choice = st.selectbox("Αρχικό προϊόντος", INITIAL_CHOICES)
+    with c3:
+        query = st.text_input("Αναζήτηση", placeholder="π.χ. D για Depon, depon, 520..., κάψουλες, παρτίδα")
+    filtered = filter_stock(stock, query, location_choice, initial_choice)
     m1, m2 = st.columns(2)
     m1.metric("Batches", len(filtered))
     m2.metric("Σύνολο τεμαχίων", int(filtered["Stock"].sum()) if not filtered.empty else 0)
@@ -242,7 +266,7 @@ def stock_tab(data):
         st.info("Δεν βρέθηκε stock με αυτά τα φίλτρα.")
         return
     st.dataframe(
-        filtered[["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]],
+        filtered[["Αρχικό", "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]],
         hide_index=True,
         use_container_width=True,
     )
