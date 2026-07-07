@@ -9,6 +9,7 @@ import pandas as pd
 from PIL import Image
 
 import app_inventory_search as core
+import photo_suggestions as photo_ai
 
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
 LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
@@ -114,6 +115,66 @@ def scan_code_from_photo(uploaded_file):
     }
 
 
+def ensure_form_state(defaults):
+    initial_values = {
+        "stable_product": defaults.get("product", ""),
+        "stable_brand": defaults.get("brand", ""),
+        "stable_strength": defaults.get("strength", ""),
+        "stable_form": defaults.get("form", ""),
+        "stable_expiry": "",
+        "stable_lot": "",
+    }
+    for key, value in initial_values.items():
+        st.session_state.setdefault(key, clean(value))
+
+
+def apply_defaults_from_existing_code(code, rows, defaults):
+    code = clean(code)
+    if not code or rows.empty:
+        return
+    if st.session_state.get("stable_defaults_code") == code:
+        return
+    mapping = {
+        "stable_product": defaults.get("product", ""),
+        "stable_brand": defaults.get("brand", ""),
+        "stable_strength": defaults.get("strength", ""),
+        "stable_form": defaults.get("form", ""),
+    }
+    for key, value in mapping.items():
+        if clean(value):
+            st.session_state[key] = clean(value)
+    st.session_state["stable_defaults_code"] = code
+
+
+def suggestion_rows(suggestions):
+    rows = [
+        {"Πεδίο": "Όνομα", "Πρόταση": clean(suggestions.get("product", ""))},
+        {"Πεδίο": "Μάρκα", "Πρόταση": clean(suggestions.get("brand", ""))},
+        {"Πεδίο": "Περιεκτικότητα", "Πρόταση": clean(suggestions.get("strength", ""))},
+        {"Πεδίο": "Μορφή", "Πρόταση": clean(suggestions.get("form", ""))},
+        {"Πεδίο": "Λήξη", "Πρόταση": clean(suggestions.get("expiry", ""))},
+        {"Πεδίο": "Lot", "Πρόταση": clean(suggestions.get("lot", ""))},
+    ]
+    return [row for row in rows if row["Πρόταση"]]
+
+
+def apply_photo_suggestions_to_form(suggestions):
+    if st.session_state.get("applied_photo_suggestion_key") == suggestions.get("key"):
+        return
+    mapping = {
+        "stable_product": suggestions.get("product", ""),
+        "stable_brand": suggestions.get("brand", ""),
+        "stable_strength": suggestions.get("strength", ""),
+        "stable_form": suggestions.get("form", ""),
+        "stable_expiry": suggestions.get("expiry", ""),
+        "stable_lot": suggestions.get("lot", ""),
+    }
+    for key, value in mapping.items():
+        if clean(value):
+            st.session_state[key] = clean(value)
+    st.session_state["applied_photo_suggestion_key"] = suggestions.get("key")
+
+
 def product_initial(value):
     text = up(value)
     for ch in text:
@@ -205,6 +266,9 @@ def entry_tab(data):
 
     rows = stock_by_code(data, code)
     defaults = product_defaults(rows)
+    ensure_form_state(defaults)
+    apply_defaults_from_existing_code(code, rows, defaults)
+
     if clean(code) and not rows.empty:
         stock = pd.to_numeric(rows["DeltaQty"], errors="coerce").fillna(0).astype(int).sum()
         st.success(f"Βρέθηκε τοπικά: {defaults['product']} | stock κινήσεων: {stock}")
@@ -215,7 +279,7 @@ def entry_tab(data):
     col1, col2 = st.columns(2)
     with col1:
         front_photo = st.file_uploader(
-            "Μπροστινή φωτογραφία προϊόντος (προαιρετική, μόνο για αναφορά)",
+            "Μπροστινή φωτογραφία προϊόντος (προαιρετική OCR πρόταση ονόματος)",
             type=["jpg", "jpeg", "png"],
             key="front_photo_uploader",
         )
@@ -223,13 +287,13 @@ def entry_tab(data):
             st.image(front_photo, caption="Μπροστινή φωτογραφία", width=260)
     with col2:
         qr_photo = st.file_uploader(
-            "Φωτογραφία QR / barcode φαρμάκου (προαιρετική ανάγνωση κωδικού)",
+            "Φωτογραφία QR / barcode / λήξης (προαιρετική ανάγνωση)",
             type=["jpg", "jpeg", "png"],
             key="qr_photo_uploader",
         )
         scan_result = scan_code_from_photo(qr_photo) if qr_photo else scan_result
         if qr_photo:
-            st.image(qr_photo, caption="Φωτογραφία QR / barcode", width=260)
+            st.image(qr_photo, caption="Φωτογραφία QR / barcode / λήξης", width=260)
             if scan_result.get("code"):
                 scanned_code = clean(scan_result["code"])
                 st.success(f"Διαβάστηκε κωδικός: {scanned_code} ({scan_result.get('type') or 'code'})")
@@ -246,16 +310,34 @@ def entry_tab(data):
                 error = clean(scan_result.get("debug", {}).get("error", ""))
                 st.warning(error or "Δεν διαβάστηκε καθαρός QR / barcode από τη φωτογραφία. Δοκίμασε πιο κοντινή και καθαρή λήψη.")
 
+    suggestions = {"key": ""}
+    if front_photo or qr_photo:
+        with st.spinner("Διαβάζω πιθανές πληροφορίες από τις φωτογραφίες..."):
+            suggestions = photo_ai.suggest_fields(core, front_photo, qr_photo, scan_result)
+        rows_for_display = suggestion_rows(suggestions)
+        if rows_for_display:
+            st.info("Βρέθηκαν προτάσεις από τις φωτογραφίες. Έλεγξέ τες πριν αποθήκευση.")
+            st.dataframe(pd.DataFrame(rows_for_display), hide_index=True, use_container_width=True)
+            use_photo_suggestions = st.checkbox(
+                "Χρήση προτάσεων φωτογραφίας στα πεδία",
+                value=False,
+                key="use_photo_suggestions",
+            )
+            if use_photo_suggestions:
+                apply_photo_suggestions_to_form(suggestions)
+        else:
+            st.caption("Δεν βρέθηκαν καθαρές προτάσεις για όνομα, λήξη ή lot από τις φωτογραφίες.")
+
     options = CATEGORIES if defaults["category"] in CATEGORIES else [defaults["category"], *CATEGORIES]
     with st.form("save"):
-        product = st.text_input("Όνομα προϊόντος", value=defaults["product"])
-        brand = st.text_input("Μάρκα / Εταιρεία", value=defaults["brand"])
+        product = st.text_input("Όνομα προϊόντος", key="stable_product")
+        brand = st.text_input("Μάρκα / Εταιρεία", key="stable_brand")
         category = st.selectbox("Κατηγορία", options)
-        strength = st.text_input("Περιεκτικότητα (π.χ. 1000mg, 2000 IU, SPF50)", value=defaults["strength"])
-        form = st.text_input("Μορφή προϊόντος (π.χ. κάψουλες, ταμπλέτες, κρέμα, σπρέι)", value=defaults["form"])
-        expiry = st.text_input("Ημερομηνία λήξης", help="YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY")
+        strength = st.text_input("Περιεκτικότητα (π.χ. 1000mg, 2000 IU, SPF50)", key="stable_strength")
+        form = st.text_input("Μορφή προϊόντος (π.χ. κάψουλες, ταμπλέτες, κρέμα, σπρέι)", key="stable_form")
+        expiry = st.text_input("Ημερομηνία λήξης", help="YYYY-MM-DD, DD/MM/YYYY ή MM/YYYY", key="stable_expiry")
         no_expiry = st.checkbox("Το προϊόν δεν έχει ημερομηνία λήξης")
-        lot = st.text_input("Lot / Παρτίδα")
+        lot = st.text_input("Lot / Παρτίδα", key="stable_lot")
         location_label = st.selectbox("Τοποθεσία", [f"{k} - {v}" for k, v in LOCATIONS.items()], index=2)
         qty = st.number_input("Ποσότητα προσθήκης", min_value=1, value=1, step=1)
         note = st.text_input("Σημείωση")
@@ -281,6 +363,7 @@ def entry_tab(data):
                 f"expiry_date={expiry_value}" if expiry_value else "no_expiry=true",
                 f"scan_type={scan_result.get('type', '')}" if scan_result.get("type") else "",
                 f"scan_raw={scan_result.get('raw', '')}" if scan_result.get("raw") else "",
+                "photo_suggestions_used=true" if st.session_state.get("use_photo_suggestions") else "",
                 front_photo_note,
                 qr_photo_note,
             ]
@@ -345,7 +428,7 @@ def expiry_tab(data):
 def main():
     st.set_page_config(page_title="Αποθήκη - Απλή Καταχώρηση", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη - Απλή Καταχώρηση")
-    st.caption("Καταχώρηση + stock ανά τοποθεσία. Οι φωτογραφίες είναι μόνο για αναφορά.")
+    st.caption("Καταχώρηση + stock ανά τοποθεσία. Οι φωτογραφίες δίνουν προτάσεις, αλλά η αποθήκευση θέλει δική σου επιβεβαίωση.")
     data = load_data()
     tab_entry, tab_stock, tab_expiry = st.tabs(["➕ Καταχώρηση", "📦 Stock / Πάνω", "⚠️ Λήξεις"])
     with tab_entry:
