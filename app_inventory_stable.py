@@ -310,6 +310,13 @@ def entry_tab(data):
                 error = clean(scan_result.get("debug", {}).get("error", ""))
                 st.warning(error or "Δεν διαβάστηκε καθαρός QR / barcode από τη φωτογραφία. Δοκίμασε πιο κοντινή και καθαρή λήψη.")
 
+    if clean(effective_code):
+        effective_rows = stock_by_code(data, effective_code)
+        if not effective_rows.empty and (clean(effective_code) != clean(code) or rows.empty):
+            effective_defaults = product_defaults(effective_rows)
+            apply_defaults_from_existing_code(effective_code, effective_rows, effective_defaults)
+            st.success(f"Βρέθηκε προϊόν από τον κωδικό φωτογραφίας: {effective_defaults['product']}")
+
     suggestions = {"key": ""}
     if front_photo or qr_photo:
         with st.spinner("Διαβάζω πιθανές πληροφορίες από τις φωτογραφίες..."):
