@@ -10,6 +10,7 @@ from PIL import Image
 
 import app_inventory_search as core
 import photo_suggestions as photo_ai
+import inventory_base as base_db
 
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
 LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
@@ -380,6 +381,10 @@ def entry_tab(data):
                 scan_result.get("type", ""), scan_result.get("raw", ""),
             )
             core.append_stock_transaction(core.worksheet(), row)
+            try:
+                base_db.upsert_product_from_transaction(core, row)
+            except Exception:
+                pass
             core.invalidate_data_cache()
             st.success("Αποθηκεύτηκε.")
             st.rerun()
@@ -432,18 +437,64 @@ def expiry_tab(data):
         st.dataframe(no_expiry[["Προϊόν", "Μάρκα", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
 
 
+def base_tab(data):
+    st.subheader("🧱 Βάση προϊόντων")
+    st.caption("Η βάση κρατάει προϊόντα, αντιστοιχίσεις προμηθευτή, γραμμές τιμολογίων και πωλήσεις. Το stock συνεχίζει να βγαίνει από κινήσεις, όπως πρέπει, γιατί τα μαγικά κελιά είναι για μάγους και κακά ERP.")
+    inferred_products = base_db.product_rows_from_transactions(data)
+    products_df = base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
+    mappings_df = base_db.read_sheet_df(core, "SupplierMappings", base_db.SUPPLIER_MAPPING_COLUMNS)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Προϊόντα από κινήσεις", len(inferred_products))
+    m2.metric("Products sheet", len(products_df))
+    m3.metric("Supplier mappings", len(mappings_df))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Δημιουργία / έλεγχος φύλλων βάσης"):
+            try:
+                sizes = base_db.ensure_base_sheets(core)
+                st.success("Έτοιμα τα φύλλα βάσης: " + ", ".join(f"{name}: {count}" for name, count in sizes.items()))
+            except Exception as exc:
+                st.error(f"Δεν μπόρεσα να φτιάξω τα φύλλα βάσης: {exc}")
+    with c2:
+        if st.button("Συγχρονισμός Products από κινήσεις"):
+            try:
+                result = base_db.sync_products_from_transactions(core, data)
+                st.success(f"Προστέθηκαν {result['added']} νέα προϊόντα στη βάση. Υποψήφια: {result['candidates']}, υπήρχαν ήδη: {result['existing']}.")
+            except Exception as exc:
+                st.error(f"Δεν μπόρεσα να συγχρονίσω Products: {exc}")
+
+    with st.expander("Σχήμα βάσης", expanded=False):
+        st.dataframe(base_db.schema_overview_df(), hide_index=True, use_container_width=True)
+
+    with st.expander("Products sheet", expanded=True):
+        if products_df.empty:
+            st.info("Δεν υπάρχει ακόμα Products sheet ή είναι άδειο. Πάτα πρώτα δημιουργία/συγχρονισμό.")
+        else:
+            st.dataframe(products_df, hide_index=True, use_container_width=True)
+
+    with st.expander("Προϊόντα που προκύπτουν από τις κινήσεις", expanded=False):
+        if inferred_products:
+            st.dataframe(pd.DataFrame(inferred_products), hide_index=True, use_container_width=True)
+        else:
+            st.info("Δεν υπάρχουν αρκετές κινήσεις για να προκύψει μητρώο προϊόντων.")
+
+
 def main():
     st.set_page_config(page_title="Αποθήκη - Απλή Καταχώρηση", page_icon="📦", layout="wide")
     st.title("📦 Αποθήκη - Απλή Καταχώρηση")
     st.caption("Καταχώρηση + stock ανά τοποθεσία. Οι φωτογραφίες δίνουν προτάσεις, αλλά η αποθήκευση θέλει δική σου επιβεβαίωση.")
     data = load_data()
-    tab_entry, tab_stock, tab_expiry = st.tabs(["➕ Καταχώρηση", "📦 Stock / Πάνω", "⚠️ Λήξεις"])
+    tab_entry, tab_stock, tab_expiry, tab_base = st.tabs(["➕ Καταχώρηση", "📦 Stock / Πάνω", "⚠️ Λήξεις", "🧱 Βάση"])
     with tab_entry:
         entry_tab(data)
     with tab_stock:
         stock_tab(data)
     with tab_expiry:
         expiry_tab(data)
+    with tab_base:
+        base_tab(data)
 
 
 if __name__ == "__main__":
