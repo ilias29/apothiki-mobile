@@ -8,12 +8,17 @@ PRODUCT_COLUMNS = [
     "ProductId",
     "Barcode",
     "GTIN",
+    "PC_GTIN",
+    "DataMatrix_PC",
+    "DataMatrix_SN",
     "ProductName",
     "Brand",
     "Category",
     "Strength",
     "DosageForm",
     "Company",
+    "FrontPhotoUrl",
+    "BackPhotoUrl",
     "Active",
     "CreatedAt",
     "UpdatedAt",
@@ -104,8 +109,8 @@ def stable_hash(*parts: Any, size: int = 16) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:size]
 
 
-def product_id(barcode: str = "", gtin: str = "", product_name: str = "", strength: str = "", dosage_form: str = "") -> str:
-    return "prd_" + stable_hash(barcode, gtin, product_name, strength, dosage_form)
+def product_id(barcode: str = "", gtin: str = "", product_name: str = "", strength: str = "", dosage_form: str = "", pc_gtin: str = "") -> str:
+    return "prd_" + stable_hash(barcode, gtin, pc_gtin, product_name, strength, dosage_form)
 
 
 def mapping_id(supplier_name: str, supplier_item_code: str, supplier_description: str = "") -> str:
@@ -156,11 +161,19 @@ def read_sheet_df(core, sheet_name: str, columns: list[str]) -> pd.DataFrame:
     return df[columns]
 
 
+def infer_pc_gtin(row: dict[str, Any]) -> str:
+    return clean(row.get("PC_GTIN", "")) or clean(row.get("PCCode", "")) or clean(row.get("DataMatrix_PC", ""))
+
+
+def infer_datamatrix_sn(row: dict[str, Any]) -> str:
+    return clean(row.get("DataMatrix_SN", "")) or clean(row.get("SerialNumber", ""))
+
+
 def product_rows_from_transactions(data: pd.DataFrame) -> list[dict[str, str]]:
     if data is None or data.empty:
         return []
     df = data.copy(deep=True)
-    for column in ["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm"]:
+    for column in ["Barcode", "GTIN", "PCCode", "DataMatrix_PC", "SerialNumber", "DataMatrix_SN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "FrontPhotoUrl", "BackPhotoUrl"]:
         if column not in df.columns:
             df[column] = ""
         df[column] = df[column].fillna("").astype(str)
@@ -171,51 +184,65 @@ def product_rows_from_transactions(data: pd.DataFrame) -> list[dict[str, str]]:
         product_name = up(item.get("Προϊόν", ""))
         barcode = clean(item.get("Barcode", ""))
         gtin = clean(item.get("GTIN", ""))
+        pc_gtin = infer_pc_gtin(item)
+        datamatrix_sn = infer_datamatrix_sn(item)
         strength = up(item.get("Strength", ""))
         dosage_form = up(item.get("DosageForm", ""))
-        if not product_name and not barcode and not gtin:
+        if not product_name and not barcode and not gtin and not pc_gtin:
             continue
-        pid = product_id(barcode, gtin, product_name, strength, dosage_form)
+        pid = product_id(barcode, gtin, product_name, strength, dosage_form, pc_gtin)
         rows[pid] = {
             "ProductId": pid,
             "Barcode": barcode,
             "GTIN": gtin,
+            "PC_GTIN": pc_gtin,
+            "DataMatrix_PC": pc_gtin,
+            "DataMatrix_SN": datamatrix_sn,
             "ProductName": product_name,
             "Brand": up(item.get("Μάρκα", "")),
             "Category": clean(item.get("Κατηγορία", "")),
             "Strength": strength,
             "DosageForm": dosage_form,
             "Company": "",
+            "FrontPhotoUrl": clean(item.get("FrontPhotoUrl", "")),
+            "BackPhotoUrl": clean(item.get("BackPhotoUrl", "")),
             "Active": "true",
             "CreatedAt": stamp,
             "UpdatedAt": stamp,
-            "Notes": "synced_from_transactions",
+            "Notes": "synced_from_transactions; identifiers=barcode_gtin_pc_sn_photos",
         }
-    return sorted(rows.values(), key=lambda row: (row["ProductName"], row["Barcode"], row["GTIN"]))
+    return sorted(rows.values(), key=lambda row: (row["ProductName"], row["Barcode"], row["GTIN"], row["PC_GTIN"]))
 
 
 def transaction_row_to_product(row: dict[str, Any]) -> dict[str, str]:
     product_name = up(row.get("Προϊόν", ""))
     barcode = clean(row.get("Barcode", ""))
     gtin = clean(row.get("GTIN", ""))
+    pc_gtin = infer_pc_gtin(row)
+    datamatrix_sn = infer_datamatrix_sn(row)
     strength = up(row.get("Strength", ""))
     dosage_form = up(row.get("DosageForm", ""))
     stamp = now_iso()
-    pid = product_id(barcode, gtin, product_name, strength, dosage_form)
+    pid = product_id(barcode, gtin, product_name, strength, dosage_form, pc_gtin)
     return {
         "ProductId": pid,
         "Barcode": barcode,
         "GTIN": gtin,
+        "PC_GTIN": pc_gtin,
+        "DataMatrix_PC": pc_gtin,
+        "DataMatrix_SN": datamatrix_sn,
         "ProductName": product_name,
         "Brand": up(row.get("Μάρκα", "")),
         "Category": clean(row.get("Κατηγορία", "")),
         "Strength": strength,
         "DosageForm": dosage_form,
         "Company": "",
+        "FrontPhotoUrl": clean(row.get("FrontPhotoUrl", "")),
+        "BackPhotoUrl": clean(row.get("BackPhotoUrl", "")),
         "Active": "true",
         "CreatedAt": stamp,
         "UpdatedAt": stamp,
-        "Notes": "created_from_manual_entry",
+        "Notes": "created_from_entry; identifiers=barcode_gtin_pc_sn_photos",
     }
 
 
@@ -232,7 +259,7 @@ def sync_products_from_transactions(core, data: pd.DataFrame) -> dict[str, int]:
 
 def upsert_product_from_transaction(core, row: dict[str, Any]) -> bool:
     product_row = transaction_row_to_product(row)
-    if not clean(product_row.get("ProductName")) and not clean(product_row.get("Barcode")) and not clean(product_row.get("GTIN")):
+    if not clean(product_row.get("ProductName")) and not clean(product_row.get("Barcode")) and not clean(product_row.get("GTIN")) and not clean(product_row.get("PC_GTIN")):
         return False
     ws = ensure_worksheet(core, "Products", PRODUCT_COLUMNS)
     existing = pd.DataFrame(ws.get_all_records())
