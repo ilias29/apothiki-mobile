@@ -11,6 +11,7 @@ from PIL import Image
 import app_inventory_search as core
 import photo_suggestions as photo_ai
 import inventory_base as base_db
+import shelf_photo as shelf_ai
 
 CATEGORIES = ["Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
 LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
@@ -208,6 +209,46 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
     }
 
 
+def make_shelf_row(item, location_id, source_note=""):
+    product = clean(item.get("ProductName", ""))
+    qty = int(pd.to_numeric(item.get("EstimatedQty", 1), errors="coerce") or 1)
+    code = clean(item.get("BarcodeOrGTIN", ""))
+    expiry = clean(item.get("ExpiryDate", ""))
+    lot = clean(item.get("LotNumber", ""))
+    strength = clean(item.get("Strength", ""))
+    category = clean(item.get("Category", "")) or "Φάρμακο"
+    note = " | ".join([p for p in ["shelf_photo_draft_confirmed=true", clean(item.get("Notes", "")), source_note] if p])
+    if code.isdigit():
+        code_type = "GTIN" if len(code) == 14 else "Barcode"
+        barcode = "" if code_type == "GTIN" else code
+        gtin = code if code_type == "GTIN" else ""
+        code_value = code
+    else:
+        code_type = "Internal"
+        code_value = "PHOTO-" + base_db.stable_hash(product, strength, expiry, lot, location_id, size=12)
+        barcode = ""
+        gtin = ""
+    return core.make_transaction(
+        code_type=code_type,
+        code_value=code_value,
+        barcode=barcode,
+        gtin=gtin,
+        brand=product.split()[0] if product else "",
+        product=product,
+        category=category,
+        location_id=int(location_id),
+        movement="Φωτογραφία αποθέματος (+)",
+        quantity=max(1, qty),
+        delta=max(1, qty),
+        lot_number=lot,
+        expiry_date=expiry,
+        strength=strength,
+        dosage_form="",
+        note=note,
+        movement_kind=core.NORMAL,
+    )
+
+
 def stock_table(data):
     display_cols = [
         "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm",
@@ -392,6 +433,89 @@ def entry_tab(data):
             st.error(str(exc))
 
 
+def shelf_photo_tab(data):
+    st.subheader("📸 Φωτογραφία αποθέματος")
+    st.caption("Ανεβάζεις φωτογραφίες ραφιού. Η εφαρμογή βγάζει ονόματα, κάνει υπόθεση ποσότητας και αποθηκεύει μόνο όσα τσεκάρεις. Barcode/QR/ημερομηνίες μπαίνουν όταν διαβαστούν ή όταν τα διορθώσεις εσύ.")
+    uploaded_files = st.file_uploader(
+        "Φωτογραφίες ραφιού / αποθέματος",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        key="shelf_photo_uploader",
+    )
+    location_label = st.selectbox("Τοποθεσία αποθέματος", [f"{k} - {v}" for k, v in LOCATIONS.items()], index=2, key="shelf_location")
+    location_id = int(location_label.split("-", 1)[0].strip())
+
+    if uploaded_files:
+        st.image(uploaded_files, width=180)
+        if st.button("Ανάλυση φωτογραφιών", key="analyze_shelf_photos"):
+            with st.spinner("Διαβάζω ονόματα, πιθανές ποσότητες, barcode/QR και ημερομηνίες..."):
+                draft_df, debug = shelf_ai.suggest_shelf_inventory(core, uploaded_files)
+            st.session_state["shelf_draft_df"] = draft_df
+            st.session_state["shelf_debug"] = debug
+            st.success(f"Βρέθηκαν {len(draft_df)} πιθανές γραμμές. Τώρα έρχεται το ανθρώπινο κομμάτι, δηλαδή να μην πιστέψουμε τυφλά το OCR.")
+
+    draft_df = st.session_state.get("shelf_draft_df")
+    if draft_df is not None:
+        st.info("Διόρθωσε ονόματα/ποσότητες/barcode/λήξεις και τσέκαρε μόνο όσα θες να περαστούν στο stock.")
+        edited = st.data_editor(
+            draft_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="shelf_draft_editor",
+            column_config={
+                "confirm": st.column_config.CheckboxColumn("OK", help="Μόνο τα τσεκαρισμένα αποθηκεύονται"),
+                "ProductName": st.column_config.TextColumn("Προϊόν", required=True),
+                "EstimatedQty": st.column_config.NumberColumn("Ποσότητα", min_value=1, step=1),
+                "BarcodeOrGTIN": st.column_config.TextColumn("Barcode / GTIN / QR"),
+                "ExpiryDate": st.column_config.TextColumn("Λήξη"),
+                "LotNumber": st.column_config.TextColumn("Lot"),
+                "Strength": st.column_config.TextColumn("Περιεκτικότητα"),
+                "Category": st.column_config.TextColumn("Κατηγορία"),
+            },
+        )
+        final_ok = st.checkbox("Τελικό ΟΚ: έλεγξα τις γραμμές και θέλω να περαστούν στο stock", key="shelf_final_ok")
+        if st.button("✅ Αποθήκευση επιβεβαιωμένων στο stock", key="save_shelf_stock"):
+            if not final_ok:
+                st.error("Τσέκαρε πρώτα το τελικό ΟΚ. Τα φάρμακα δεν είναι πεδίο για YOLO αποθήκευση, ευτυχώς.")
+            else:
+                saved = 0
+                skipped = 0
+                ws = core.worksheet()
+                for _, item in edited.iterrows():
+                    if not bool(item.get("confirm", False)):
+                        skipped += 1
+                        continue
+                    if not clean(item.get("ProductName", "")):
+                        skipped += 1
+                        continue
+                    try:
+                        row = make_shelf_row(item, location_id, source_note="source=shelf_photo_review")
+                        core.append_stock_transaction(ws, row)
+                        try:
+                            base_db.upsert_product_from_transaction(core, row)
+                        except Exception:
+                            pass
+                        saved += 1
+                    except Exception as exc:
+                        st.warning(f"Δεν αποθηκεύτηκε γραμμή {clean(item.get('ProductName', ''))}: {exc}")
+                core.invalidate_data_cache()
+                st.success(f"Αποθηκεύτηκαν {saved} γραμμές. Παραλείφθηκαν {skipped}.")
+                st.rerun()
+
+        with st.expander("OCR debug / γραμμές που διάβασε", expanded=False):
+            for dbg in st.session_state.get("shelf_debug", []):
+                st.write(f"**{dbg.get('source_photo', '')}**")
+                st.caption("OCR available: " + clean(dbg.get("ocr_available", "")))
+                if dbg.get("errors"):
+                    st.warning(" | ".join(map(str, dbg.get("errors", []))))
+                lines = dbg.get("lines", [])
+                if lines:
+                    st.text("\n".join(lines[:80]))
+                else:
+                    st.caption("Δεν διαβάστηκαν γραμμές.")
+
+
 def stock_tab(data):
     stock = stock_table(data)
     st.subheader("📦 Stock ανά τοποθεσία")
@@ -486,9 +610,11 @@ def main():
     st.title("📦 Αποθήκη - Απλή Καταχώρηση")
     st.caption("Καταχώρηση + stock ανά τοποθεσία. Οι φωτογραφίες δίνουν προτάσεις, αλλά η αποθήκευση θέλει δική σου επιβεβαίωση.")
     data = load_data()
-    tab_entry, tab_stock, tab_expiry, tab_base = st.tabs(["➕ Καταχώρηση", "📦 Stock / Πάνω", "⚠️ Λήξεις", "🧱 Βάση"])
+    tab_entry, tab_shelf, tab_stock, tab_expiry, tab_base = st.tabs(["➕ Καταχώρηση", "📸 Φωτογραφία αποθέματος", "📦 Stock / Πάνω", "⚠️ Λήξεις", "🧱 Βάση"])
     with tab_entry:
         entry_tab(data)
+    with tab_shelf:
+        shelf_photo_tab(data)
     with tab_stock:
         stock_tab(data)
     with tab_expiry:
