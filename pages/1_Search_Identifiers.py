@@ -37,14 +37,51 @@ def load_transactions() -> pd.DataFrame:
     return frame
 
 
-def search_transactions(data: pd.DataFrame, query: str) -> pd.DataFrame:
+def contains_mask(frame: pd.DataFrame, columns: list[str], query: str) -> pd.Series:
+    mask = pd.Series(False, index=frame.index)
+    search = clean(query).lower()
+    if not search:
+        return mask
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        mask |= frame[column].astype(str).str.lower().str.contains(search, regex=False, na=False)
+    return mask
+
+
+def product_names_from_master(products: pd.DataFrame, packages: pd.DataFrame, query: str) -> set[str]:
+    names: set[str] = set()
+    product_ids: set[str] = set()
+    if products is not None and not products.empty:
+        mask = contains_mask(
+            products,
+            ["ProductName", "Brand", "Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC", "DataMatrix_SN", "Strength", "DosageForm"],
+            query,
+        )
+        matching_products = products[mask]
+        names.update(up(value) for value in matching_products["ProductName"] if clean(value))
+        product_ids.update(clean(value) for value in matching_products["ProductId"] if clean(value))
+    if packages is not None and not packages.empty:
+        package_mask = contains_mask(packages, ["PC_GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "ProductId"], query)
+        product_ids.update(clean(value) for value in packages.loc[package_mask, "ProductId"] if clean(value))
+    if product_ids and products is not None and not products.empty:
+        linked = products[products["ProductId"].astype(str).isin(product_ids)]
+        names.update(up(value) for value in linked["ProductName"] if clean(value))
+    return names
+
+
+def search_transactions(data: pd.DataFrame, query: str, products: pd.DataFrame | None = None, packages: pd.DataFrame | None = None) -> pd.DataFrame:
     if data.empty or not clean(query):
         return data.iloc[0:0].copy()
-    search = clean(query).lower()
-    mask = pd.Series(False, index=data.index)
-    for column in ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "PCCode", "SerialNumber", "LotNumber", "ExpiryDate", "CodeValue"]:
-        mask |= data[column].astype(str).str.lower().str.contains(search, regex=False, na=False)
-    return data[mask].copy()
+    direct_mask = contains_mask(
+        data,
+        ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "PCCode", "SerialNumber", "LotNumber", "ExpiryDate", "CodeValue"],
+        query,
+    )
+    names = product_names_from_master(products, packages, query)
+    if names:
+        direct_mask |= data["Προϊόν"].map(up).isin(names)
+    return data[direct_mask].copy()
 
 
 def stock_summary(rows: pd.DataFrame) -> pd.DataFrame:
@@ -69,7 +106,7 @@ def stock_summary(rows: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_identifier_row(product_name: str, barcode: str, gtin: str, pc_code: str, serial_number: str, strength: str, dosage_form: str, lot: str, expiry: str, location_id: int) -> dict[str, Any]:
-    identifier = clean(gtin) or clean(barcode) or clean(pc_code)
+    identifier = clean(gtin) or clean(barcode) or clean(pc_code) or clean(serial_number)
     if gtin:
         code_type, code_value = "GTIN", clean(gtin)
     elif barcode:
@@ -113,16 +150,19 @@ except Exception as exc:
     st.error(f"Δεν φορτώθηκαν οι κινήσεις: {exc}")
     data = pd.DataFrame(columns=core.COLUMNS)
 
+products = base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
+packages = base_db.read_sheet_df(core, "PackageIdentifiers", base_db.PACKAGE_IDENTIFIER_COLUMNS)
+
 query = st.text_input("Αναζήτηση", placeholder="π.χ. BUDECOL, 07640129622818 ή SN...")
 if clean(query):
-    matches = search_transactions(data, query)
+    matches = search_transactions(data, query, products, packages)
     summary = stock_summary(matches)
     if summary.empty:
         st.warning("Δεν βρέθηκε ενεργό stock με αυτό το στοιχείο.")
     else:
         st.success(f"Βρέθηκαν {len(summary)} γραμμές stock.")
         st.dataframe(summary, hide_index=True, use_container_width=True)
-    with st.expander(f"Κινήσεις που ταιριάζουν ({len(matches)})", expanded=False):
+    with st.expander(f"Κινήσεις που συνδέονται με το αποτέλεσμα ({len(matches)})", expanded=False):
         display = ["Προϊόν", "Barcode", "GTIN", "PCCode", "SerialNumber", "ExpiryDate", "LotNumber", "Τοποθεσία", "DeltaQty", "Timestamp"]
         st.dataframe(matches[display] if not matches.empty else pd.DataFrame(columns=display), hide_index=True, use_container_width=True)
 
@@ -165,8 +205,6 @@ if submitted:
 st.divider()
 st.subheader("Product Master")
 try:
-    products = base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
-    packages = base_db.read_sheet_df(core, "PackageIdentifiers", base_db.PACKAGE_IDENTIFIER_COLUMNS)
     c1, c2 = st.columns(2)
     if c1.button("Δημιουργία / έλεγχος φύλλων", use_container_width=True):
         base_db.ensure_base_sheets(core)
@@ -176,9 +214,14 @@ try:
         result = base_db.sync_products_from_transactions(core, data)
         st.success(f"Νέα: {result['added']}, ενημερωμένα: {result['updated']}, νέα SN/PC: {result['packages_added']}.")
         st.rerun()
-    with st.expander(f"Προϊόντα ({len(products)})", expanded=True):
-        st.dataframe(products, hide_index=True, use_container_width=True)
-    with st.expander(f"Αναγνωριστικά συσκευασιών ({len(packages)})", expanded=False):
-        st.dataframe(packages, hide_index=True, use_container_width=True)
+    display_products = products
+    display_packages = packages
+    if clean(query):
+        display_products = products[contains_mask(products, ["ProductName", "Brand", "Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC", "DataMatrix_SN", "Strength"], query)] if not products.empty else products
+        display_packages = packages[contains_mask(packages, ["PC_GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "ProductId"], query)] if not packages.empty else packages
+    with st.expander(f"Προϊόντα ({len(display_products)})", expanded=True):
+        st.dataframe(display_products, hide_index=True, use_container_width=True)
+    with st.expander(f"Αναγνωριστικά συσκευασιών ({len(display_packages)})", expanded=False):
+        st.dataframe(display_packages, hide_index=True, use_container_width=True)
 except Exception as exc:
     st.error(f"Δεν φορτώθηκε η βάση προϊόντων: {exc}")
