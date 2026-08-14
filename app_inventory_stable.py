@@ -12,6 +12,7 @@ from PIL import Image
 import app_inventory_search as core
 import photo_suggestions as photo_ai
 import inventory_base as base_db
+import inventory_import as import_io
 import shelf_photo as shelf_ai
 
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
@@ -19,7 +20,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "�
 TRUE_VALUES = {"true", "1", "yes", "y", "ναι", "nai"}
 INITIAL_CHOICES = ["Όλα", "0-9", *list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"), *list("ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ")]
 MAX_PHOTO_CELL_CHARS = 45000
-SHELF_DRAFT_COLUMNS = ["confirm", "ProductName", "EstimatedQty", "BarcodeOrGTIN", "ExpiryDate", "LotNumber", "Strength", "Category", "Confidence", "SourcePhoto", "Notes"]
+SHELF_DRAFT_COLUMNS = import_io.DRAFT_COLUMNS
 
 
 def clean(x):
@@ -209,7 +210,7 @@ def make_row(code, product, brand, category, strength, form, expiry, lot, locati
     }
 
 
-def make_shelf_row(item, location_id, source_note=""):
+def make_shelf_row(item, location_id, source_note="", transaction_id=None):
     product = clean(item.get("ProductName", ""))
     qty = int(pd.to_numeric(item.get("EstimatedQty", 1), errors="coerce") or 1)
     code = clean(item.get("BarcodeOrGTIN", ""))
@@ -248,6 +249,7 @@ def make_shelf_row(item, location_id, source_note=""):
         location_id=int(location_id), movement="Φωτογραφία αποθέματος (+)",
         quantity=max(1, qty), delta=max(1, qty), lot_number=lot, expiry_date=expiry,
         strength=strength, dosage_form="", note=note, movement_kind=core.NORMAL,
+        transaction_id=transaction_id,
     )
 
 
@@ -270,28 +272,7 @@ def make_quick_update_row(item, location_id, delta, note=""):
 
 
 def normalize_draft_columns(df):
-    aliases = {
-        "προϊόν": "ProductName", "προιον": "ProductName", "product": "ProductName", "productname": "ProductName", "name": "ProductName", "όνομα": "ProductName", "ονομα": "ProductName",
-        "ποσότητα": "EstimatedQty", "ποσοτητα": "EstimatedQty", "qty": "EstimatedQty", "quantity": "EstimatedQty", "estimatedqty": "EstimatedQty",
-        "barcode": "BarcodeOrGTIN", "ean": "BarcodeOrGTIN", "gtin": "BarcodeOrGTIN", "qr": "BarcodeOrGTIN", "barcodeorgtin": "BarcodeOrGTIN",
-        "λήξη": "ExpiryDate", "ληξη": "ExpiryDate", "expiry": "ExpiryDate", "expirydate": "ExpiryDate", "ημερομηνία λήξης": "ExpiryDate", "ημερομηνια ληξης": "ExpiryDate",
-        "lot": "LotNumber", "lotnumber": "LotNumber", "παρτίδα": "LotNumber", "παρτιδα": "LotNumber",
-        "strength": "Strength", "περιεκτικότητα": "Strength", "περιεκτικοτητα": "Strength",
-        "category": "Category", "κατηγορία": "Category", "κατηγορια": "Category",
-        "notes": "Notes", "σημειώσεις": "Notes", "σημειωσεις": "Notes",
-    }
-    renamed = {}
-    for col in df.columns:
-        key = re.sub(r"[^0-9a-zA-ZΑ-Ωα-ω ]", "", clean(col)).lower().replace(" ", "")
-        spaced_key = re.sub(r"[^0-9a-zA-ZΑ-Ωα-ω ]", "", clean(col)).lower().strip()
-        renamed[col] = aliases.get(key) or aliases.get(spaced_key) or clean(col)
-    out = df.rename(columns=renamed).copy()
-    for col in SHELF_DRAFT_COLUMNS:
-        if col not in out.columns:
-            out[col] = False if col == "confirm" else 1 if col == "EstimatedQty" else "Φάρμακο" if col == "Category" else "chatgpt" if col == "Confidence" else "ChatGPT paste" if col == "SourcePhoto" else "draft_from_chatgpt_vision" if col == "Notes" else ""
-    out["ProductName"] = out["ProductName"].map(up)
-    out["EstimatedQty"] = pd.to_numeric(out["EstimatedQty"], errors="coerce").fillna(1).astype(int).clip(lower=1)
-    return out[SHELF_DRAFT_COLUMNS]
+    return import_io.normalize_draft_columns(df, source="ChatGPT paste")
 
 
 def parse_chatgpt_inventory_text(text):
@@ -387,7 +368,7 @@ def entry_tab(data):
     if clean(code) and not rows.empty:
         stock = pd.to_numeric(rows["DeltaQty"], errors="coerce").fillna(0).astype(int).sum()
         st.success(f"Βρέθηκε τοπικά: {defaults['product']} | stock κινήσεων: {stock}")
-        st.dataframe(rows[["Προϊόν", "Μάρκα", "ExpiryDate", "LotNumber", "Τοποθεσία", "DeltaQty"]], hide_index=True, use_container_width=True)
+        st.dataframe(rows[["Προϊόν", "Μάρκα", "ExpiryDate", "LotNumber", "Τοποθεσία", "DeltaQty"]], hide_index=True, width="stretch")
     elif clean(code):
         st.info("Δεν υπάρχει τοπικά. Συμπλήρωσε χειροκίνητα.")
     col1, col2 = st.columns(2)
@@ -425,7 +406,7 @@ def entry_tab(data):
         rows_for_display = suggestion_rows(suggestions)
         if rows_for_display:
             st.info("Βρέθηκαν προτάσεις από τις φωτογραφίες. Έλεγξέ τες πριν αποθήκευση.")
-            st.dataframe(pd.DataFrame(rows_for_display), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows_for_display), hide_index=True, width="stretch")
             if st.checkbox("Χρήση προτάσεων φωτογραφίας στα πεδία", value=False, key="use_photo_suggestions"):
                 apply_photo_suggestions_to_form(suggestions)
         else:
@@ -474,24 +455,84 @@ def entry_tab(data):
             st.error(str(exc))
 
 
+def set_shelf_draft(draft_df, *, batch_id, source, debug=None):
+    st.session_state.pop("shelf_draft_editor", None)
+    st.session_state["shelf_draft_df"] = draft_df
+    st.session_state["shelf_import_batch_id"] = batch_id
+    st.session_state["shelf_import_source"] = source
+    st.session_state["shelf_debug"] = debug or []
+
+
+def clear_shelf_draft():
+    for key in [
+        "shelf_draft_df",
+        "shelf_draft_editor",
+        "shelf_import_batch_id",
+        "shelf_import_source",
+        "shelf_debug",
+        "shelf_final_ok",
+    ]:
+        st.session_state.pop(key, None)
+
+
 def shelf_photo_tab(data):
     st.subheader("📸 Φωτογραφία αποθέματος")
-    st.caption("Καλύτερη ροή: φωτογραφίες εδώ στη συνομιλία, καθαρός πίνακας από ChatGPT, επικόλληση εδώ, μετά barcode/QR και λήξη ανά κουτί πριν το τελικό OK.")
+    st.caption("Ροή: ανεβάζεις τις φωτογραφίες στη συνομιλία, παίρνεις CSV/XLSX από ChatGPT, το φορτώνεις εδώ, ελέγχεις και αποθηκεύεις.")
+    if st.session_state.pop("shelf_import_flash", None):
+        st.success("Η εισαγωγή ολοκληρώθηκε χωρίς διπλοεγγραφές.")
     location_label = st.selectbox("Τοποθεσία αποθέματος", [f"{k} - {v}" for k, v in LOCATIONS.items()], index=2, key="shelf_location")
     location_id = int(location_label.split("-", 1)[0].strip())
-    pasted = st.text_area("Επικόλληση πίνακα από ChatGPT", height=180, placeholder="| ProductName | EstimatedQty | BarcodeOrGTIN | ExpiryDate | LotNumber |\n| BRIVIACT 100MG | 5 | | | |", key="chatgpt_shelf_paste")
-    c_paste, c_clear = st.columns(2)
+
+    import_file = st.file_uploader(
+        "Αρχείο αποθέματος από ChatGPT",
+        type=["csv", "xlsx"],
+        help="Απαραίτητες στήλες: Προϊόν/ProductName και Ποσότητα/EstimatedQty/TotalQuantity.",
+        key="chatgpt_stock_file",
+    )
+    pasted = st.text_area(
+        "Ή επικόλλησε πίνακα από ChatGPT",
+        height=150,
+        placeholder="| ProductName | EstimatedQty | BarcodeOrGTIN | ExpiryDate | LotNumber |\n| BRIVIACT 100MG | 5 | | | |",
+        key="chatgpt_shelf_paste",
+    )
+    c_file, c_paste, c_clear = st.columns(3)
+    with c_file:
+        if st.button("📄 Φόρτωση αρχείου", key="load_chatgpt_stock_file", width="stretch"):
+            if import_file is None:
+                st.error("Διάλεξε πρώτα αρχείο CSV ή XLSX.")
+            else:
+                try:
+                    raw_file = import_file.getvalue()
+                    draft_df = import_io.read_inventory_bytes(raw_file, import_file.name)
+                    set_shelf_draft(
+                        draft_df,
+                        batch_id=import_io.import_batch_id(raw_file),
+                        source=import_file.name,
+                        debug=[{"source": import_file.name, "rows": len(draft_df)}],
+                    )
+                    st.success(f"Φορτώθηκαν {len(draft_df)} γραμμές. Έλεγξέ τες πριν πατήσεις αποθήκευση.")
+                except Exception as exc:
+                    st.error(f"Δεν φορτώθηκε το αρχείο: {exc}")
     with c_paste:
-        if st.button("📥 Φόρτωση πίνακα ChatGPT", key="load_chatgpt_shelf_table"):
-            draft_df = parse_chatgpt_inventory_text(pasted)
-            st.session_state["shelf_draft_df"] = draft_df
-            st.session_state["shelf_debug"] = [{"source_photo": "ChatGPT paste", "ocr_available": "not_used", "lines": pasted.splitlines(), "errors": []}]
-            st.success(f"Φορτώθηκαν {len(draft_df)} γραμμές από ChatGPT. Τώρα περνάς barcode/QR και λήξη ανά κουτί/γραμμή.")
+        if st.button("📋 Φόρτωση επικόλλησης", key="load_chatgpt_shelf_table", width="stretch"):
+            try:
+                draft_df = parse_chatgpt_inventory_text(pasted)
+                if draft_df.empty:
+                    raise ValueError("Δεν βρέθηκαν γραμμές προϊόντων.")
+                set_shelf_draft(
+                    draft_df,
+                    batch_id=import_io.text_batch_id(pasted),
+                    source="ChatGPT paste",
+                    debug=[{"source": "ChatGPT paste", "rows": len(draft_df)}],
+                )
+                st.success(f"Φορτώθηκαν {len(draft_df)} γραμμές. Έλεγξέ τες πριν πατήσεις αποθήκευση.")
+            except Exception as exc:
+                st.error(f"Δεν φορτώθηκε ο πίνακας: {exc}")
     with c_clear:
-        if st.button("🧹 Καθαρισμός draft", key="clear_shelf_draft"):
-            st.session_state.pop("shelf_draft_df", None)
-            st.session_state.pop("shelf_debug", None)
+        if st.button("🧹 Καθαρισμός", key="clear_shelf_draft", width="stretch"):
+            clear_shelf_draft()
             st.rerun()
+
     with st.expander("Εναλλακτικό OCR μέσα από την εφαρμογή, χαμηλότερη αξιοπιστία", expanded=False):
         uploaded_files = st.file_uploader("Φωτογραφίες ραφιού / αποθέματος", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="shelf_photo_uploader")
         if uploaded_files:
@@ -499,14 +540,20 @@ def shelf_photo_tab(data):
             if st.button("Ανάλυση φωτογραφιών με OCR", key="analyze_shelf_photos"):
                 with st.spinner("Διαβάζω ονόματα, πιθανές ποσότητες, barcode/QR και ημερομηνίες..."):
                     draft_df, debug = shelf_ai.suggest_shelf_inventory(core, uploaded_files)
-                st.session_state["shelf_draft_df"] = draft_df
-                st.session_state["shelf_debug"] = debug
+                photo_bytes = b"".join(uploaded_file.getvalue() for uploaded_file in uploaded_files)
+                set_shelf_draft(
+                    draft_df,
+                    batch_id=import_io.import_batch_id(photo_bytes),
+                    source="in-app OCR",
+                    debug=debug,
+                )
                 st.success(f"Βρέθηκαν {len(draft_df)} πιθανές γραμμές. Μην το πιστέψεις τυφλά, είναι OCR, όχι φαρμακοποιός.")
+
     draft_df = st.session_state.get("shelf_draft_df")
     if draft_df is not None:
-        st.info("Διόρθωσε ποσότητες και μετά πήγαινε ανά κουτί για Barcode/QR και ημερομηνία λήξης. Τσέκαρε OK μόνο στις τελικές γραμμές.")
+        st.info("Έλεγξε όνομα και ποσότητα. Barcode/GTIN, λήξη και lot μπορούν να μείνουν κενά μόνο όταν δεν φαίνονται στις φωτογραφίες.")
         edited = st.data_editor(
-            draft_df, hide_index=True, use_container_width=True, num_rows="dynamic", key="shelf_draft_editor",
+            draft_df, hide_index=True, width="stretch", num_rows="dynamic", key="shelf_draft_editor",
             column_config={
                 "confirm": st.column_config.CheckboxColumn("OK", help="Μόνο τα τσεκαρισμένα αποθηκεύονται"),
                 "ProductName": st.column_config.TextColumn("Προϊόν", required=True),
@@ -518,32 +565,64 @@ def shelf_photo_tab(data):
                 "Category": st.column_config.TextColumn("Κατηγορία"),
             },
         )
-        st.caption("Αν ίδια προϊόντα έχουν διαφορετική λήξη, κάνε ξεχωριστές γραμμές. Βαρετό, αλλά το χάος είναι πιο βαρετό.")
+        try:
+            checked = import_io.normalize_draft_columns(edited, source=st.session_state.get("shelf_import_source", "ChatGPT"))
+        except Exception as exc:
+            st.error(str(exc))
+            checked = pd.DataFrame(columns=SHELF_DRAFT_COLUMNS)
+        selected = checked[checked["confirm"]].copy() if not checked.empty else checked
+        duplicate_selected = import_io.duplicate_rows(selected)
+        m1, m2 = st.columns(2)
+        m1.metric("Επιλεγμένες γραμμές", len(selected))
+        m2.metric("Τεμάχια για προσθήκη", int(selected["EstimatedQty"].sum()) if not selected.empty else 0)
+        if not duplicate_selected.empty:
+            st.error("Υπάρχουν διπλές επιλεγμένες γραμμές για το ίδιο προϊόν/λήξη/lot. Ένωσέ τες πριν την αποθήκευση.")
+            st.dataframe(duplicate_selected, hide_index=True, width="stretch")
+        st.caption("Αν ίδια προϊόντα έχουν διαφορετική λήξη ή lot, κράτησέ τα σε ξεχωριστές γραμμές.")
         final_ok = st.checkbox("Τελικό ΟΚ: έλεγξα barcode/QR, λήξη και ποσότητες", key="shelf_final_ok")
-        if st.button("✅ Αποθήκευση επιβεβαιωμένων στο stock", key="save_shelf_stock"):
+        if st.button("✅ Αποθήκευση επιβεβαιωμένων στο stock", key="save_shelf_stock", type="primary", width="stretch"):
             if not final_ok:
-                st.error("Τσέκαρε πρώτα το τελικό ΟΚ. Τα φάρμακα δεν είναι πεδίο για YOLO αποθήκευση, ευτυχώς.")
+                st.error("Τσέκαρε πρώτα το τελικό ΟΚ.")
+            elif selected.empty:
+                st.error("Δεν έχεις επιλέξει καμία γραμμή.")
+            elif not duplicate_selected.empty:
+                st.error("Διόρθωσε πρώτα τις διπλές γραμμές.")
             else:
                 saved = 0
-                skipped = 0
+                already_saved = 0
+                failed = 0
                 ws = core.worksheet()
-                for _, item in edited.iterrows():
-                    if not bool(item.get("confirm", False)) or not clean(item.get("ProductName", "")):
-                        skipped += 1
-                        continue
+                batch_id = st.session_state.get("shelf_import_batch_id") or import_io.import_batch_id(
+                    selected.to_csv(index=False).encode("utf-8")
+                )
+                source = st.session_state.get("shelf_import_source", "ChatGPT")
+                for position, (_, item) in enumerate(selected.iterrows(), start=1):
                     try:
-                        row = make_shelf_row(item, location_id, source_note="source=chatgpt_or_shelf_photo_review")
-                        core.append_stock_transaction(ws, row)
+                        row = make_shelf_row(
+                            item,
+                            location_id,
+                            source_note=f"source={source}; import_batch_id={batch_id}",
+                            transaction_id=import_io.transaction_id(batch_id, position),
+                        )
+                        status = core.append_stock_transaction(ws, row)
                         try:
                             base_db.upsert_product_from_transaction(core, row)
                         except Exception:
                             pass
-                        saved += 1
+                        if status == "duplicate":
+                            already_saved += 1
+                        else:
+                            saved += 1
                     except Exception as exc:
+                        failed += 1
                         st.warning(f"Δεν αποθηκεύτηκε γραμμή {clean(item.get('ProductName', ''))}: {exc}")
                 core.invalidate_data_cache()
-                st.success(f"Αποθηκεύτηκαν {saved} γραμμές. Παραλείφθηκαν {skipped}.")
-                st.rerun()
+                if failed:
+                    st.error(f"Αποθηκεύτηκαν {saved}, υπήρχαν ήδη {already_saved}, απέτυχαν {failed}. Μην ξαναφτιάξεις αρχείο· διόρθωσε και ξαναπάτησε αποθήκευση.")
+                else:
+                    clear_shelf_draft()
+                    st.session_state["shelf_import_flash"] = True
+                    st.rerun()
 
 
 def quick_update_tab(data):
@@ -563,7 +642,7 @@ def quick_update_tab(data):
     results["label"] = results.apply(lambda r: f"{r['Προϊόν']} | {r['Strength']} | λήξη {r['ExpiryDate'] or '-'} | {r['Τοποθεσία']} | stock {r['Stock']}", axis=1)
     selected_label = st.selectbox("Προϊόν / παρτίδα", results["label"].tolist(), key="quick_selected")
     item = results[results["label"] == selected_label].iloc[0]
-    st.dataframe(pd.DataFrame([item[["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Strength", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]].to_dict()]), hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame([item[["Barcode", "GTIN", "Προϊόν", "Μάρκα", "Strength", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]].to_dict()]), hide_index=True, width="stretch")
     c1, c2, c3, c4 = st.columns(4)
     quick_delta = None
     if c1.button("-1", key="quick_minus_1"):
@@ -611,7 +690,7 @@ def stock_tab(data):
     if filtered.empty:
         st.info("Δεν βρέθηκε stock με αυτά τα φίλτρα.")
         return
-    st.dataframe(filtered[["Αρχικό", "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
+    st.dataframe(filtered[["Αρχικό", "Barcode", "GTIN", "Προϊόν", "Μάρκα", "Κατηγορία", "Strength", "DosageForm", "ExpiryDate", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, width="stretch")
 
 
 def expiry_tab(data):
@@ -626,9 +705,9 @@ def expiry_tab(data):
     no_expiry = frame[frame["ExpiryDate"].astype(str).str.strip().eq("")]
     st.subheader("⚠️ Λήξεις")
     with st.expander(f"Ληγμένα / λήγουν σε 90 ημέρες ({len(expiring)})", expanded=True):
-        st.dataframe(expiring[["Προϊόν", "Μάρκα", "ExpiryDate", "DaysToExpiry", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
+        st.dataframe(expiring[["Προϊόν", "Μάρκα", "ExpiryDate", "DaysToExpiry", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, width="stretch")
     with st.expander(f"Χωρίς λήξη ({len(no_expiry)})", expanded=False):
-        st.dataframe(no_expiry[["Προϊόν", "Μάρκα", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, use_container_width=True)
+        st.dataframe(no_expiry[["Προϊόν", "Μάρκα", "LotNumber", "Τοποθεσία", "Stock"]], hide_index=True, width="stretch")
 
 
 def base_tab(data):
@@ -657,15 +736,15 @@ def base_tab(data):
             except Exception as exc:
                 st.error(f"Δεν μπόρεσα να συγχρονίσω Products: {exc}")
     with st.expander("Σχήμα βάσης", expanded=False):
-        st.dataframe(base_db.schema_overview_df(), hide_index=True, use_container_width=True)
+        st.dataframe(base_db.schema_overview_df(), hide_index=True, width="stretch")
     with st.expander("Products sheet", expanded=True):
         if products_df.empty:
             st.info("Δεν υπάρχει ακόμα Products sheet ή είναι άδειο. Πάτα πρώτα δημιουργία/συγχρονισμό.")
         else:
-            st.dataframe(products_df, hide_index=True, use_container_width=True)
+            st.dataframe(products_df, hide_index=True, width="stretch")
     with st.expander("Προϊόντα που προκύπτουν από τις κινήσεις", expanded=False):
         if inferred_products:
-            st.dataframe(pd.DataFrame(inferred_products), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(inferred_products), hide_index=True, width="stretch")
         else:
             st.info("Δεν υπάρχουν αρκετές κινήσεις για να προκύψει μητρώο προϊόντων.")
 
