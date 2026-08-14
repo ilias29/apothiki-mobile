@@ -10,6 +10,11 @@ st.caption(
     "Η ποσότητα βγαίνει από επιμέρους ορατές ομάδες, όχι από ένα μαγικό νούμερο. "
     "Έτσι εντοπίζεται αμέσως διπλομέτρηση ή χαμένο κουτί."
 )
+st.info(
+    "Για την κανονική ροή: ανέβασε τις φωτογραφίες στη συνομιλία, πάρε CSV/XLSX από ChatGPT "
+    "και φόρτωσέ το στην κύρια εφαρμογή → Φωτογραφία αποθέματος. "
+    "Η σελίδα αυτή παραμένει ως χειροκίνητη εναλλακτική καταμέτρησης."
+)
 
 COUNT_COLUMNS = [
     "ProductName",
@@ -66,7 +71,7 @@ photo = st.file_uploader(
     help="Η φωτογραφία μένει μόνο στη συνεδρία και χρησιμοποιείται ως οπτική αναφορά.",
 )
 if photo is not None:
-    st.image(photo, caption="Φωτογραφία αναφοράς", use_container_width=True)
+    st.image(photo, caption="Φωτογραφία αναφοράς", width="stretch")
 
 st.subheader("Καταμέτρηση ανά ορατή περιοχή")
 st.info(
@@ -78,7 +83,7 @@ edited = st.data_editor(
     st.session_state.photo_count_rows,
     key="photo_count_editor",
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     column_config={
         "ProductName": st.column_config.TextColumn("Προϊόν", required=False, width="large"),
@@ -100,17 +105,17 @@ st.session_state.photo_count_rows = normalized
 
 left, middle, right = st.columns(3)
 with left:
-    if st.button("🔄 Υπολογισμός συνόλων", type="primary", use_container_width=True):
+    if st.button("🔄 Υπολογισμός συνόλων", type="primary", width="stretch"):
         st.session_state.photo_count_rows = normalized
         st.rerun()
 with middle:
-    if st.button("➕ 10 κενές γραμμές", use_container_width=True):
+    if st.button("➕ 10 κενές γραμμές", width="stretch"):
         st.session_state.photo_count_rows = pd.concat(
             [normalized, blank_rows(10)], ignore_index=True
         )
         st.rerun()
 with right:
-    if st.button("🧹 Καθαρισμός", use_container_width=True):
+    if st.button("🧹 Καθαρισμός", width="stretch"):
         st.session_state.photo_count_rows = blank_rows()
         st.rerun()
 
@@ -124,7 +129,7 @@ if not valid.empty:
             "Υπάρχουν διπλές γραμμές για το ίδιο προϊόν/περιεκτικότητα. "
             "Ένωσέ τες πριν από το import, αλλιώς η ανθρωπότητα θα εφεύρει άλλη μία διπλοεγγραφή."
         )
-        st.dataframe(valid.loc[duplicate_mask], use_container_width=True, hide_index=True)
+        st.dataframe(valid.loc[duplicate_mask], width="stretch", hide_index=True)
 
     zero_rows = valid[valid["TotalQuantity"].eq(0)]
     if not zero_rows.empty:
@@ -144,7 +149,7 @@ if not valid.empty:
         "Confidence",
         "Notes",
     ]
-    st.dataframe(valid[audit_columns], use_container_width=True, hide_index=True)
+    st.dataframe(valid[audit_columns], width="stretch", hide_index=True)
 
     import_df = pd.DataFrame(
         {
@@ -172,7 +177,7 @@ if not valid.empty:
         data=csv_bytes,
         file_name=filename,
         mime="text/csv",
-        use_container_width=True,
+        width="stretch",
     )
 else:
     st.caption("Συμπλήρωσε τουλάχιστον ένα προϊόν για να δημιουργηθεί αρχείο import.")
