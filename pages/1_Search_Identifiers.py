@@ -161,10 +161,10 @@ if clean(query):
         st.warning("Δεν βρέθηκε ενεργό stock με αυτό το στοιχείο.")
     else:
         st.success(f"Βρέθηκαν {len(summary)} γραμμές stock.")
-        st.dataframe(summary, hide_index=True, use_container_width=True)
+        st.dataframe(summary, hide_index=True, width="stretch")
     with st.expander(f"Κινήσεις που συνδέονται με το αποτέλεσμα ({len(matches)})", expanded=False):
         display = ["Προϊόν", "Barcode", "GTIN", "PCCode", "SerialNumber", "ExpiryDate", "LotNumber", "Τοποθεσία", "DeltaQty", "Timestamp"]
-        st.dataframe(matches[display] if not matches.empty else pd.DataFrame(columns=display), hide_index=True, use_container_width=True)
+        st.dataframe(matches[display] if not matches.empty else pd.DataFrame(columns=display), hide_index=True, width="stretch")
 
 st.divider()
 st.subheader("Συμπλήρωση PC / SN χωρίς νέα κίνηση stock")
@@ -184,7 +184,7 @@ with st.form("identifier_form", clear_on_submit=True):
         expiry = st.text_input("Λήξη")
         location_label = st.selectbox("Τοποθεσία αναφοράς", [f"{key} - {value}" for key, value in LOCATIONS.items()], index=2)
     confirm = st.checkbox("Επιβεβαιώνω ότι τα αναγνωριστικά αντιστοιχούν σε αυτό το προϊόν")
-    submitted = st.form_submit_button("💾 Αποθήκευση αναγνωριστικών", use_container_width=True)
+    submitted = st.form_submit_button("💾 Αποθήκευση αναγνωριστικών", width="stretch")
 
 if submitted:
     try:
@@ -206,11 +206,11 @@ st.divider()
 st.subheader("Product Master")
 try:
     c1, c2 = st.columns(2)
-    if c1.button("Δημιουργία / έλεγχος φύλλων", use_container_width=True):
+    if c1.button("Δημιουργία / έλεγχος φύλλων", width="stretch"):
         base_db.ensure_base_sheets(core)
         st.success("Τα φύλλα βάσης είναι έτοιμα.")
         st.rerun()
-    if c2.button("Συγχρονισμός από όλες τις κινήσεις", use_container_width=True):
+    if c2.button("Συγχρονισμός από όλες τις κινήσεις", width="stretch"):
         result = base_db.sync_products_from_transactions(core, data)
         st.success(f"Νέα: {result['added']}, ενημερωμένα: {result['updated']}, νέα SN/PC: {result['packages_added']}.")
         st.rerun()
@@ -220,8 +220,8 @@ try:
         display_products = products[contains_mask(products, ["ProductName", "Brand", "Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC", "DataMatrix_SN", "Strength"], query)] if not products.empty else products
         display_packages = packages[contains_mask(packages, ["PC_GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "ProductId"], query)] if not packages.empty else packages
     with st.expander(f"Προϊόντα ({len(display_products)})", expanded=True):
-        st.dataframe(display_products, hide_index=True, use_container_width=True)
+        st.dataframe(display_products, hide_index=True, width="stretch")
     with st.expander(f"Αναγνωριστικά συσκευασιών ({len(display_packages)})", expanded=False):
-        st.dataframe(display_packages, hide_index=True, use_container_width=True)
+        st.dataframe(display_packages, hide_index=True, width="stretch")
 except Exception as exc:
     st.error(f"Δεν φορτώθηκε η βάση προϊόντων: {exc}")
