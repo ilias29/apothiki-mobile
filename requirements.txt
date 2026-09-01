@@ -9,5 +9,5 @@ pyzbar
 pytesseract
 numpy
 pytest
-
 requests
+openai>=1.0.0
