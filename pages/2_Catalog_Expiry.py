@@ -238,7 +238,7 @@ def make_transaction(row: pd.Series, location_id: int, transaction_id: str) -> d
 def save_stock(rows: pd.DataFrame, location_id: int, batch_id: str) -> tuple[int, int]:
     ws = core.worksheet()
     headers, _ = core.initialize_schema(ws)
-    data, _ = core.load_data_cached(ws, force=True)
+    data, _ = core.load_data_cached(ws, ttl_seconds=0)
     existing_ids = set(data["TransactionId"].astype(str)) if not data.empty else set()
     payload = []
     skipped = 0
@@ -260,7 +260,7 @@ def save_stock(rows: pd.DataFrame, location_id: int, batch_id: str) -> tuple[int
 
 
 def active_stock() -> pd.DataFrame:
-    data, _ = core.load_data_cached(core.worksheet(), force=True)
+    data, _ = core.load_data_cached(core.worksheet(), ttl_seconds=0)
     if data.empty:
         return pd.DataFrame()
     frame = data[~data["Voided"].astype(str).str.lower().isin(TRUE_VALUES)].copy()
