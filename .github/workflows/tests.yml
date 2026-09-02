@@ -26,7 +26,6 @@ jobs:
           inventory_csa.py
           ai_inventory.py
           pages/1_Search_Identifiers.py
-          'pages/3_🤖_AI_Αποθήκη.py'
-          'pages/4_💊_Pharmacy_CSA.py'
+          pages/2_Catalog_Expiry.py
       - name: Test
         run: pytest -q
