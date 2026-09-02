@@ -18,6 +18,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile
-        run: python -m py_compile app_inventory_search.py app_inventory_stable.py inventory_base.py pages/1_Search_Identifiers.py
+        run: >-
+          python -m py_compile
+          app_inventory_search.py
+          app_inventory_stable.py
+          inventory_base.py
+          inventory_csa.py
+          ai_inventory.py
+          pages/1_Search_Identifiers.py
+          'pages/3_🤖_AI_Αποθήκη.py'
+          'pages/4_💊_Pharmacy_CSA.py'
       - name: Test
         run: pytest -q
