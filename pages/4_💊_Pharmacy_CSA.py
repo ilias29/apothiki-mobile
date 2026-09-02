@@ -85,10 +85,7 @@ with receipt_tab:
                 )
             st.session_state["csa_receipt_rows"] = csa.normalize_ai_items(result.get("items", []), default_vat)
             st.session_state["csa_receipt_warnings"] = result.get("warnings", [])
-            st.session_state["csa_receipt_seed"] = csa.batch_seed(
-                [image["bytes"] for image in images],
-                f"{supplier}|{reference}|{document_date.isoformat()}" if csa.clean(reference) else "",
-            )
+            st.session_state["csa_receipt_seed"] = csa.batch_seed([image["bytes"] for image in images], f"{supplier}|{reference}|{document_date.isoformat()}" if csa.clean(reference) else "")
         except Exception as exc:
             st.error(f"Αποτυχία ανάλυσης: {exc}")
 
@@ -224,27 +221,12 @@ with issue_tab:
             chosen_out = issue_edited[issue_edited["confirm"] == True].copy()
             if st.button("➖ Επιβεβαίωση και αφαίρεση", type="primary", disabled=chosen_out.empty, width="stretch"):
                 try:
-                    all_txs = []
-                    errors = []
-                    for _, item in chosen_out.iterrows():
-                        candidates = csa.match_ai_item_to_summary(summary, item)
-                        distinct = candidates[["CodeType", "CodeValue", "LocationId"]].drop_duplicates() if not candidates.empty else candidates
-                        if candidates.empty:
-                            errors.append(f"Δεν βρέθηκε στο stock: {csa.clean(item.get('ProductName')) or csa.clean(item.get('BarcodeOrGTIN'))}")
-                            continue
-                        if len(distinct) != 1:
-                            errors.append(f"Αμφίβολη αντιστοίχιση: {csa.clean(item.get('ProductName'))}. Βάλε barcode ή κάνε χειροκίνητη έξοδο.")
-                            continue
-                        selected = candidates.iloc[0]
-                        qty = int(item.get("Quantity", 0))
-                        prefix = "csa-ai-out-" + uuid.uuid4().hex[:18]
-                        all_txs.extend(csa.fefo_issue_transactions(
-                            snapshot,
-                            selected,
-                            quantity=qty,
-                            note="source=CSA_AI_OUT; " + csa.clean(item.get("Notes")),
-                            transaction_prefix=prefix,
-                        ))
+                    all_txs, errors = csa.ai_issue_transactions(
+                        snapshot,
+                        summary,
+                        chosen_out,
+                        note_prefix="source=CSA_AI_OUT",
+                    )
                     if errors:
                         st.error("\n".join(errors))
                     if all_txs:
