@@ -66,12 +66,29 @@ Keep long identifiers as strings, preserving leading zeroes.
 Default VAT is {default_vat}% only when a price is present and the VAT is not visible; mention this assumption in Notes.
 Quantity must be the count you can justify from the image. If uncertain, set Confidence to low and explain in Notes.
 Do not treat a serial number as a product-level identifier. One serial number represents one physical pack.
+Do not infer values from typical pharmacy pricing, package sizes, or prior knowledge when they are not visible.
 """
     if mode == "Φάρμακο / DataMatrix":
         return common + """
 Focus on medicine pack traceability. Extract GTIN, LOT, EXP and SN when visible, and raw DataMatrix/QR content only if actually readable.
 If GTIN is extracted from a machine-readable code, also place it in BarcodeOrGTIN.
 For a row with a SerialNumber, Quantity must be 1.
+"""
+    if mode == "Τιμολόγιο / παραλαβή":
+        return common + """
+The image is a pharmacy supplier invoice, delivery note, order-receipt screen, or computer screen showing invoice rows.
+Create one item per actual product line. Quantity means the delivered/received quantity on that line, not pack size, unit price, discount, line number, or tax rate.
+Prefer the clearly labelled delivered/invoiced quantity when several numeric columns exist. If the quantity column is ambiguous, set Quantity to null, Confidence to low, and explain why in Notes.
+Extract barcode/GTIN only when it is visibly tied to that row. Preserve product strength and dosage form when visible.
+Ignore totals, subtotals, VAT summary rows, payment lines, headers, footers, and non-product service rows.
+If a line is repeated on another photo because pages overlap, include it only once when you can confidently identify the duplicate; otherwise warn about the possible duplicate.
+"""
+    if mode == "Έξοδος / πωλήσεις":
+        return common + """
+The image is a list or screen of pharmacy items that were sold, dispensed, transferred out, or otherwise left stock.
+Create one item per visible product row. Quantity means the quantity that left stock. Do not infer hidden sales or cumulative totals.
+Prioritize barcode/GTIN when visible because it is used for exact stock matching. If product identity is ambiguous, keep Confidence low and explain in Notes.
+Ignore money totals, discounts, payment fields, customer information, and rows that are not products.
 """
     if mode == "Συγκεντρωτικό / τιμοκατάλογος":
         return common + """
@@ -91,7 +108,7 @@ def analyze_images(
     api_key: str,
     mode: str,
     default_vat: float = 24.0,
-    model: str = "gpt-5.6-sol",
+    model: str = "gpt-5.6-terra",
 ) -> dict[str, Any]:
     if not api_key:
         raise ValueError("Λείπει το OPENAI_API_KEY από τα Streamlit Secrets.")
@@ -110,6 +127,9 @@ def analyze_images(
             "image_url": _data_url(data, image.get("name", "image.jpg"), image.get("type", "")),
             "detail": "high",
         })
+
+    if len(content) == 1:
+        raise ValueError("Οι εικόνες είναι κενές ή δεν διαβάστηκαν.")
 
     client = OpenAI(api_key=api_key)
     response = client.responses.create(
