@@ -307,6 +307,58 @@ def fefo_issue_transactions(
     return txs
 
 
+def ai_issue_transactions(
+    snapshot: pd.DataFrame,
+    summary: pd.DataFrame,
+    rows: pd.DataFrame,
+    *,
+    note_prefix: str = "source=CSA_AI_OUT",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    requests: dict[tuple[str, str, int], dict[str, Any]] = {}
+    errors: list[str] = []
+    for _, item in rows.iterrows():
+        qty = int(item.get("Quantity", 0))
+        if qty <= 0:
+            errors.append(f"Μη έγκυρη ποσότητα για {clean(item.get('ProductName')) or clean(item.get('BarcodeOrGTIN'))}.")
+            continue
+        candidates = match_ai_item_to_summary(summary, item)
+        if candidates.empty:
+            errors.append(f"Δεν βρέθηκε στο stock: {clean(item.get('ProductName')) or clean(item.get('BarcodeOrGTIN'))}")
+            continue
+        distinct = candidates[["CodeType", "CodeValue", "LocationId"]].drop_duplicates()
+        if len(distinct) != 1:
+            errors.append(f"Αμφίβολη αντιστοίχιση: {clean(item.get('ProductName'))}. Βάλε barcode ή κάνε χειροκίνητη έξοδο.")
+            continue
+        selected = candidates.iloc[0]
+        key = (clean(selected["CodeType"]), clean(selected["CodeValue"]), int(selected["LocationId"]))
+        if key not in requests:
+            requests[key] = {"selected": selected, "quantity": 0, "notes": []}
+        requests[key]["quantity"] += qty
+        if clean(item.get("Notes")):
+            requests[key]["notes"].append(clean(item.get("Notes")))
+
+    all_txs: list[dict[str, Any]] = []
+    for idx, request in enumerate(requests.values(), start=1):
+        selected = request["selected"]
+        note = note_prefix
+        if request["notes"]:
+            note += "; " + " | ".join(request["notes"])
+        prefix = "csa-ai-out-" + hashlib.sha256(
+            f"{datetime.now().isoformat()}|{idx}|{selected['CodeType']}|{selected['CodeValue']}|{selected['LocationId']}".encode("utf-8")
+        ).hexdigest()[:18]
+        try:
+            all_txs.extend(fefo_issue_transactions(
+                snapshot,
+                selected,
+                quantity=int(request["quantity"]),
+                note=note,
+                transaction_prefix=prefix,
+            ))
+        except Exception as exc:
+            errors.append(f"{clean(selected.get('Προϊόν'))}: {exc}")
+    return all_txs, errors
+
+
 def batch_seed(image_bytes: list[bytes], reference: str = "") -> str:
     digest = hashlib.sha256()
     ref = clean(reference)
