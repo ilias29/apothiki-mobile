@@ -267,9 +267,13 @@ def fefo_issue_transactions(
     if qty <= 0:
         raise ValueError("Η ποσότητα εξόδου πρέπει να είναι μεγαλύτερη από 0.")
     lots = matching_lots(snapshot, product_row)
+    if not lots.empty:
+        expiry = pd.to_datetime(lots["ExpiryDate"], errors="coerce")
+        today = pd.Timestamp.now().normalize()
+        lots = lots[expiry.isna() | (expiry >= today)].copy()
     available = int(pd.to_numeric(lots.get("Stock", pd.Series(dtype=int)), errors="coerce").fillna(0).sum())
     if available < qty:
-        raise core.InventoryError(f"Δεν υπάρχει αρκετό stock. Διαθέσιμα: {available}, ζητήθηκαν: {qty}.")
+        raise core.InventoryError(f"Δεν υπάρχει αρκετό μη ληγμένο stock. Διαθέσιμα: {available}, ζητήθηκαν: {qty}.")
     lots = lots.copy()
     lots["_expiry"] = pd.to_datetime(lots["ExpiryDate"], errors="coerce").fillna(pd.Timestamp.max)
     lots = lots.sort_values(["_expiry", "LotNumber", "SerialNumber"]).drop(columns=["_expiry"])
