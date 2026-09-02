@@ -9,6 +9,16 @@ from openai import OpenAI
 ITEM_SCHEMA = {
     "type": "object",
     "properties": {
+        "document": {
+            "type": "object",
+            "properties": {
+                "Supplier": {"type": "string"},
+                "DocumentNumber": {"type": "string"},
+                "DocumentDate": {"type": "string"},
+            },
+            "required": ["Supplier", "DocumentNumber", "DocumentDate"],
+            "additionalProperties": False,
+        },
         "items": {
             "type": "array",
             "items": {
@@ -45,7 +55,7 @@ ITEM_SCHEMA = {
         },
         "warnings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["items", "warnings"],
+    "required": ["document", "items", "warnings"],
     "additionalProperties": False,
 }
 
@@ -59,27 +69,34 @@ def _data_url(file_bytes: bytes, filename: str = "image.jpg", mime_type: str = "
 def _instructions(mode: str, default_vat: float) -> str:
     common = f"""
 You extract pharmacy inventory data from images. Return only data supported by visible evidence.
-Never invent a barcode, GTIN, lot, expiry, serial number, product name, price, or quantity.
+Never invent a barcode, GTIN, lot, expiry, serial number, product name, price, quantity, supplier, document number, or date.
 If a field is unreadable or absent, return an empty string or null.
-Use ISO date YYYY-MM-DD when a full expiry date is visible. If only MM/YYYY is visible, use the last day of that month.
+Use ISO date YYYY-MM-DD for document dates and full expiry dates. If only MM/YYYY is visible for expiry, use the last day of that month.
 Keep long identifiers as strings, preserving leading zeroes.
 Default VAT is {default_vat}% only when a price is present and the VAT is not visible; mention this assumption in Notes.
 Quantity must be the count you can justify from the image. If uncertain, set Confidence to low and explain in Notes.
 Do not treat a serial number as a product-level identifier. One serial number represents one physical pack.
 Do not infer values from typical pharmacy pricing, package sizes, or prior knowledge when they are not visible.
+For pharmacy stock control, quantity, document date, expiry date, lot number and exact product identity are more important than prices.
 """
     if mode == "Φάρμακο / DataMatrix":
         return common + """
 Focus on medicine pack traceability. Extract GTIN, LOT, EXP and SN when visible, and raw DataMatrix/QR content only if actually readable.
 If GTIN is extracted from a machine-readable code, also place it in BarcodeOrGTIN.
 For a row with a SerialNumber, Quantity must be 1.
+Return blank document metadata unless it is actually visible.
 """
     if mode == "Τιμολόγιο / παραλαβή":
         return common + """
 The image is a pharmacy supplier invoice, delivery note, order-receipt screen, or computer screen showing invoice rows.
-Create one item per actual product line. Quantity means the delivered/received quantity on that line, not pack size, unit price, discount, line number, or tax rate.
+First extract document metadata when visible: Supplier, DocumentNumber and DocumentDate.
+Create one item per actual product line.
+TOP PRIORITY for each line: ProductName, Quantity, ExpiryDate, LotNumber, BarcodeOrGTIN/GTIN, Strength and DosageForm.
+Quantity means the delivered/received quantity on that line, not pack size, unit price, discount, line number, or tax rate.
 Prefer the clearly labelled delivered/invoiced quantity when several numeric columns exist. If the quantity column is ambiguous, set Quantity to null, Confidence to low, and explain why in Notes.
-Extract barcode/GTIN only when it is visibly tied to that row. Preserve product strength and dosage form when visible.
+Extract expiry and lot whenever they are visibly tied to the product line, even if prices are unreadable.
+Prices are secondary. If price columns are unclear, leave NetPrice/GrossPrice null rather than spending confidence on guessing them.
+Extract barcode/GTIN only when it is visibly tied to that row.
 Ignore totals, subtotals, VAT summary rows, payment lines, headers, footers, and non-product service rows.
 If a line is repeated on another photo because pages overlap, include it only once when you can confidently identify the duplicate; otherwise warn about the possible duplicate.
 """
@@ -89,16 +106,19 @@ The image is a list or screen of pharmacy items that were sold, dispensed, trans
 Create one item per visible product row. Quantity means the quantity that left stock. Do not infer hidden sales or cumulative totals.
 Prioritize barcode/GTIN when visible because it is used for exact stock matching. If product identity is ambiguous, keep Confidence low and explain in Notes.
 Ignore money totals, discounts, payment fields, customer information, and rows that are not products.
+Return document metadata only if clearly visible.
 """
     if mode == "Συγκεντρωτικό / τιμοκατάλογος":
         return common + """
 The image is a supplier summary, price list, invoice-like table, or handwritten/printed inventory list.
-Create one item per visible product row. Prioritize ProductName, Brand, BarcodeOrGTIN, Quantity and prices.
-If only a gross price is visible, put it in GrossPrice. If only a net price is clearly labeled, put it in NetPrice.
+Create one item per visible product row. Prioritize ProductName, Brand, BarcodeOrGTIN, Quantity, ExpiryDate and LotNumber.
+Prices are secondary. If only a gross price is visible, put it in GrossPrice. If only a net price is clearly labeled, put it in NetPrice.
+Return document metadata only if clearly visible.
 """
     return common + """
 The image shows shelves, drawers, or stock. Create one item per distinguishable product and estimate only clearly visible quantities.
 Do not infer hidden boxes. Prefer a lower quantity with a low-confidence note over an invented total.
+Return document metadata only if clearly visible.
 """
 
 
@@ -154,4 +174,6 @@ def analyze_images(
         raise ValueError("Το AI επέστρεψε μη έγκυρο JSON.") from exc
     if not isinstance(result, dict) or not isinstance(result.get("items"), list):
         raise ValueError("Το αποτέλεσμα του AI δεν έχει την αναμενόμενη μορφή.")
+    if not isinstance(result.get("document"), dict):
+        result["document"] = {"Supplier": "", "DocumentNumber": "", "DocumentDate": ""}
     return result
