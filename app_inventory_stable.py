@@ -28,6 +28,15 @@ def clean(value: Any) -> str:
     return str(value).strip()
 
 
+def configured_openai_model() -> str:
+    model = clean(st.secrets.get("OPENAI_MODEL", "gpt-4.1-mini"))
+    # Old setup instructions used an internal Codex model name that the API
+    # cannot serve. Repair that stale secret automatically.
+    if model in {"gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"}:
+        return "gpt-4.1-mini"
+    return model or "gpt-4.1-mini"
+
+
 @st.cache_resource(show_spinner=False)
 def ensure_storage_once() -> bool:
     """Initialize the Google Sheets structure only once per app process."""
@@ -135,7 +144,7 @@ def detect_barcode_from_camera(upload) -> str:
         value = clean(parsed.get("gtin")) or value
     if not value:
         api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
-        model = clean(st.secrets.get("OPENAI_MODEL", "gpt-5.6-terra"))
+        model = configured_openai_model()
         if api_key:
             try:
                 fallback = ai_inventory.read_barcode_digits(
@@ -160,6 +169,11 @@ def detect_barcode_from_camera(upload) -> str:
                     }
             except Exception as exc:
                 debug["ai_digit_fallback"] = {"accepted": False, "error": str(exc)}
+        else:
+            debug["ai_digit_fallback"] = {
+                "accepted": False,
+                "reason": "missing_openai_api_key",
+            }
     st.session_state["scan_debug"] = debug
     return value
 
@@ -247,7 +261,13 @@ def scan_tab() -> None:
                 st.session_state["active_barcode"] = detected
                 st.session_state.pop("lookup_candidates", None)
             else:
-                st.error("Δεν διαβάστηκε barcode από τη φωτογραφία. Δοκίμασε πιο κοντά ή γράψ' το χειροκίνητα.")
+                fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
+                if fallback.get("reason") == "missing_openai_api_key":
+                    st.error("Δεν διαβάστηκε barcode και λείπει το OPENAI_API_KEY από τα Streamlit Secrets.")
+                elif fallback.get("error"):
+                    st.error("Δεν διαβάστηκε barcode και απέτυχε η εφεδρική ανάγνωση εικόνας. Έλεγξε το API key/model στα Secrets.")
+                else:
+                    st.error("Δεν διαβάστηκε barcode από τη φωτογραφία. Γράψ' το χειροκίνητα.")
 
     manual_code = st.text_input(
         "ή γράψε το barcode",
@@ -389,7 +409,7 @@ def invoice_tab() -> None:
 
     if method == "Φωτογραφία τιμολογίου":
         api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
-        model = clean(st.secrets.get("OPENAI_MODEL", "gpt-5.6-terra"))
+        model = configured_openai_model()
         uploads = st.file_uploader(
             "Φωτογραφίες τιμολογίου",
             type=["jpg", "jpeg", "png", "webp"],
