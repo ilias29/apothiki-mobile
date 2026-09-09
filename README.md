@@ -55,6 +55,7 @@ OPENAI_MODEL = "gpt-4.1-mini"
 
 ## Λειτουργίες
 
+- Ζωντανός scanner κάμερας για EAN/barcodes χωρίς OpenAI API
 - Barcode και QR detection
 - Fallback με `PCCode` και `SerialNumber` όταν δεν διαβάζεται το QR
 - Τα PC και SN είναι προαιρετικά μεμονωμένα: αρκεί να υπάρχει ένα από τα δύο
