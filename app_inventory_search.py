@@ -50,7 +50,9 @@ GREEK_PROVIDER_CACHE_TTL_SECONDS = 600
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 0
 MAX_BACK_EXPIRY_OCR_CALLS = 4
-MAX_BARCODE_DECODER_ATTEMPTS = 120
+# One rotation needs up to 6 crops x 7 variants x 3 decoders. Keep enough
+# room for the 90-degree pass used by portrait phone photos.
+MAX_BARCODE_DECODER_ATTEMPTS = 280
 MIN_VALID_EXPIRY_YEAR = 2020
 DEFAULT_STOCK_ADD_QUANTITY = 1
 
@@ -1044,7 +1046,12 @@ def barcode_rotations(image: np.ndarray) -> list[tuple[int, np.ndarray]]:
 
 
 def classify_pyzbar_type(kind: str) -> str:
-    mapping = {"QRCODE": "QR", "DATAMATRIX": "DataMatrix", "EAN13": "EAN-13", "EAN8": "EAN-8", "CODE128": "CODE128"}
+    mapping = {
+        "QRCODE": "QR", "DATAMATRIX": "DataMatrix",
+        "EAN13": "EAN-13", "EAN_13": "EAN-13",
+        "EAN8": "EAN-8", "EAN_8": "EAN-8",
+        "CODE128": "CODE128", "CODE_128": "CODE128",
+    }
     return mapping.get(kind, "Other")
 
 
@@ -1103,6 +1110,38 @@ def decode_with_pyzbar(image: np.ndarray) -> list[tuple[str, str, str]]:
         value = raw.strip()
         if value:
             values.append((classify_pyzbar_type(item.type), value, item.type))
+    return values
+
+
+def decode_with_opencv_barcode(image: np.ndarray) -> list[tuple[str, str, str]]:
+    """Decode barcodes across both the OpenCV 4.x and 5.x return formats."""
+    detector = cv2.barcode.BarcodeDetector()
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if image.ndim == 3 else image
+    result = detector.detectAndDecode(bgr)
+    if not isinstance(result, tuple):
+        return []
+    if len(result) == 4:
+        ok, decoded_values, decoded_types, _points = result
+        if not ok:
+            return []
+    elif len(result) == 3:
+        decoded_values, decoded_types, _points = result
+    else:
+        return []
+
+    if isinstance(decoded_values, str):
+        decoded_values = [decoded_values]
+    if isinstance(decoded_types, str):
+        decoded_types = [decoded_types]
+    decoded_types = list(decoded_types or [])
+
+    values = []
+    for index, raw_value in enumerate(decoded_values or []):
+        value = clean(raw_value)
+        if not value:
+            continue
+        raw_type = clean(decoded_types[index]) if index < len(decoded_types) else "opencv"
+        values.append((classify_pyzbar_type(raw_type), value, raw_type or "opencv"))
     return values
 
 
@@ -1200,11 +1239,7 @@ def detect_code(front=None, back=None) -> tuple[str, str, dict[str, Any]]:
                             if decoder_name == "pyzbar":
                                 values = decode_with_pyzbar(variant)
                             elif decoder_name == "opencv_barcode":
-                                detector = cv2.barcode.BarcodeDetector()
-                                bgr = cv2.cvtColor(variant, cv2.COLOR_RGB2BGR) if variant.ndim == 3 else variant
-                                ok, decoded_values, _, _ = detector.detectAndDecode(bgr)
-                                if ok and decoded_values is not None:
-                                    values = [("Barcode" if clean(v).isdigit() else "Other", clean(v), "opencv") for v in decoded_values if clean(v)]
+                                values = decode_with_opencv_barcode(variant)
                             else:
                                 value, _, _ = cv2.QRCodeDetector().detectAndDecode(variant)
                                 values = [("QR", clean(value), "opencv_qr")] if clean(value) else []

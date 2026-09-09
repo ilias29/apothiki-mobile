@@ -362,6 +362,24 @@ def test_barcode_candidate_prefers_valid_ean13_and_preserves_digits():
     assert selection["selected"]["checksum"] == "valid"
 
 
+def test_opencv_barcode_decoder_accepts_three_value_api(monkeypatch):
+    class FakeDetector:
+        def detectAndDecode(self, _image):
+            return (["5206087700016"], ["EAN_13"], None)
+
+    monkeypatch.setattr(app.cv2.barcode, "BarcodeDetector", lambda: FakeDetector())
+    image = app.np.zeros((20, 40, 3), dtype=app.np.uint8)
+
+    assert app.decode_with_opencv_barcode(image) == [
+        ("EAN-13", "5206087700016", "EAN_13")
+    ]
+
+
+def test_barcode_attempt_budget_reaches_portrait_rotation():
+    attempts_per_rotation = 6 * 7 * 3
+    assert app.MAX_BARCODE_DECODER_ATTEMPTS > attempts_per_rotation
+
+
 def test_search_includes_gtin_lot_and_raw_datamatrix():
     row = base_row(
         GTIN="01234567890128",
