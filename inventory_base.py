@@ -142,11 +142,6 @@ def product_id(
     dosage_form: str = "",
     pc_gtin: str = "",
 ) -> str:
-    """Create an initial internal id that does not change when identifiers are added later.
-
-    Named products use name + strength + dosage form. Identifiers are only a fallback
-    when no product name exists. Existing ProductId values are always preserved on update.
-    """
     name_key = normalized_product_key(product_name, strength, dosage_form)
     if name_key[0]:
         seed = ("name", *name_key)
@@ -188,10 +183,15 @@ def ensure_worksheet(core, sheet_name: str, columns: list[str]):
 
 
 def ensure_base_sheets(core) -> dict[str, int]:
+    """Ensure helper sheets exist without reading their full contents.
+
+    The old implementation called get_all_records() for every helper sheet on every
+    Streamlit rerun, which could exhaust the Google Sheets per-minute read quota.
+    """
     sizes = {}
     for sheet_name, columns in SHEET_SCHEMAS.items():
-        ws = ensure_worksheet(core, sheet_name, columns)
-        sizes[sheet_name] = len(ws.get_all_records())
+        ensure_worksheet(core, sheet_name, columns)
+        sizes[sheet_name] = 0
     return sizes
 
 
