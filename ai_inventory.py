@@ -79,6 +79,17 @@ Do not treat a serial number as a product-level identifier. One serial number re
 Do not infer values from typical pharmacy pricing, package sizes, or prior knowledge when they are not visible.
 For pharmacy stock control, quantity, document date, expiry date, lot number and exact product identity are more important than prices.
 """
+    if mode == "Όνομα προϊόντος":
+        return common + """
+The image is a close photo of the front face or label of ONE pharmacy product.
+Return at most one item.
+Your only goal is to transcribe the visible product identity accurately.
+Prioritize ProductName, Brand, Strength and DosageForm/package wording exactly as visibly supported.
+Do not infer the product from appearance, logo style, packaging color, prior knowledge, or likely brand conventions.
+Do not invent a barcode or GTIN if it is not visibly readable in this same photo.
+Set Quantity to null. Leave prices, lot, expiry, serial and document metadata blank/null unless they are explicitly visible and unambiguous.
+If the name is partially unreadable, keep only the readable part and set Confidence to low with a short explanation in Notes.
+"""
     if mode == "Φάρμακο / DataMatrix":
         return common + """
 Focus on medicine pack traceability. Extract GTIN, LOT, EXP and SN when visible, and raw DataMatrix/QR content only if actually readable.
