@@ -5,6 +5,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+try:
+    from streamlit_qrcode_scanner import qrcode_scanner
+except Exception:
+    qrcode_scanner = None
+
 import ai_inventory
 import app_inventory_search as core
 import inventory_base as base_db
@@ -178,6 +183,12 @@ def detect_barcode_from_camera(upload) -> str:
     return value
 
 
+def validated_live_barcode(raw_value: Any) -> str:
+    value = clean(raw_value).replace(" ", "")
+    candidate = core.classify_barcode_value("Barcode", value)
+    return value if candidate.get("valid") else ""
+
+
 def _clear_scan_state() -> None:
     for key in [
         "active_barcode",
@@ -246,28 +257,50 @@ def scan_tab() -> None:
     st.subheader("📷 Σκανάρισμα barcode")
     st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
 
-    camera = st.camera_input(
-        "Φωτογράφισε το barcode",
-        key="barcode_camera",
-        help="Κράτα το barcode καθαρό και σχετικά κοντά στην κάμερα.",
+    scan_method = st.segmented_control(
+        "Τρόπος σάρωσης",
+        ["Ζωντανός scanner", "Φωτογραφία"],
+        default="Ζωντανός scanner",
+        key="barcode_scan_method",
     )
-    if camera is not None:
-        camera_hash = hashlib.sha256(camera.getvalue()).hexdigest()
-        if st.session_state.get("last_camera_hash") != camera_hash:
-            with st.spinner("Διαβάζω barcode..."):
-                detected = detect_barcode_from_camera(camera)
-            st.session_state["last_camera_hash"] = camera_hash
-            if detected:
-                st.session_state["active_barcode"] = detected
-                st.session_state.pop("lookup_candidates", None)
-            else:
-                fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
-                if fallback.get("reason") == "missing_openai_api_key":
-                    st.error("Δεν διαβάστηκε barcode και λείπει το OPENAI_API_KEY από τα Streamlit Secrets.")
-                elif fallback.get("error"):
-                    st.error("Δεν διαβάστηκε barcode και απέτυχε η εφεδρική ανάγνωση εικόνας. Έλεγξε το API key/model στα Secrets.")
+
+    if scan_method == "Ζωντανός scanner":
+        st.caption("Στόχευσε τις γραμμές του barcode. Η κάμερα το διαβάζει ζωντανά χωρίς API.")
+        if qrcode_scanner is None:
+            st.error("Ο ζωντανός scanner δεν εγκαταστάθηκε. Επίλεξε Φωτογραφία.")
+        else:
+            live_value = qrcode_scanner(key="live_barcode_scanner")
+            if live_value:
+                detected = validated_live_barcode(live_value)
+                if detected:
+                    st.session_state["active_barcode"] = detected
+                    st.session_state.pop("lookup_candidates", None)
+                    st.success(f"Διαβάστηκε: {detected}")
                 else:
-                    st.error("Δεν διαβάστηκε barcode από τη φωτογραφία. Γράψ' το χειροκίνητα.")
+                    st.warning("Διαβάστηκε κωδικός αλλά απέτυχε ο έλεγχος εγκυρότητας. Ξαναστόχευσε.")
+    else:
+        camera = st.camera_input(
+            "Φωτογράφισε το barcode",
+            key="barcode_camera",
+            help="Κράτα το barcode καθαρό και σχετικά κοντά στην κάμερα.",
+        )
+        if camera is not None:
+            camera_hash = hashlib.sha256(camera.getvalue()).hexdigest()
+            if st.session_state.get("last_camera_hash") != camera_hash:
+                with st.spinner("Διαβάζω barcode..."):
+                    detected = detect_barcode_from_camera(camera)
+                st.session_state["last_camera_hash"] = camera_hash
+                if detected:
+                    st.session_state["active_barcode"] = detected
+                    st.session_state.pop("lookup_candidates", None)
+                else:
+                    fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
+                    if fallback.get("reason") == "missing_openai_api_key":
+                        st.error("Δεν διαβάστηκε barcode και λείπει το OPENAI_API_KEY από τα Streamlit Secrets.")
+                    elif fallback.get("error"):
+                        st.error("Δεν διαβάστηκε barcode και απέτυχε η εφεδρική ανάγνωση εικόνας. Έλεγξε το API key/model στα Secrets.")
+                    else:
+                        st.error("Δεν διαβάστηκε barcode από τη φωτογραφία. Γράψ' το χειροκίνητα.")
 
     manual_code = st.text_input(
         "ή γράψε το barcode",
