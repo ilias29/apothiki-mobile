@@ -9,8 +9,9 @@ import requests
 SEARCH_TIMEOUT = 8
 MAX_RESULTS = 8
 
-# Κύριες online πηγές για barcode lookup. Ψάχνουμε πρώτα σε δύο μεγάλα
-# ελληνικά pharmacy e-shops και μόνο μετά κάνουμε γενικό fallback search.
+# Κύριες online πηγές για barcode lookup. Πρώτα επιχειρούμε άμεση,
+# επιβεβαιωμένη αναζήτηση σε pharmacy e-shops και μόνο αν δεν βρεθεί
+# exact barcode κάνουμε γενικό web fallback.
 PRIMARY_PHARMACY_DOMAINS = [
     "pharmacy295.gr",
     "ofarmakopoiosmou.gr",
@@ -74,12 +75,38 @@ def _looks_like_product(title: str, snippet: str, barcode: str) -> bool:
     text = f"{title} {snippet}".lower()
     if not title or len(title) < 4:
         return False
-    blocked = ["login", "σύνδεση", "καλάθι", "privacy", "όροι χρήσης"]
+    blocked = [
+        "login",
+        "σύνδεση",
+        "καλάθι",
+        "privacy",
+        "όροι χρήσης",
+        "λογαριασμός",
+        "contact",
+        "επικοινωνία",
+    ]
     if any(token in text for token in blocked):
         return False
     return barcode in text or any(
         token in text
-        for token in ["mg", "ml", "spf", "caps", "tabs", "δισκ", "κάψ", "κρέμα", "serum", "spray"]
+        for token in [
+            "mg",
+            "ml",
+            "spf",
+            "caps",
+            "tabs",
+            "δισκ",
+            "κάψ",
+            "κρέμα",
+            "cream",
+            "serum",
+            "spray",
+            "gel",
+            "shampoo",
+            "σαμπουάν",
+            "vitamin",
+            "βιταμ",
+        ]
     )
 
 
@@ -119,7 +146,7 @@ def _search_ddg(query: str) -> list[dict[str, str]]:
 
 
 def _search_queries(barcode: str) -> list[str]:
-    # Πρώτα ένα ξεχωριστό exact-barcode search για κάθε κύριο pharmacy e-shop.
+    # Πρώτα ξεχωριστό exact-barcode search για κάθε κύριο pharmacy e-shop.
     queries = [f'"{barcode}" site:{domain}' for domain in PRIMARY_PHARMACY_DOMAINS]
 
     # Μετά fallback σε ευρύτερο ελληνικό pharmacy/product search.
@@ -129,11 +156,59 @@ def _search_queries(barcode: str) -> list[str]:
     return queries
 
 
-def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
-    barcode = re.sub(r"\s+", "", clean(barcode))
-    if not barcode:
+def _candidate_key(candidate: dict[str, Any]) -> str:
+    name = re.sub(r"\W+", " ", clean(candidate.get("product_name")).lower()).strip()
+    return name or clean(candidate.get("url")).lower()
+
+
+def _verified_provider_candidates(barcode: str) -> list[dict[str, Any]]:
+    """Try direct provider pages and return only exact-barcode verified products.
+
+    app_inventory_search already contains the stricter provider parser: it opens
+    the provider search page, follows product detail pages and marks a result as
+    verified only when the requested barcode/GTIN is present on the product page.
+    Keeping that verification ahead of search-engine snippets sharply reduces
+    false positives while still allowing the looser web search as fallback.
+    """
+    try:
+        import app_inventory_search as inventory_search
+
+        found, _debug = inventory_search.online_lookup_candidates(barcode, "")
+    except Exception:
         return []
 
+    candidates: list[dict[str, Any]] = []
+    seen = set()
+    is_gtin14 = barcode.isdigit() and len(barcode) == 14
+    for item in found or []:
+        if not item.get("verified"):
+            continue
+        product_name = clean(item.get("product_name"))
+        if not product_name:
+            continue
+        candidate = {
+            "product_name": product_name,
+            "brand": clean(item.get("brand")),
+            "barcode": "" if is_gtin14 else barcode,
+            "gtin": barcode if is_gtin14 else "",
+            "strength": clean(item.get("strength")),
+            "dosage_form": clean(item.get("dosage_form")),
+            "category": clean(item.get("category")) or "Άλλο",
+            "source": clean(item.get("provider")) or "verified pharmacy",
+            "url": clean(item.get("product_page_url")),
+            "confidence": 0.99,
+            "verified": True,
+        }
+        key = _candidate_key(candidate)
+        if key and key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+        if len(candidates) >= 5:
+            break
+    return candidates
+
+
+def _fallback_search_candidates(barcode: str) -> list[dict[str, Any]]:
     raw_results: list[dict[str, str]] = []
     seen_urls = set()
     for query in _search_queries(barcode):
@@ -143,6 +218,7 @@ def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
                     seen_urls.add(result["url"])
                     raw_results.append(result)
         except Exception:
+            # Ένα provider/search failure δεν πρέπει να ρίχνει ολόκληρο το lookup.
             continue
 
     candidates = []
@@ -175,16 +251,32 @@ def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
                 "source": domain or "web",
                 "url": result["url"],
                 "confidence": min(confidence, 0.98),
+                "verified": False,
             }
         )
 
     deduped = []
-    seen_titles = set()
+    seen = set()
     for candidate in sorted(candidates, key=lambda item: item["confidence"], reverse=True):
-        key = re.sub(r"\W+", " ", candidate["product_name"].lower()).strip()
-        if key and key not in seen_titles:
-            seen_titles.add(key)
+        key = _candidate_key(candidate)
+        if key and key not in seen:
+            seen.add(key)
             deduped.append(candidate)
         if len(deduped) >= 5:
             break
     return deduped
+
+
+def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
+    barcode = re.sub(r"\s+", "", clean(barcode))
+    if not barcode:
+        return []
+
+    # 1) Σοβαρή πηγή: exact barcode/GTIN επιβεβαιωμένο μέσα σε product detail page.
+    verified = _verified_provider_candidates(barcode)
+    if verified:
+        return verified
+
+    # 2) Αν δεν υπάρχει verified detail page, search-engine discovery.
+    # Παραμένει υποψήφιο αποτέλεσμα και απαιτεί πάντα ανθρώπινο OK στο app.
+    return _fallback_search_candidates(barcode)
