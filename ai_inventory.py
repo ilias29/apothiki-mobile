@@ -138,7 +138,7 @@ def analyze_images(
     api_key: str,
     mode: str,
     default_vat: float = 24.0,
-    model: str = "gpt-5.6-terra",
+    model: str = "gpt-4.1-mini",
 ) -> dict[str, Any]:
     if not api_key:
         raise ValueError("Λείπει το OPENAI_API_KEY από τα Streamlit Secrets.")
@@ -193,7 +193,7 @@ def read_barcode_digits(
     image_bytes: bytes,
     *,
     api_key: str,
-    model: str = "gpt-5.6-terra",
+    model: str = "gpt-4.1-mini",
     mime_type: str = "image/jpeg",
 ) -> dict[str, str]:
     """Read only the printed EAN/GTIN digits when line decoders fail."""
