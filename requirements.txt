@@ -1,4 +1,5 @@
 streamlit
+streamlit-qrcode-scanner==0.1.2
 pandas
 gspread
 google-auth
