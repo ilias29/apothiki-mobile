@@ -9,18 +9,22 @@ import requests
 SEARCH_TIMEOUT = 8
 MAX_RESULTS = 8
 
-# Δημόσιες πηγές που έχουν συχνά φαρμακευτικά/παραφαρμακευτικά προϊόντα.
-# Οι αποθήκες φαρμακοποιών συνήθως θέλουν login, οπότε χρησιμοποιούνται μόνο
-# όταν το αποτέλεσμά τους είναι δημόσια προσβάσιμο από search engine.
-PREFERRED_DOMAINS = [
+# Κύριες online πηγές για barcode lookup. Ψάχνουμε πρώτα σε δύο μεγάλα
+# ελληνικά pharmacy e-shops και μόνο μετά κάνουμε γενικό fallback search.
+PRIMARY_PHARMACY_DOMAINS = [
+    "pharmacy295.gr",
+    "ofarmakopoiosmou.gr",
+]
+
+FALLBACK_DOMAINS = [
+    "vita4you.gr",
+    "tofarmakeiomou.gr",
     "skroutz.gr",
     "bestprice.gr",
-    "ofarmakopoiosmou.gr",
-    "vita4you.gr",
-    "pharmacy295.gr",
-    "tofarmakeiomou.gr",
     "galinos.gr",
 ]
+
+PREFERRED_DOMAINS = PRIMARY_PHARMACY_DOMAINS + FALLBACK_DOMAINS
 
 
 def clean(value: Any) -> str:
@@ -56,7 +60,12 @@ def _domain(url: str) -> str:
 
 def _clean_title(title: str, barcode: str) -> str:
     title = _strip_tags(title)
-    title = re.sub(r"\s*[-|·]\s*(Skroutz|BestPrice|φαρμακείο|pharmacy).*?$", "", title, flags=re.I)
+    title = re.sub(
+        r"\s*[-|·]\s*(Skroutz|BestPrice|φαρμακείο|pharmacy).*?$",
+        "",
+        title,
+        flags=re.I,
+    )
     title = title.replace(barcode, "").strip(" -|·")
     return title.strip()
 
@@ -100,7 +109,7 @@ def _search_ddg(query: str) -> list[dict[str, str]]:
     )
 
     results = []
-    for index, (raw_url, raw_title) in enumerate(links[:MAX_RESULTS * 2]):
+    for index, (raw_url, raw_title) in enumerate(links[: MAX_RESULTS * 2]):
         url = _unwrap_ddg_url(raw_url)
         title = _strip_tags(raw_title)
         snippet = _strip_tags(snippets[index]) if index < len(snippets) else ""
@@ -109,18 +118,25 @@ def _search_ddg(query: str) -> list[dict[str, str]]:
     return results
 
 
+def _search_queries(barcode: str) -> list[str]:
+    # Πρώτα ένα ξεχωριστό exact-barcode search για κάθε κύριο pharmacy e-shop.
+    queries = [f'"{barcode}" site:{domain}' for domain in PRIMARY_PHARMACY_DOMAINS]
+
+    # Μετά fallback σε ευρύτερο ελληνικό pharmacy/product search.
+    fallback_domain_query = " OR ".join(f"site:{domain}" for domain in FALLBACK_DOMAINS)
+    queries.append(f'"{barcode}" ({fallback_domain_query})')
+    queries.append(f'"{barcode}"')
+    return queries
+
+
 def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
     barcode = re.sub(r"\s+", "", clean(barcode))
     if not barcode:
         return []
 
-    queries = [f'"{barcode}"']
-    domain_query = " OR ".join(f"site:{domain}" for domain in PREFERRED_DOMAINS[:5])
-    queries.append(f'"{barcode}" ({domain_query})')
-
     raw_results: list[dict[str, str]] = []
     seen_urls = set()
-    for query in queries:
+    for query in _search_queries(barcode):
         try:
             for result in _search_ddg(query):
                 if result["url"] not in seen_urls:
@@ -135,11 +151,18 @@ def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
         snippet = result["snippet"]
         if not _looks_like_product(title, snippet, barcode):
             continue
+
         domain = _domain(result["url"])
-        preferred = any(domain.endswith(item) for item in PREFERRED_DOMAINS)
-        confidence = 0.80 if barcode in f"{result['title']} {snippet}" else 0.60
-        if preferred:
-            confidence += 0.10
+        exact_barcode_visible = barcode in f"{result['title']} {snippet}"
+        primary = any(domain.endswith(item) for item in PRIMARY_PHARMACY_DOMAINS)
+        fallback = any(domain.endswith(item) for item in FALLBACK_DOMAINS)
+
+        confidence = 0.80 if exact_barcode_visible else 0.60
+        if primary:
+            confidence += 0.15
+        elif fallback:
+            confidence += 0.08
+
         candidates.append(
             {
                 "product_name": title,
@@ -151,7 +174,7 @@ def lookup_barcode_online(barcode: str) -> list[dict[str, Any]]:
                 "category": "Άλλο",
                 "source": domain or "web",
                 "url": result["url"],
-                "confidence": min(confidence, 0.95),
+                "confidence": min(confidence, 0.98),
             }
         )
 
