@@ -233,8 +233,20 @@ def scan_tab() -> None:
         with st.spinner("Ψάχνω πρώτα τη δική σου βάση και μετά το internet..."):
             st.session_state["lookup_candidates"] = resolve_barcode(code, force_online=online_clicked)
 
+    with st.expander("📸 Φωτογραφία ονόματος", expanded=False):
+        st.caption("Προαιρετικά φωτογράφισε την μπροστινή όψη για να βλέπεις εσύ καθαρά το όνομα. Δεν γίνεται OCR και δεν προτείνεται όνομα από τη φωτογραφία.")
+        name_photo = st.camera_input(
+            "Φωτογράφισε το όνομα του προϊόντος",
+            key="product_name_reference_camera",
+            help="Η εικόνα είναι μόνο οπτική αναφορά για σένα.",
+        )
+        if name_photo is not None:
+            st.image(name_photo, caption="Οπτική αναφορά ονόματος", width=320)
+
     candidates = st.session_state.get("lookup_candidates")
     if candidates is None:
+        if code:
+            st.info("Πάτησε «Βρες προϊόν» ή χρησιμοποίησε τη φωτογραφία ως οπτική αναφορά και γράψε το όνομα όταν εμφανιστεί η φόρμα.")
         return
 
     selected = render_candidate_picker(code, candidates)
@@ -246,6 +258,7 @@ def scan_tab() -> None:
         "Όνομα προϊόντος",
         value=clean(selected.get("product_name")),
         key=f"product_name_{context}",
+        help="Μπορείς να το διορθώσεις ή να το γράψεις χειροκίνητα κοιτώντας τη φωτογραφία ονόματος.",
     )
     brand = st.text_input(
         "Μάρκα / εταιρεία",
