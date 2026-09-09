@@ -51,3 +51,8 @@ def test_curved_barcode_rejects_one_digit_error_even_with_high_confidence(monkey
     fallback = stable.st.session_state["scan_debug"]["ai_digit_fallback"]
     assert fallback["accepted"] is False
     assert fallback["reason"] == "invalid_length_or_check_digit"
+
+
+def test_stale_internal_codex_model_is_repaired_for_openai_api(monkeypatch):
+    monkeypatch.setattr(stable.st, "secrets", {"OPENAI_MODEL": "gpt-5.6-terra"})
+    assert stable.configured_openai_model() == "gpt-4.1-mini"
