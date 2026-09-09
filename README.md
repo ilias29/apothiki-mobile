@@ -36,7 +36,7 @@
 
 ```toml
 OPENAI_API_KEY = "sk-..."
-OPENAI_MODEL = "gpt-5.6-terra"
+OPENAI_MODEL = "gpt-4.1-mini"
 ```
 
 Το API key δεν αποθηκεύεται στο repository.
