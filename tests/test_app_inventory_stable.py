@@ -56,3 +56,8 @@ def test_curved_barcode_rejects_one_digit_error_even_with_high_confidence(monkey
 def test_stale_internal_codex_model_is_repaired_for_openai_api(monkeypatch):
     monkeypatch.setattr(stable.st, "secrets", {"OPENAI_MODEL": "gpt-5.6-terra"})
     assert stable.configured_openai_model() == "gpt-4.1-mini"
+
+
+def test_live_scanner_accepts_valid_ean13_and_rejects_bad_check_digit():
+    assert stable.validated_live_barcode("5200421900551") == "5200421900551"
+    assert stable.validated_live_barcode("5200421900552") == ""
