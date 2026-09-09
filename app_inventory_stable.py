@@ -13,6 +13,8 @@ from barcode_lookup import lookup_barcode_online
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 DEFAULT_CATEGORY = "Άλλο"
+STOCK_CACHE_TTL_SECONDS = 30
+PRODUCT_CACHE_TTL_SECONDS = 60
 
 
 def clean(value: Any) -> str:
@@ -26,12 +28,15 @@ def clean(value: Any) -> str:
     return str(value).strip()
 
 
-def ensure_storage() -> None:
-    ws = core.worksheet()
-    core.initialize_schema(ws)
+@st.cache_resource(show_spinner=False)
+def ensure_storage_once() -> bool:
+    """Initialize the Google Sheets structure only once per app process."""
+    core.worksheet()  # worksheet() already validates the Transactions schema.
     base_db.ensure_base_sheets(core)
+    return True
 
 
+@st.cache_data(ttl=PRODUCT_CACHE_TTL_SECONDS, show_spinner=False)
 def read_products() -> pd.DataFrame:
     return base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
 
@@ -108,13 +113,13 @@ def save_inventory_item(
         movement_kind=core.NORMAL,
     )
     ws = core.worksheet()
-    core.initialize_schema(ws)
     core.append_stock_transaction(ws, transaction)
     try:
         base_db.upsert_product_from_transaction(core, transaction)
     except Exception:
         pass
     core.invalidate_data_cache(ws)
+    read_products.clear()
 
 
 def detect_barcode_from_camera(upload) -> str:
@@ -132,19 +137,21 @@ def detect_barcode_from_camera(upload) -> str:
     return value
 
 
-def reset_scan() -> None:
+def _clear_scan_state() -> None:
     for key in [
         "active_barcode",
         "lookup_candidates",
         "selected_candidate_index",
-        "confirmed_product_name",
-        "confirmed_brand",
-        "confirmed_strength",
-        "confirmed_form",
-        "confirmed_category",
         "scan_debug",
+        "manual_barcode",
+        "last_camera_hash",
+        "barcode_camera",
+        "product_name_reference_camera",
     ]:
         st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if key.startswith(("product_name_", "brand_", "strength_", "form_", "confirm_", "quantity_", "location_")):
+            st.session_state.pop(key, None)
 
 
 def resolve_barcode(code: str, force_online: bool = False) -> list[dict[str, Any]]:
@@ -158,9 +165,9 @@ def resolve_barcode(code: str, force_online: bool = False) -> list[dict[str, Any
     return lookup_barcode_online(code)
 
 
-def render_candidate_picker(code: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+def render_candidate_picker(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     if not candidates:
-        st.warning("Δεν βρήκα ασφαλή αντιστοίχιση. Γράψε το όνομα χειροκίνητα και επιβεβαίωσέ το.")
+        st.warning("Δεν βρήκα ασφαλή αντιστοίχιση online. Γράψε το όνομα χειροκίνητα και επιβεβαίωσέ το.")
         return {
             "product_name": "",
             "brand": "",
@@ -192,6 +199,9 @@ def render_candidate_picker(code: str, candidates: list[dict[str, Any]]) -> dict
 
 
 def scan_tab() -> None:
+    if st.session_state.pop("_scan_reset_pending", False):
+        _clear_scan_state()
+
     st.subheader("📷 Σκανάρισμα barcode")
     st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
 
@@ -200,7 +210,6 @@ def scan_tab() -> None:
         key="barcode_camera",
         help="Κράτα το barcode καθαρό και σχετικά κοντά στην κάμερα.",
     )
-
     if camera is not None:
         camera_hash = hashlib.sha256(camera.getvalue()).hexdigest()
         if st.session_state.get("last_camera_hash") != camera_hash:
@@ -219,7 +228,6 @@ def scan_tab() -> None:
         placeholder="π.χ. 5201234567890",
         key="manual_barcode",
     )
-
     code = clean(manual_code) or clean(st.session_state.get("active_barcode"))
     if code and code != clean(st.session_state.get("active_barcode")):
         st.session_state["active_barcode"] = code
@@ -228,13 +236,12 @@ def scan_tab() -> None:
     c1, c2 = st.columns(2)
     search_clicked = c1.button("🔎 Βρες προϊόν", type="primary", width="stretch", disabled=not code)
     online_clicked = c2.button("🌐 Ψάξε ξανά online", width="stretch", disabled=not code)
-
     if search_clicked or online_clicked:
-        with st.spinner("Ψάχνω πρώτα τη δική σου βάση και μετά το internet..."):
+        with st.spinner("Ψάχνω πρώτα τη δική σου βάση και μετά online..."):
             st.session_state["lookup_candidates"] = resolve_barcode(code, force_online=online_clicked)
 
     with st.expander("📸 Φωτογραφία ονόματος", expanded=False):
-        st.caption("Προαιρετικά φωτογράφισε την μπροστινή όψη για να βλέπεις εσύ καθαρά το όνομα. Δεν γίνεται OCR και δεν προτείνεται όνομα από τη φωτογραφία.")
+        st.caption("Μόνο για να τη βλέπεις εσύ. Δεν γίνεται OCR και δεν προτείνεται όνομα από τη φωτογραφία.")
         name_photo = st.camera_input(
             "Φωτογράφισε το όνομα του προϊόντος",
             key="product_name_reference_camera",
@@ -245,37 +252,20 @@ def scan_tab() -> None:
 
     candidates = st.session_state.get("lookup_candidates")
     if candidates is None:
-        if code:
-            st.info("Πάτησε «Βρες προϊόν» ή χρησιμοποίησε τη φωτογραφία ως οπτική αναφορά και γράψε το όνομα όταν εμφανιστεί η φόρμα.")
         return
 
-    selected = render_candidate_picker(code, candidates)
-    if selected is None:
-        return
-
+    selected = render_candidate_picker(candidates)
     context = hashlib.sha256((code + clean(selected.get("product_name"))).encode()).hexdigest()[:10]
     product_name = st.text_input(
         "Όνομα προϊόντος",
         value=clean(selected.get("product_name")),
         key=f"product_name_{context}",
-        help="Μπορείς να το διορθώσεις ή να το γράψεις χειροκίνητα κοιτώντας τη φωτογραφία ονόματος.",
+        help="Διόρθωσέ το χειροκίνητα αν χρειάζεται.",
     )
-    brand = st.text_input(
-        "Μάρκα / εταιρεία",
-        value=clean(selected.get("brand")),
-        key=f"brand_{context}",
-    )
+    brand = st.text_input("Μάρκα / εταιρεία", value=clean(selected.get("brand")), key=f"brand_{context}")
     c3, c4 = st.columns(2)
-    strength = c3.text_input(
-        "Περιεκτικότητα",
-        value=clean(selected.get("strength")),
-        key=f"strength_{context}",
-    )
-    dosage_form = c4.text_input(
-        "Μορφή / συσκευασία",
-        value=clean(selected.get("dosage_form")),
-        key=f"form_{context}",
-    )
+    strength = c3.text_input("Περιεκτικότητα", value=clean(selected.get("strength")), key=f"strength_{context}")
+    dosage_form = c4.text_input("Μορφή / συσκευασία", value=clean(selected.get("dosage_form")), key=f"form_{context}")
 
     confirmed = st.checkbox(
         f"OK, το barcode {code} αντιστοιχεί σε αυτό το προϊόν",
@@ -285,13 +275,7 @@ def scan_tab() -> None:
         st.info("Δεν αποθηκεύεται τίποτα πριν το OK.")
         return
 
-    quantity = st.number_input(
-        "Ποσότητα",
-        min_value=1,
-        value=1,
-        step=1,
-        key=f"quantity_{context}",
-    )
+    quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
     location_label = st.selectbox(
         "Τοποθεσία",
         [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
@@ -313,9 +297,7 @@ def scan_tab() -> None:
                 note=f"source={clean(selected.get('source')) or 'manual'}; verified_by_user=true",
             )
             st.success(f"Αποθηκεύτηκαν {int(quantity)} τεμάχια: {product_name}")
-            reset_scan()
-            st.session_state.pop("manual_barcode", None)
-            st.session_state.pop("last_camera_hash", None)
+            st.session_state["_scan_reset_pending"] = True
             st.rerun()
         except Exception as exc:
             st.error(f"Δεν αποθηκεύτηκε: {exc}")
@@ -346,8 +328,7 @@ def _normalize_invoice_rows(df: pd.DataFrame) -> pd.DataFrame:
     out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int) if qty_col is not None else 1
     out["Barcode"] = ""
     out["OK"] = False
-    out = out[out["ProductName"].ne("") & out["Quantity"].gt(0)].reset_index(drop=True)
-    return out
+    return out[out["ProductName"].ne("") & out["Quantity"].gt(0)].reset_index(drop=True)
 
 
 def _invoice_rows_from_ai(images: list[dict[str, Any]], api_key: str, model: str) -> pd.DataFrame:
@@ -370,7 +351,7 @@ def _invoice_rows_from_ai(images: list[dict[str, Any]], api_key: str, model: str
 
 def invoice_tab() -> None:
     st.subheader("🧾 Τιμολόγια")
-    st.caption("Από το τιμολόγιο κρατάμε μόνο όνομα και ποσότητα. Το barcode το βάζεις εσύ πριν περάσει στο stock.")
+    st.caption("Κρατάμε όνομα + ποσότητα. Το barcode επιβεβαιώνεται από εσένα πριν περάσει στο stock.")
 
     method = st.segmented_control(
         "Πηγή",
@@ -392,12 +373,9 @@ def invoice_tab() -> None:
             if not api_key:
                 st.error("Λείπει OPENAI_API_KEY από τα Streamlit Secrets.")
             else:
-                images = [
-                    {"bytes": f.getvalue(), "name": f.name, "type": getattr(f, "type", "image/jpeg")}
-                    for f in uploads
-                ]
+                images = [{"bytes": f.getvalue(), "name": f.name, "type": getattr(f, "type", "image/jpeg")} for f in uploads]
                 try:
-                    with st.spinner("Διαβάζω μόνο προϊόντα και ποσότητες..."):
+                    with st.spinner("Διαβάζω προϊόντα και ποσότητες..."):
                         st.session_state["invoice_rows"] = _invoice_rows_from_ai(images, api_key, model)
                 except Exception as exc:
                     st.error(f"Δεν διαβάστηκε το τιμολόγιο: {exc}")
@@ -418,11 +396,10 @@ def invoice_tab() -> None:
             rows = st.session_state.get("invoice_rows")
             if not isinstance(rows, pd.DataFrame):
                 rows = pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "OK"])
-            rows = pd.concat(
+            st.session_state["invoice_rows"] = pd.concat(
                 [rows, pd.DataFrame([{"ProductName": clean(name), "Quantity": int(qty), "Barcode": "", "OK": False}])],
                 ignore_index=True,
             )
-            st.session_state["invoice_rows"] = rows
 
     rows = st.session_state.get("invoice_rows")
     if not isinstance(rows, pd.DataFrame) or rows.empty:
@@ -448,14 +425,10 @@ def invoice_tab() -> None:
     if not invalid.empty:
         st.warning("Υπάρχουν επιβεβαιωμένες γραμμές χωρίς barcode. Αυτές δεν θα περάσουν.")
 
-    location_label = st.selectbox(
-        "Παραλαβή σε",
-        [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
-        key="invoice_location",
-    )
+    location_label = st.selectbox("Παραλαβή σε", [f"{idx} - {name}" for idx, name in LOCATIONS.items()], key="invoice_location")
     location_id = int(location_label.split("-", 1)[0].strip())
-
     valid = chosen[chosen["Barcode"].astype(str).str.strip().ne("")]
+
     if st.button(
         f"💾 Πέρασε {len(valid)} επιβεβαιωμένες γραμμές στο stock",
         type="primary",
@@ -487,8 +460,13 @@ def invoice_tab() -> None:
 def stock_tab() -> None:
     st.subheader("📦 Τρέχον stock")
     ws = core.worksheet()
-    core.initialize_schema(ws)
-    data, _ = core.load_data_cached(ws, ttl_seconds=0)
+    try:
+        data, _ = core.load_data_cached(ws, ttl_seconds=STOCK_CACHE_TTL_SECONDS)
+    except Exception as exc:
+        if "429" in str(exc) or "quota" in str(exc).lower():
+            st.warning("Το Google Sheets έπιασε προσωρινά το όριο αναγνώσεων. Περίμενε λίγο και ξαναδοκίμασε.")
+            return
+        raise
     stock = core.stock_table(data)
     if stock.empty:
         st.info("Δεν υπάρχουν ακόμα κινήσεις stock.")
@@ -496,10 +474,7 @@ def stock_tab() -> None:
     query = st.text_input("Αναζήτηση", placeholder="όνομα, barcode, μάρκα...")
     if query:
         stock, _ = core.search_stock(stock, query)
-    columns = [
-        "Προϊόν", "Μάρκα", "Barcode", "GTIN", "Αποθήκη",
-        "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο",
-    ]
+    columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
     available = [column for column in columns if column in stock.columns]
     st.dataframe(stock[available], hide_index=True, width="stretch")
 
@@ -510,16 +485,16 @@ def main() -> None:
     st.caption("Barcode πρώτα. Επιβεβαίωση από άνθρωπο μετά. Έτσι αποφεύγουμε να κάνουμε το internet υπεύθυνο φαρμακείου.")
 
     try:
-        ensure_storage()
+        ensure_storage_once()
     except Exception as exc:
-        st.error(f"Δεν συνδέθηκε το Google Sheet: {exc}")
+        text = str(exc)
+        if "429" in text or "quota" in text.lower():
+            st.error("Το Google Sheets έπιασε προσωρινά το όριο αναγνώσεων. Περίμενε περίπου 1 λεπτό και κάνε refresh.")
+        else:
+            st.error(f"Δεν συνδέθηκε το Google Sheet: {exc}")
         st.stop()
 
-    tab_scan, tab_invoice, tab_stock = st.tabs([
-        "📷 Barcode",
-        "🧾 Τιμολόγια",
-        "📦 Stock",
-    ])
+    tab_scan, tab_invoice, tab_stock = st.tabs(["📷 Barcode", "🧾 Τιμολόγια", "📦 Stock"])
     with tab_scan:
         scan_tab()
     with tab_invoice:
