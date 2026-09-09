@@ -1,7 +1,5 @@
-import calendar
 import hashlib
-import uuid
-from datetime import date, datetime
+import io
 from typing import Any
 
 import pandas as pd
@@ -10,660 +8,511 @@ import streamlit as st
 import ai_inventory
 import app_inventory_search as core
 import inventory_base as base_db
-import inventory_csa as csa
+from barcode_lookup import lookup_barcode_online
 
 
-CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Ορθοπεδικό", "Βρεφικό", "Άλλο"]
-LOCATIONS = {0: "Αποθήκη", 1: "Κάτω / Κύριο Κτήριο", 2: "Πάνω / Επίπεδο 1"}
-DEFAULT_VAT = 24.0
+LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
+DEFAULT_CATEGORY = "Άλλο"
 
 
 def clean(value: Any) -> str:
-    return csa.clean(value)
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
 
 
-def fresh_data() -> pd.DataFrame:
+def ensure_storage() -> None:
     ws = core.worksheet()
     core.initialize_schema(ws)
-    data, _ = core.load_data_cached(ws, ttl_seconds=0)
-    return data
+    base_db.ensure_base_sheets(core)
 
 
-def append_transactions(transactions: list[dict]) -> tuple[int, int]:
+def read_products() -> pd.DataFrame:
+    return base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
+
+
+def local_product_by_code(code: str) -> dict[str, str] | None:
+    code = clean(code)
+    if not code:
+        return None
+    products = read_products()
+    if products.empty:
+        return None
+    for column in ["Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC"]:
+        if column not in products.columns:
+            continue
+        match = products[products[column].astype(str).str.strip().eq(code)]
+        if not match.empty:
+            row = match.iloc[0]
+            return {
+                "product_name": clean(row.get("ProductName")),
+                "brand": clean(row.get("Brand")),
+                "barcode": clean(row.get("Barcode")) or code,
+                "gtin": clean(row.get("GTIN")),
+                "strength": clean(row.get("Strength")),
+                "dosage_form": clean(row.get("DosageForm")),
+                "category": clean(row.get("Category")) or DEFAULT_CATEGORY,
+                "source": "Δική σου επιβεβαιωμένη βάση",
+                "url": "",
+                "confidence": 1.0,
+            }
+    return None
+
+
+def save_inventory_item(
+    *,
+    code: str,
+    product_name: str,
+    quantity: int,
+    brand: str = "",
+    strength: str = "",
+    dosage_form: str = "",
+    category: str = DEFAULT_CATEGORY,
+    location_id: int = 0,
+    note: str = "",
+) -> None:
+    code = clean(code)
+    product_name = clean(product_name)
+    if not code:
+        raise ValueError("Δεν υπάρχει barcode.")
+    if not product_name:
+        raise ValueError("Δεν υπάρχει όνομα προϊόντος.")
+    if quantity < 1:
+        raise ValueError("Η ποσότητα πρέπει να είναι τουλάχιστον 1.")
+
+    is_gtin14 = code.isdigit() and len(code) == 14
+    code_type = "GTIN" if is_gtin14 else "Barcode"
+    barcode = "" if is_gtin14 else code
+    gtin = code if is_gtin14 else ""
+
+    transaction = core.make_transaction(
+        code_type=code_type,
+        code_value=code,
+        barcode=barcode,
+        gtin=gtin,
+        brand=brand,
+        product=product_name,
+        category=category or DEFAULT_CATEGORY,
+        strength=strength,
+        dosage_form=dosage_form,
+        location_id=location_id,
+        movement="Απογραφή / καταμέτρηση (+)",
+        quantity=int(quantity),
+        delta=int(quantity),
+        note=note or "source=barcode_inventory; verified_by_user=true",
+        movement_kind=core.NORMAL,
+    )
     ws = core.worksheet()
-    saved = 0
-    duplicate = 0
-    for transaction in transactions:
-        status = core.append_stock_transaction(ws, transaction)
-        if status == "duplicate":
-            duplicate += 1
-        else:
-            saved += 1
-        try:
-            base_db.upsert_product_from_transaction(core, transaction)
-        except Exception:
-            pass
+    core.initialize_schema(ws)
+    core.append_stock_transaction(ws, transaction)
+    try:
+        base_db.upsert_product_from_transaction(core, transaction)
+    except Exception:
+        pass
     core.invalidate_data_cache(ws)
-    return saved, duplicate
 
 
-def images_from_uploads(files) -> list[dict[str, Any]]:
-    return [
-        {
-            "bytes": file.getvalue(),
-            "name": file.name,
-            "type": getattr(file, "type", "image/jpeg"),
-        }
-        for file in (files or [])
-    ]
-
-
-def normalize_expiry(value: Any) -> str:
-    text = clean(value)
-    if not text:
+def detect_barcode_from_camera(upload) -> str:
+    if upload is None:
         return ""
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
-        try:
-            return datetime.strptime(text, fmt).date().isoformat()
-        except ValueError:
-            pass
-    for sep in ("/", "-", "."):
-        parts = text.split(sep)
-        if len(parts) == 2 and all(part.isdigit() for part in parts):
-            month, year = int(parts[0]), int(parts[1])
-            if 1 <= month <= 12 and 2000 <= year <= 2200:
-                last_day = calendar.monthrange(year, month)[1]
-                return date(year, month, last_day).isoformat()
-    parsed = pd.to_datetime(text, errors="coerce")
-    return parsed.date().isoformat() if not pd.isna(parsed) else text
+    image = core.to_img(upload)
+    if image is None:
+        return ""
+    detected_type, detected_value, debug = core.detect_code(None, image)
+    value = clean(detected_value)
+    if detected_type in {"DataMatrix", "QR"} and value:
+        parsed = core.parse_machine_readable_fields(value)
+        value = clean(parsed.get("gtin")) or value
+    st.session_state["scan_debug"] = debug
+    return value
 
 
-def apply_pending_document_metadata() -> None:
-    pending = st.session_state.pop("main_pending_document", None)
-    if not isinstance(pending, dict):
-        return
-    supplier = clean(pending.get("Supplier"))
-    document_number = clean(pending.get("DocumentNumber"))
-    document_date = clean(pending.get("DocumentDate"))
-    if supplier:
-        st.session_state["main_supplier"] = supplier
-    if document_number:
-        st.session_state["main_reference"] = document_number
-    if document_date:
-        parsed = pd.to_datetime(document_date, errors="coerce")
-        if not pd.isna(parsed):
-            st.session_state["main_document_date"] = parsed.date()
+def reset_scan() -> None:
+    for key in [
+        "active_barcode",
+        "lookup_candidates",
+        "selected_candidate_index",
+        "confirmed_product_name",
+        "confirmed_brand",
+        "confirmed_strength",
+        "confirmed_form",
+        "confirmed_category",
+        "scan_debug",
+    ]:
+        st.session_state.pop(key, None)
 
 
-def stock_label(row: pd.Series) -> str:
-    code = clean(row.get("GTIN")) or clean(row.get("Barcode")) or clean(row.get("CodeValue"))
-    return (
-        f"{clean(row.get('Προϊόν'))} | {clean(row.get('Strength')) or '-'} | "
-        f"stock {int(row.get('Stock', 0))} | {clean(row.get('Τοποθεσία'))} | {code}"
+def resolve_barcode(code: str, force_online: bool = False) -> list[dict[str, Any]]:
+    code = clean(code)
+    if not code:
+        return []
+    if not force_online:
+        local = local_product_by_code(code)
+        if local:
+            return [local]
+    return lookup_barcode_online(code)
+
+
+def render_candidate_picker(code: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not candidates:
+        st.warning("Δεν βρήκα ασφαλή αντιστοίχιση. Γράψε το όνομα χειροκίνητα και επιβεβαίωσέ το.")
+        return {
+            "product_name": "",
+            "brand": "",
+            "strength": "",
+            "dosage_form": "",
+            "category": DEFAULT_CATEGORY,
+            "source": "Χειροκίνητη καταχώρηση",
+            "url": "",
+            "confidence": 0.0,
+        }
+
+    labels = []
+    for idx, candidate in enumerate(candidates):
+        title = clean(candidate.get("product_name")) or "Χωρίς σαφές όνομα"
+        source = clean(candidate.get("source")) or "internet"
+        labels.append(f"{idx + 1}. {title} · {source}")
+    choice = st.radio(
+        "Πιθανό προϊόν",
+        options=list(range(len(labels))),
+        format_func=lambda idx: labels[idx],
+        key="selected_candidate_index",
+    )
+    selected = candidates[int(choice)]
+    if clean(selected.get("url")):
+        st.caption(f"Πηγή: {clean(selected.get('source'))} · {clean(selected.get('url'))}")
+    else:
+        st.caption(f"Πηγή: {clean(selected.get('source'))}")
+    return selected
+
+
+def scan_tab() -> None:
+    st.subheader("📷 Σκανάρισμα barcode")
+    st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
+
+    camera = st.camera_input(
+        "Φωτογράφισε το barcode",
+        key="barcode_camera",
+        help="Κράτα το barcode καθαρό και σχετικά κοντά στην κάμερα.",
     )
 
+    if camera is not None:
+        camera_hash = hashlib.sha256(camera.getvalue()).hexdigest()
+        if st.session_state.get("last_camera_hash") != camera_hash:
+            with st.spinner("Διαβάζω barcode..."):
+                detected = detect_barcode_from_camera(camera)
+            st.session_state["last_camera_hash"] = camera_hash
+            if detected:
+                st.session_state["active_barcode"] = detected
+                st.session_state.pop("lookup_candidates", None)
+            else:
+                st.error("Δεν διαβάστηκε barcode από τη φωτογραφία. Δοκίμασε πιο κοντά ή γράψ' το χειροκίνητα.")
 
-def lot_label(row: pd.Series) -> str:
-    code = clean(row.get("GTIN")) or clean(row.get("Barcode")) or clean(row.get("CodeValue"))
-    return (
-        f"{clean(row.get('Προϊόν'))} | stock {int(row.get('Stock', 0))} | "
-        f"λήξη {clean(row.get('ExpiryDate')) or '-'} | LOT {clean(row.get('LotNumber')) or '-'} | "
-        f"{clean(row.get('Τοποθεσία'))} | {code}"
+    manual_code = st.text_input(
+        "ή γράψε το barcode",
+        value=clean(st.session_state.get("active_barcode")),
+        placeholder="π.χ. 5201234567890",
+        key="manual_barcode",
     )
 
-
-def manual_entry_tab() -> None:
-    st.subheader("➕ Χειροκίνητη καταχώρηση")
-    st.caption("Για ένα προϊόν τη φορά. Η AI παραλαβή είναι για τιμολόγια και οθόνες, εδώ κρατάμε το απλό χειροκίνητο fallback.")
+    code = clean(manual_code) or clean(st.session_state.get("active_barcode"))
+    if code and code != clean(st.session_state.get("active_barcode")):
+        st.session_state["active_barcode"] = code
+        st.session_state.pop("lookup_candidates", None)
 
     c1, c2 = st.columns(2)
-    code = c1.text_input("Barcode / GTIN", key="manual_code")
-    product = c2.text_input("Προϊόν", key="manual_product")
+    search_clicked = c1.button("🔎 Βρες προϊόν", type="primary", width="stretch", disabled=not code)
+    online_clicked = c2.button("🌐 Ψάξε ξανά online", width="stretch", disabled=not code)
+
+    if search_clicked or online_clicked:
+        with st.spinner("Ψάχνω πρώτα τη δική σου βάση και μετά το internet..."):
+            st.session_state["lookup_candidates"] = resolve_barcode(code, force_online=online_clicked)
+
+    candidates = st.session_state.get("lookup_candidates")
+    if candidates is None:
+        return
+
+    selected = render_candidate_picker(code, candidates)
+    if selected is None:
+        return
+
+    context = hashlib.sha256((code + clean(selected.get("product_name"))).encode()).hexdigest()[:10]
+    product_name = st.text_input(
+        "Όνομα προϊόντος",
+        value=clean(selected.get("product_name")),
+        key=f"product_name_{context}",
+    )
+    brand = st.text_input(
+        "Μάρκα / εταιρεία",
+        value=clean(selected.get("brand")),
+        key=f"brand_{context}",
+    )
     c3, c4 = st.columns(2)
-    brand = c3.text_input("Μάρκα / Εταιρεία", key="manual_brand")
-    category = c4.selectbox("Κατηγορία", CATEGORIES, key="manual_category")
-    c5, c6 = st.columns(2)
-    strength = c5.text_input("Περιεκτικότητα", key="manual_strength")
-    dosage_form = c6.text_input("Μορφή", key="manual_form")
-    c7, c8 = st.columns(2)
-    expiry = c7.text_input("Λήξη", placeholder="YYYY-MM-DD ή MM/YYYY", key="manual_expiry")
-    lot = c8.text_input("LOT / Παρτίδα", key="manual_lot")
-    c9, c10 = st.columns(2)
-    serial = c9.text_input("Serial Number (αν υπάρχει)", key="manual_serial")
-    qty = c10.number_input("Ποσότητα", min_value=1, value=1, step=1, key="manual_qty")
+    strength = c3.text_input(
+        "Περιεκτικότητα",
+        value=clean(selected.get("strength")),
+        key=f"strength_{context}",
+    )
+    dosage_form = c4.text_input(
+        "Μορφή / συσκευασία",
+        value=clean(selected.get("dosage_form")),
+        key=f"form_{context}",
+    )
+
+    confirmed = st.checkbox(
+        f"OK, το barcode {code} αντιστοιχεί σε αυτό το προϊόν",
+        key=f"confirm_{context}",
+    )
+    if not confirmed:
+        st.info("Δεν αποθηκεύεται τίποτα πριν το OK.")
+        return
+
+    quantity = st.number_input(
+        "Ποσότητα",
+        min_value=1,
+        value=1,
+        step=1,
+        key=f"quantity_{context}",
+    )
     location_label = st.selectbox(
         "Τοποθεσία",
         [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
-        index=2,
-        key="manual_location",
+        key=f"location_{context}",
     )
-    no_expiry = st.checkbox("Δεν υπάρχει / δεν είναι διαθέσιμη λήξη", key="manual_no_expiry")
-    confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία", key="manual_confirm")
+    location_id = int(location_label.split("-", 1)[0].strip())
 
-    if st.button("💾 Αποθήκευση στο stock", type="primary", width="stretch", key="manual_save"):
+    if st.button("💾 Αποθήκευση", type="primary", width="stretch", key=f"save_{context}"):
         try:
-            if not clean(product):
-                raise core.InventoryError("Βάλε όνομα προϊόντος.")
-            if not confirm:
-                raise core.InventoryError("Χρειάζεται επιβεβαίωση πριν την αποθήκευση.")
-            if clean(serial) and int(qty) != 1:
-                raise core.InventoryError("Όταν υπάρχει Serial Number, η ποσότητα της γραμμής πρέπει να είναι 1.")
-            expiry_value = normalize_expiry(expiry)
-            if not expiry_value and not no_expiry:
-                raise core.InventoryError("Βάλε λήξη ή επίλεξε ότι δεν είναι διαθέσιμη.")
-
-            raw_code = clean(code)
-            if raw_code:
-                if raw_code.isdigit() and len(raw_code) == 14:
-                    code_type, code_value, barcode, gtin = "GTIN", raw_code, "", raw_code
-                else:
-                    code_type, code_value, barcode, gtin = "Barcode", raw_code, raw_code, ""
-            else:
-                internal = csa.internal_identity(product, brand, strength)
-                code_type, code_value, barcode, gtin = "Internal", internal, "", ""
-
-            location_id = int(location_label.split("-", 1)[0].strip())
-            transaction = core.make_transaction(
-                code_type=code_type,
-                code_value=code_value,
-                barcode=barcode,
-                gtin=gtin,
-                serial_number=clean(serial),
-                lot_number=clean(lot),
-                expiry_date=expiry_value,
-                strength=clean(strength),
-                dosage_form=clean(dosage_form),
-                brand=clean(brand),
-                product=clean(product),
-                category=clean(category),
+            save_inventory_item(
+                code=code,
+                product_name=product_name,
+                quantity=int(quantity),
+                brand=brand,
+                strength=strength,
+                dosage_form=dosage_form,
+                category=clean(selected.get("category")) or DEFAULT_CATEGORY,
                 location_id=location_id,
-                movement="Χειροκίνητη παραλαβή (+)",
-                quantity=int(qty),
-                delta=int(qty),
-                note="source=manual_entry",
-                movement_kind=core.NORMAL,
+                note=f"source={clean(selected.get('source')) or 'manual'}; verified_by_user=true",
             )
-            saved, _ = append_transactions([transaction])
-            st.success(f"Αποθηκεύτηκε {saved} κίνηση.")
+            st.success(f"Αποθηκεύτηκαν {int(quantity)} τεμάχια: {product_name}")
+            reset_scan()
+            st.session_state.pop("manual_barcode", None)
+            st.session_state.pop("last_camera_hash", None)
             st.rerun()
         except Exception as exc:
-            st.error(str(exc))
+            st.error(f"Δεν αποθηκεύτηκε: {exc}")
 
 
-def ai_receipt_tab(api_key: str, model: str) -> None:
-    apply_pending_document_metadata()
-    st.subheader("📥 AI Παραλαβή")
-    st.caption("Φωτογραφία τιμολογίου ή οθόνης → AI → έλεγχος → stock. Προτεραιότητα σε ποσότητα, ημερομηνία, LOT και λήξη, όχι σε τιμές.")
+def _invoice_dataframe_from_upload(file) -> pd.DataFrame:
+    name = file.name.lower()
+    raw = file.getvalue()
+    if name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(raw))
+    if name.endswith(".xlsx"):
+        return pd.read_excel(io.BytesIO(raw))
+    raise ValueError("Υποστηρίζονται CSV και XLSX.")
 
-    if not api_key:
-        st.error("Λείπει το OPENAI_API_KEY από τα Streamlit Secrets. Οι υπόλοιπες λειτουργίες της αποθήκης συνεχίζουν να δουλεύουν.")
-        return
 
-    a, b, c = st.columns(3)
-    supplier = a.text_input("Προμηθευτής", key="main_supplier")
-    reference = b.text_input("Αρ. τιμολογίου / αναφορά", key="main_reference")
-    document_date = c.date_input("Ημερομηνία παραστατικού", value=date.today(), key="main_document_date")
-    location_label = st.selectbox(
-        "Παραλαβή σε",
-        [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
-        index=2,
-        key="main_receipt_location",
+def _normalize_invoice_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "OK"])
+    lower = {str(col).strip().lower(): col for col in df.columns}
+    name_col = next((lower[k] for k in lower if any(token in k for token in ["product", "προϊόν", "description", "περιγραφή", "item"])), None)
+    qty_col = next((lower[k] for k in lower if any(token in k for token in ["quantity", "qty", "ποσότητα", "τεμάχ"])), None)
+    if name_col is None:
+        name_col = df.columns[0]
+    if qty_col is None and len(df.columns) > 1:
+        qty_col = df.columns[1]
+    out = pd.DataFrame()
+    out["ProductName"] = df[name_col].map(clean)
+    out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int) if qty_col is not None else 1
+    out["Barcode"] = ""
+    out["OK"] = False
+    out = out[out["ProductName"].ne("") & out["Quantity"].gt(0)].reset_index(drop=True)
+    return out
+
+
+def _invoice_rows_from_ai(images: list[dict[str, Any]], api_key: str, model: str) -> pd.DataFrame:
+    result = ai_inventory.analyze_images(
+        images,
+        api_key=api_key,
+        mode="Τιμολόγιο / παραλαβή",
+        default_vat=24.0,
+        model=model,
+    )
+    rows = []
+    for item in result.get("items", []):
+        product = clean(item.get("ProductName"))
+        qty_value = pd.to_numeric(item.get("Quantity"), errors="coerce")
+        qty = 1 if pd.isna(qty_value) else int(qty_value)
+        if product and qty > 0:
+            rows.append({"ProductName": product, "Quantity": qty, "Barcode": "", "OK": False})
+    return pd.DataFrame(rows, columns=["ProductName", "Quantity", "Barcode", "OK"])
+
+
+def invoice_tab() -> None:
+    st.subheader("🧾 Τιμολόγια")
+    st.caption("Από το τιμολόγιο κρατάμε μόνο όνομα και ποσότητα. Το barcode το βάζεις εσύ πριν περάσει στο stock.")
+
+    method = st.segmented_control(
+        "Πηγή",
+        ["Φωτογραφία τιμολογίου", "CSV / XLSX", "Χειροκίνητα"],
+        default="Φωτογραφία τιμολογίου",
+        key="invoice_method",
     )
 
-    uploads = st.file_uploader(
-        "Φωτογραφίες / screenshots τιμολογίου",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
-        key="main_receipt_uploads",
-        help="Στο κινητό μπορείς να επιλέξεις Κάμερα ή Gallery από το πεδίο αρχείων.",
-    )
-    if uploads:
-        st.image(uploads, width=180)
+    if method == "Φωτογραφία τιμολογίου":
+        api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
+        model = clean(st.secrets.get("OPENAI_MODEL", "gpt-5.6-terra"))
+        uploads = st.file_uploader(
+            "Φωτογραφίες τιμολογίου",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="invoice_images",
+        )
+        if st.button("📄 Διάβασε όνομα + ποσότητα", type="primary", disabled=not uploads, width="stretch"):
+            if not api_key:
+                st.error("Λείπει OPENAI_API_KEY από τα Streamlit Secrets.")
+            else:
+                images = [
+                    {"bytes": f.getvalue(), "name": f.name, "type": getattr(f, "type", "image/jpeg")}
+                    for f in uploads
+                ]
+                try:
+                    with st.spinner("Διαβάζω μόνο προϊόντα και ποσότητες..."):
+                        st.session_state["invoice_rows"] = _invoice_rows_from_ai(images, api_key, model)
+                except Exception as exc:
+                    st.error(f"Δεν διαβάστηκε το τιμολόγιο: {exc}")
 
-    if st.button("✨ Ανάλυση τιμολογίου με AI", type="primary", disabled=not uploads, width="stretch", key="main_receipt_analyze"):
-        try:
-            images = images_from_uploads(uploads)
-            with st.spinner("Διαβάζω ημερομηνία, προϊόντα, ποσότητες, LOT και λήξεις..."):
-                result = ai_inventory.analyze_images(
-                    images,
-                    api_key=api_key,
-                    mode="Τιμολόγιο / παραλαβή",
-                    default_vat=DEFAULT_VAT,
-                    model=model,
-                )
-            st.session_state["main_receipt_rows"] = csa.normalize_ai_items(result.get("items", []), DEFAULT_VAT)
-            st.session_state["main_receipt_warnings"] = result.get("warnings", [])
-            seed_reference = clean(reference) or clean(result.get("document", {}).get("DocumentNumber"))
-            st.session_state["main_receipt_seed"] = csa.batch_seed(
-                [image["bytes"] for image in images],
-                seed_reference,
+    elif method == "CSV / XLSX":
+        upload = st.file_uploader("Αρχείο τιμολογίου", type=["csv", "xlsx"], key="invoice_file")
+        if st.button("📄 Φόρτωσε γραμμές", type="primary", disabled=upload is None, width="stretch"):
+            try:
+                st.session_state["invoice_rows"] = _normalize_invoice_rows(_invoice_dataframe_from_upload(upload))
+            except Exception as exc:
+                st.error(str(exc))
+
+    else:
+        c1, c2 = st.columns([3, 1])
+        name = c1.text_input("Όνομα προϊόντος", key="invoice_manual_name")
+        qty = c2.number_input("Ποσότητα", min_value=1, value=1, step=1, key="invoice_manual_qty")
+        if st.button("➕ Πρόσθεσε γραμμή", disabled=not clean(name)):
+            rows = st.session_state.get("invoice_rows")
+            if not isinstance(rows, pd.DataFrame):
+                rows = pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "OK"])
+            rows = pd.concat(
+                [rows, pd.DataFrame([{"ProductName": clean(name), "Quantity": int(qty), "Barcode": "", "OK": False}])],
+                ignore_index=True,
             )
-            st.session_state["main_pending_document"] = result.get("document", {})
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Αποτυχία ανάλυσης: {exc}")
+            st.session_state["invoice_rows"] = rows
 
-    for warning in st.session_state.get("main_receipt_warnings", []):
-        st.warning(clean(warning))
-
-    rows = st.session_state.get("main_receipt_rows")
+    rows = st.session_state.get("invoice_rows")
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return
 
-    missing_expiry = rows["ExpiryDate"].astype(str).str.strip().eq("").sum()
-    missing_lot = rows["LotNumber"].astype(str).str.strip().eq("").sum()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Γραμμές", len(rows))
-    m2.metric("Χωρίς λήξη", int(missing_expiry))
-    m3.metric("Χωρίς LOT", int(missing_lot))
-
-    receipt_columns = [
-        "RowId", "confirm", "ProductName", "Quantity", "ExpiryDate", "LotNumber",
-        "BarcodeOrGTIN", "GTIN", "Strength", "Brand", "Category", "DosageForm",
-        "SerialNumber", "Confidence", "Notes",
-    ]
+    st.markdown("**Βάλε barcode σε κάθε γραμμή και τσέκαρε OK.**")
     edited = st.data_editor(
-        rows[receipt_columns],
+        rows,
         hide_index=True,
         width="stretch",
-        disabled=["RowId", "Confidence"],
         column_config={
-            "RowId": st.column_config.NumberColumn("#"),
-            "confirm": st.column_config.CheckboxColumn("OK", default=False),
             "ProductName": st.column_config.TextColumn("Προϊόν"),
-            "Quantity": st.column_config.NumberColumn("Ποσότητα", min_value=0, step=1),
-            "ExpiryDate": st.column_config.TextColumn("Λήξη"),
-            "LotNumber": st.column_config.TextColumn("LOT"),
-            "BarcodeOrGTIN": st.column_config.TextColumn("Barcode / GTIN"),
-            "Strength": st.column_config.TextColumn("Περιεκτικότητα"),
-            "Brand": st.column_config.TextColumn("Μάρκα"),
-            "SerialNumber": st.column_config.TextColumn("SN"),
+            "Quantity": st.column_config.NumberColumn("Ποσότητα", min_value=1, step=1),
+            "Barcode": st.column_config.TextColumn("Barcode"),
+            "OK": st.column_config.CheckboxColumn("OK"),
         },
-        key="main_receipt_editor",
+        key="invoice_editor",
     )
-    chosen = edited[edited["confirm"] == True].copy()
-    st.caption("Τσέκαρε OK μόνο στις σωστές γραμμές. Αν LOT ή λήξη δεν φαίνονται, μένουν κενά. Δεν τα μαντεύουμε για να νιώθει παραγωγικό το μοντέλο.")
+    st.session_state["invoice_rows"] = edited
 
-    if st.button("💾 Επιβεβαίωση και προσθήκη στο stock", type="primary", disabled=chosen.empty, width="stretch", key="main_receipt_save"):
-        try:
-            location_id = int(location_label.split("-", 1)[0].strip())
-            seed = clean(st.session_state.get("main_receipt_seed"))
-            note = csa.source_note(
-                supplier=supplier,
-                reference=reference,
-                document_date=document_date.isoformat(),
-            )
-            transactions = []
-            for _, row in chosen.iterrows():
-                row_id = int(row["RowId"])
-                row = row.copy()
-                if clean(row.get("ExpiryDate")):
-                    row["ExpiryDate"] = normalize_expiry(row.get("ExpiryDate"))
-                transactions.append(csa.receipt_transaction(
-                    row,
-                    location_id=location_id,
-                    transaction_id=f"main-ai-in-{seed}-{row_id:04d}",
-                    source_note=note,
-                ))
-            saved, duplicate = append_transactions(transactions)
-            st.success(f"Παραλαβή: {saved} κινήσεις αποθηκεύτηκαν, {duplicate} διπλότυπες αγνοήθηκαν.")
-            for key in ["main_receipt_rows", "main_receipt_warnings", "main_receipt_seed", "main_receipt_editor"]:
-                st.session_state.pop(key, None)
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Δεν αποθηκεύτηκε η παραλαβή: {exc}")
+    chosen = edited[edited["OK"] == True].copy()
+    invalid = chosen[chosen["Barcode"].astype(str).str.strip().eq("")]
+    if not invalid.empty:
+        st.warning("Υπάρχουν επιβεβαιωμένες γραμμές χωρίς barcode. Αυτές δεν θα περάσουν.")
 
-
-def issue_tab(api_key: str, model: str) -> None:
-    st.subheader("📤 Έξοδος / τι έφυγε")
-    st.caption("Ό,τι δόθηκε, χρησιμοποιήθηκε ή πέρασε αλλού αφαιρείται από το stock. Η αφαίρεση γίνεται FEFO, πρώτα από την παρτίδα που λήγει νωρίτερα.")
-
-    try:
-        snapshot = csa.stock_snapshot(fresh_data())
-        summary = csa.product_summary(snapshot)
-    except Exception as exc:
-        st.error(f"Δεν φορτώθηκε το stock: {exc}")
-        return
-
-    if summary.empty:
-        st.info("Δεν υπάρχει διαθέσιμο stock για έξοδο.")
-        return
-
-    mode = st.radio(
-        "Τρόπος εξόδου",
-        ["Χειροκίνητα", "AI από φωτογραφία / screenshot"],
-        horizontal=True,
-        key="main_issue_mode",
+    location_label = st.selectbox(
+        "Παραλαβή σε",
+        [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
+        key="invoice_location",
     )
+    location_id = int(location_label.split("-", 1)[0].strip())
 
-    if mode == "Χειροκίνητα":
-        query = st.text_input("Προϊόν, μάρκα ή barcode", key="main_issue_query")
-        matches = csa.filter_summary(summary, query)
-        if clean(query) and matches.empty:
-            st.warning("Δεν βρέθηκε προϊόν.")
-            return
-        if matches.empty:
-            st.info("Γράψε προϊόν ή barcode για να βρεις τι έφυγε.")
-            return
-        options = list(matches.index)
-        selected_index = st.selectbox(
-            "Προϊόν",
-            options,
-            format_func=lambda idx: stock_label(matches.loc[idx]),
-            key="main_issue_product",
-        )
-        selected = matches.loc[selected_index]
-        available = int(selected["Stock"])
-        qty = st.number_input(
-            "Ποσότητα που έφυγε",
-            min_value=1,
-            max_value=max(1, available),
-            value=1,
-            step=1,
-            key="main_issue_qty",
-        )
-        reason = st.selectbox(
-            "Αιτία",
-            ["Πώληση / χορήγηση", "Χρήση / κατανάλωση", "Μεταφορά", "Διόρθωση αποθέματος"],
-            key="main_issue_reason",
-        )
-        note = st.text_input("Σημείωση", key="main_issue_note")
-        if st.button("➖ Αφαίρεση από stock", type="primary", width="stretch", key="main_issue_save"):
-            try:
-                prefix = "main-out-" + uuid.uuid4().hex[:18]
-                transactions = csa.fefo_issue_transactions(
-                    snapshot,
-                    selected,
-                    quantity=int(qty),
-                    note=f"reason={reason}; {clean(note)}",
-                    transaction_prefix=prefix,
-                )
-                saved, duplicate = append_transactions(transactions)
-                st.success(f"Αφαιρέθηκαν {int(qty)} τεμάχια. Κινήσεις: {saved}, διπλότυπα: {duplicate}.")
-                st.rerun()
-            except Exception as exc:
-                st.error(f"Δεν έγινε η έξοδος: {exc}")
-        return
-
-    if not api_key:
-        st.error("Λείπει το OPENAI_API_KEY, άρα η AI έξοδος δεν μπορεί να τρέξει.")
-        return
-
-    out_uploads = st.file_uploader(
-        "Φωτογραφίες / screenshots με όσα έφυγαν",
-        type=["jpg", "jpeg", "png", "webp"],
-        accept_multiple_files=True,
-        key="main_issue_uploads",
-    )
-    if out_uploads:
-        st.image(out_uploads, width=180)
-
-    if st.button("✨ Ανάλυση εξόδου με AI", type="primary", disabled=not out_uploads, width="stretch", key="main_issue_analyze"):
-        try:
-            images = images_from_uploads(out_uploads)
-            with st.spinner("Διαβάζω τι έφυγε..."):
-                result = ai_inventory.analyze_images(
-                    images,
-                    api_key=api_key,
-                    mode="Έξοδος / πωλήσεις",
-                    default_vat=DEFAULT_VAT,
-                    model=model,
-                )
-            st.session_state["main_issue_rows"] = csa.normalize_ai_items(result.get("items", []), DEFAULT_VAT)
-            st.session_state["main_issue_warnings"] = result.get("warnings", [])
-        except Exception as exc:
-            st.error(f"Αποτυχία ανάλυσης: {exc}")
-
-    for warning in st.session_state.get("main_issue_warnings", []):
-        st.warning(clean(warning))
-
-    issue_rows = st.session_state.get("main_issue_rows")
-    if not isinstance(issue_rows, pd.DataFrame) or issue_rows.empty:
-        return
-
-    issue_columns = ["RowId", "confirm", "ProductName", "Brand", "BarcodeOrGTIN", "GTIN", "Strength", "Quantity", "Confidence", "Notes"]
-    edited = st.data_editor(
-        issue_rows[issue_columns],
-        hide_index=True,
+    valid = chosen[chosen["Barcode"].astype(str).str.strip().ne("")]
+    if st.button(
+        f"💾 Πέρασε {len(valid)} επιβεβαιωμένες γραμμές στο stock",
+        type="primary",
+        disabled=valid.empty,
         width="stretch",
-        disabled=["RowId", "Confidence"],
-        column_config={
-            "confirm": st.column_config.CheckboxColumn("OK", default=False),
-            "Quantity": st.column_config.NumberColumn("Ποσότητα", min_value=0, step=1),
-        },
-        key="main_issue_editor",
-    )
-    chosen = edited[edited["confirm"] == True].copy()
-    if st.button("➖ Επιβεβαίωση και αφαίρεση", type="primary", disabled=chosen.empty, width="stretch", key="main_issue_ai_save"):
-        try:
-            transactions, errors = csa.ai_issue_transactions(
-                snapshot,
-                summary,
-                chosen,
-                note_prefix="source=MAIN_AI_OUT",
-            )
-            if errors:
-                st.error("\n".join(errors))
-            if transactions:
-                saved, duplicate = append_transactions(transactions)
-                st.success(f"AI έξοδος: {saved} κινήσεις αποθηκεύτηκαν, {duplicate} διπλότυπες.")
-                for key in ["main_issue_rows", "main_issue_warnings", "main_issue_editor"]:
-                    st.session_state.pop(key, None)
-                st.rerun()
-        except Exception as exc:
-            st.error(f"Δεν έγινε η AI έξοδος: {exc}")
-
-
-def quick_update_tab() -> None:
-    st.subheader("🔄 Γρήγορη διόρθωση")
-    st.caption("Για μικρές διορθώσεις συγκεκριμένης παρτίδας. Δεν αντικαθιστά την παραλαβή ή την έξοδο, απλώς γλιτώνει τη φόρμα-μαμούθ.")
-    try:
-        snapshot = csa.stock_snapshot(fresh_data())
-    except Exception as exc:
-        st.error(f"Δεν φορτώθηκε το stock: {exc}")
-        return
-    if snapshot.empty:
-        st.info("Δεν υπάρχει stock.")
-        return
-
-    query = st.text_input("Αναζήτηση προϊόντος / barcode / LOT", key="quick_query")
-    if not clean(query):
-        st.info("Γράψε κάτι για αναζήτηση.")
-        return
-    q = clean(query).lower()
-    mask = pd.Series(False, index=snapshot.index)
-    for column in ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "CodeValue", "LotNumber", "Strength"]:
-        mask |= snapshot[column].astype(str).str.lower().str.contains(q, regex=False, na=False)
-    matches = snapshot[mask].copy()
-    if matches.empty:
-        st.warning("Δεν βρέθηκε παρτίδα.")
-        return
-
-    options = list(matches.index)
-    selected_index = st.selectbox("Παρτίδα", options, format_func=lambda idx: lot_label(matches.loc[idx]), key="quick_lot")
-    selected = matches.loc[selected_index]
-    current = int(selected["Stock"])
-    c1, c2, c3, c4 = st.columns(4)
-    delta = None
-    if c1.button("-1", key="quick_m1"):
-        delta = -1
-    if c2.button("-5", key="quick_m5"):
-        delta = -5
-    if c3.button("+1", key="quick_p1"):
-        delta = 1
-    if c4.button("+5", key="quick_p5"):
-        delta = 5
-    custom = st.number_input("Ή δική σου μεταβολή", min_value=-999, max_value=999, value=0, step=1, key="quick_custom")
-    note = st.text_input("Σημείωση", key="quick_note")
-    if st.button("✅ Εφαρμογή μεταβολής", key="quick_apply"):
-        delta = int(custom)
-
-    if delta is None:
-        return
-    if delta == 0:
-        st.error("Μηδενική μεταβολή δεν αποθηκεύεται. Το σύστημα έχει ήδη αρκετά πράγματα να θυμάται.")
-        return
-    if current + int(delta) < 0:
-        st.error(f"Η παρτίδα έχει {current} τεμάχια. Δεν μπορείς να αφαιρέσεις {abs(int(delta))}.")
-        return
-
-    try:
-        transaction = core.make_transaction(
-            code_type=clean(selected["CodeType"]),
-            code_value=clean(selected["CodeValue"]),
-            barcode=clean(selected["Barcode"]),
-            gtin=clean(selected["GTIN"]),
-            serial_number=clean(selected["SerialNumber"]) if abs(int(delta)) == 1 else "",
-            lot_number=clean(selected["LotNumber"]),
-            expiry_date=clean(selected["ExpiryDate"]),
-            strength=clean(selected["Strength"]),
-            dosage_form=clean(selected["DosageForm"]),
-            brand=clean(selected["Μάρκα"]),
-            product=clean(selected["Προϊόν"]),
-            category=clean(selected["Κατηγορία"]),
-            location_id=int(selected["LocationId"]),
-            movement="Γρήγορη διόρθωση (+)" if int(delta) > 0 else "Γρήγορη διόρθωση (-)",
-            quantity=abs(int(delta)),
-            delta=int(delta),
-            note=f"source=quick_adjustment; {clean(note)}",
-            movement_kind=core.NORMAL,
-        )
-        saved, _ = append_transactions([transaction])
-        st.success(f"Περάστηκε μεταβολή {int(delta):+d}. Κινήσεις: {saved}.")
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Δεν αποθηκεύτηκε: {exc}")
+    ):
+        saved = 0
+        errors = []
+        for _, row in valid.iterrows():
+            try:
+                save_inventory_item(
+                    code=clean(row["Barcode"]),
+                    product_name=clean(row["ProductName"]),
+                    quantity=int(row["Quantity"]),
+                    location_id=location_id,
+                    note="source=invoice; verified_by_user=true",
+                )
+                saved += 1
+            except Exception as exc:
+                errors.append(f"{clean(row['ProductName'])}: {exc}")
+        if errors:
+            st.error(" | ".join(errors[:5]))
+        if saved:
+            st.success(f"Πέρασαν {saved} γραμμές στο stock.")
+            st.session_state.pop("invoice_rows", None)
+            st.rerun()
 
 
 def stock_tab() -> None:
-    st.subheader("📦 Τι υπάρχει τώρα")
-    try:
-        snapshot = csa.stock_snapshot(fresh_data())
-        summary = csa.product_summary(snapshot)
-    except Exception as exc:
-        st.error(f"Δεν φορτώθηκε το stock: {exc}")
+    st.subheader("📦 Τρέχον stock")
+    ws = core.worksheet()
+    core.initialize_schema(ws)
+    data, _ = core.load_data_cached(ws, ttl_seconds=0)
+    stock = core.stock_table(data)
+    if stock.empty:
+        st.info("Δεν υπάρχουν ακόμα κινήσεις stock.")
         return
-    if summary.empty:
-        st.info("Δεν υπάρχει ενεργό stock.")
-        return
-
-    q = st.text_input("Αναζήτηση stock", key="stock_query")
-    shown = csa.filter_summary(summary, q)
-    total_units = int(pd.to_numeric(shown["Stock"], errors="coerce").fillna(0).sum()) if not shown.empty else 0
-    c1, c2 = st.columns(2)
-    c1.metric("Προϊόντα / τοποθεσίες", len(shown))
-    c2.metric("Σύνολο τεμαχίων", total_units)
-    view_cols = ["Προϊόν", "Μάρκα", "Strength", "Barcode", "GTIN", "Τοποθεσία", "Stock", "Κατηγορία"]
-    st.dataframe(shown[view_cols], hide_index=True, width="stretch")
-
-    with st.expander("Παρτίδες / LOT / λήξεις", expanded=True):
-        lot_cols = ["Προϊόν", "Μάρκα", "LotNumber", "ExpiryDate", "SerialNumber", "Τοποθεσία", "Stock", "GTIN", "Barcode"]
-        st.dataframe(snapshot[lot_cols], hide_index=True, width="stretch")
-
-
-def expiry_tab() -> None:
-    st.subheader("⚠️ Λήξεις")
-    try:
-        snapshot = csa.stock_snapshot(fresh_data())
-    except Exception as exc:
-        st.error(f"Δεν φορτώθηκε το stock: {exc}")
-        return
-    if snapshot.empty:
-        st.info("Δεν υπάρχει ενεργό stock.")
-        return
-
-    frame = core.add_expiry_columns(snapshot)
-    expiry_dates = pd.to_datetime(frame["ExpiryDate"], errors="coerce")
-    today = pd.Timestamp(date.today())
-    days = (expiry_dates - today).dt.days
-    frame["DaysToExpiry"] = days
-
-    expired = frame[days < 0].copy()
-    soon = frame[(days >= 0) & (days <= 90)].copy()
-    later = frame[days > 90].copy()
-    missing = frame[expiry_dates.isna()].copy()
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Ληγμένες παρτίδες", len(expired))
-    m2.metric("0–90 ημέρες", len(soon))
-    m3.metric(">90 ημέρες", len(later))
-    m4.metric("Χωρίς λήξη", len(missing))
-
-    cols = ["Προϊόν", "Μάρκα", "LotNumber", "ExpiryDate", "DaysToExpiry", "Τοποθεσία", "Stock", "GTIN", "Barcode"]
-    with st.expander("🔴 Ληγμένα", expanded=not expired.empty):
-        st.dataframe(expired[cols], hide_index=True, width="stretch")
-    with st.expander("🟠 Λήγουν μέσα σε 90 ημέρες", expanded=True):
-        st.dataframe(soon[cols], hide_index=True, width="stretch")
-    with st.expander("🟢 Αργότερα", expanded=False):
-        st.dataframe(later[cols], hide_index=True, width="stretch")
-    with st.expander("⚪ Χωρίς καταγεγραμμένη λήξη", expanded=False):
-        st.dataframe(missing[["Προϊόν", "Μάρκα", "LotNumber", "Τοποθεσία", "Stock", "GTIN", "Barcode"]], hide_index=True, width="stretch")
-
-
-def base_tab() -> None:
-    st.subheader("🧱 Βάση προϊόντων")
-    st.caption("Το stock βγαίνει από τις κινήσεις. Η βάση προϊόντων βοηθά μόνο στην ταυτοποίηση και στην οργάνωση.")
-    try:
-        data = fresh_data()
-        inferred_products = base_db.product_rows_from_transactions(data)
-        products_df = base_db.read_sheet_df(core, "Products", base_db.PRODUCT_COLUMNS)
-        mappings_df = base_db.read_sheet_df(core, "SupplierMappings", base_db.SUPPLIER_MAPPING_COLUMNS)
-    except Exception as exc:
-        st.error(f"Δεν φορτώθηκε η βάση: {exc}")
-        return
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Προϊόντα από κινήσεις", len(inferred_products))
-    m2.metric("Products sheet", len(products_df))
-    m3.metric("Supplier mappings", len(mappings_df))
-    c1, c2 = st.columns(2)
-    if c1.button("Δημιουργία / έλεγχος φύλλων βάσης", width="stretch"):
-        try:
-            sizes = base_db.ensure_base_sheets(core)
-            st.success("Έτοιμα: " + ", ".join(f"{name}: {count}" for name, count in sizes.items()))
-        except Exception as exc:
-            st.error(str(exc))
-    if c2.button("Συγχρονισμός Products από κινήσεις", width="stretch"):
-        try:
-            result = base_db.sync_products_from_transactions(core, data)
-            st.success(f"Προστέθηκαν {result['added']} νέα προϊόντα. Υπήρχαν ήδη {result['existing']}.")
-        except Exception as exc:
-            st.error(str(exc))
-    if not products_df.empty:
-        st.dataframe(products_df, hide_index=True, width="stretch")
+    query = st.text_input("Αναζήτηση", placeholder="όνομα, barcode, μάρκα...")
+    if query:
+        stock, _ = core.search_stock(stock, query)
+    columns = [
+        "Προϊόν", "Μάρκα", "Barcode", "GTIN", "Αποθήκη",
+        "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο",
+    ]
+    available = [column for column in columns if column in stock.columns]
+    st.dataframe(stock[available], hide_index=True, width="stretch")
 
 
 def main() -> None:
-    st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="📦", layout="wide")
-    st.title("📦 Αποθήκη Φαρμακείου")
-    st.caption("Ένα app: τι μπήκε → τι έφυγε → τι υπάρχει → τι λήγει. Η AI βοηθά στην ανάγνωση, αλλά δεν γράφει stock χωρίς δικό σου ΟΚ.")
+    st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="💊", layout="wide")
+    st.title("💊 Αποθήκη Φαρμακείου")
+    st.caption("Barcode πρώτα. Επιβεβαίωση από άνθρωπο μετά. Έτσι αποφεύγουμε να κάνουμε το internet υπεύθυνο φαρμακείου.")
 
-    api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
-    model = clean(st.secrets.get("OPENAI_MODEL", "gpt-5.6-terra"))
+    try:
+        ensure_storage()
+    except Exception as exc:
+        st.error(f"Δεν συνδέθηκε το Google Sheet: {exc}")
+        st.stop()
 
-    tab_receipt, tab_issue, tab_stock, tab_expiry, tab_manual, tab_quick, tab_base = st.tabs([
-        "📥 AI Παραλαβή",
-        "📤 Έξοδος",
-        "📦 Τι υπάρχει",
-        "⚠️ Λήξεις",
-        "➕ Καταχώρηση",
-        "🔄 Διόρθωση",
-        "🧱 Βάση",
+    tab_scan, tab_invoice, tab_stock = st.tabs([
+        "📷 Barcode",
+        "🧾 Τιμολόγια",
+        "📦 Stock",
     ])
-    with tab_receipt:
-        ai_receipt_tab(api_key, model)
-    with tab_issue:
-        issue_tab(api_key, model)
+    with tab_scan:
+        scan_tab()
+    with tab_invoice:
+        invoice_tab()
     with tab_stock:
         stock_tab()
-    with tab_expiry:
-        expiry_tab()
-    with tab_manual:
-        manual_entry_tab()
-    with tab_quick:
-        quick_update_tab()
-    with tab_base:
-        base_tab()
 
 
 if __name__ == "__main__":
