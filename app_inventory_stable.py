@@ -133,6 +133,33 @@ def detect_barcode_from_camera(upload) -> str:
     if detected_type in {"DataMatrix", "QR"} and value:
         parsed = core.parse_machine_readable_fields(value)
         value = clean(parsed.get("gtin")) or value
+    if not value:
+        api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
+        model = clean(st.secrets.get("OPENAI_MODEL", "gpt-5.6-terra"))
+        if api_key:
+            try:
+                fallback = ai_inventory.read_barcode_digits(
+                    upload.getvalue(),
+                    api_key=api_key,
+                    model=model,
+                    mime_type=clean(getattr(upload, "type", "")) or "image/jpeg",
+                )
+                candidate = clean(fallback.get("digits"))
+                validation = core.classify_barcode_value("Barcode", candidate)
+                if fallback.get("confidence") != "low" and validation.get("valid"):
+                    value = candidate
+                    debug["ai_digit_fallback"] = {
+                        "accepted": True,
+                        "confidence": fallback.get("confidence"),
+                    }
+                else:
+                    debug["ai_digit_fallback"] = {
+                        "accepted": False,
+                        "confidence": fallback.get("confidence"),
+                        "reason": "invalid_length_or_check_digit",
+                    }
+            except Exception as exc:
+                debug["ai_digit_fallback"] = {"accepted": False, "error": str(exc)}
     st.session_state["scan_debug"] = debug
     return value
 

@@ -1,6 +1,7 @@
 import pandas as pd
 import pytest
 
+import ai_inventory
 import app_inventory_search as app
 
 
@@ -378,6 +379,10 @@ def test_opencv_barcode_decoder_accepts_three_value_api(monkeypatch):
 def test_barcode_attempt_budget_reaches_portrait_rotation():
     attempts_per_rotation = 6 * 7 * 3
     assert app.MAX_BARCODE_DECODER_ATTEMPTS > attempts_per_rotation
+
+
+def test_ai_barcode_schema_accepts_digits_only():
+    assert ai_inventory.BARCODE_SCHEMA["properties"]["digits"]["type"] == "string"
 
 
 def test_search_includes_gtin_lot_and_raw_datamatrix():

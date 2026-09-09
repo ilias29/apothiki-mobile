@@ -59,6 +59,16 @@ ITEM_SCHEMA = {
     "additionalProperties": False,
 }
 
+BARCODE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "digits": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    },
+    "required": ["digits", "confidence"],
+    "additionalProperties": False,
+}
+
 
 def _data_url(file_bytes: bytes, filename: str = "image.jpg", mime_type: str = "") -> str:
     mime = mime_type or mimetypes.guess_type(filename or "")[0] or "image/jpeg"
@@ -177,3 +187,52 @@ def analyze_images(
     if not isinstance(result.get("document"), dict):
         result["document"] = {"Supplier": "", "DocumentNumber": "", "DocumentDate": ""}
     return result
+
+
+def read_barcode_digits(
+    image_bytes: bytes,
+    *,
+    api_key: str,
+    model: str = "gpt-5.6-terra",
+    mime_type: str = "image/jpeg",
+) -> dict[str, str]:
+    """Read only the printed EAN/GTIN digits when line decoders fail."""
+    if not api_key or not image_bytes:
+        return {"digits": "", "confidence": "low"}
+    content = [
+        {
+            "type": "input_text",
+            "text": (
+                "Read only the human-readable digits printed directly below or beside the "
+                "barcode. Return all digits in their printed order without spaces. Do not "
+                "read lot, expiry, prices, or product text. Never guess an obscured digit; "
+                "return an empty string unless the complete 8, 12, 13, or 14 digit code is visible."
+            ),
+        },
+        {
+            "type": "input_image",
+            "image_url": _data_url(image_bytes, "barcode.jpg", mime_type),
+            "detail": "high",
+        },
+    ]
+    response = OpenAI(api_key=api_key).responses.create(
+        model=model,
+        input=[{"role": "user", "content": content}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "barcode_digit_extraction",
+                "strict": True,
+                "schema": BARCODE_SCHEMA,
+            }
+        },
+        store=False,
+    )
+    try:
+        result = json.loads(response.output_text or "{}")
+    except json.JSONDecodeError:
+        return {"digits": "", "confidence": "low"}
+    return {
+        "digits": "".join(char for char in str(result.get("digits", "")) if char.isdigit()),
+        "confidence": str(result.get("confidence", "low")),
+    }
