@@ -1,0 +1,19 @@
+name: Python syntax check
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile Python files
+        run: python -m py_compile app_inventory_stable.py app_inventory_search.py inventory_base.py barcode_lookup.py ai_inventory.py
