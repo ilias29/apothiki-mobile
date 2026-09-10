@@ -14,14 +14,14 @@ import ai_inventory
 import app_inventory_search as core
 import inventory_base as base_db
 from barcode_lookup import lookup_barcode_online
-from starter_catalog import lookup_starter_product
+from starter_catalog import LAMBERTS_PRODUCTS, lookup_starter_product
 
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.10.2"
+APP_VERSION = "2026.09.10.3"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -627,6 +627,52 @@ def stock_tab() -> None:
     st.dataframe(stock[available], hide_index=True, width="stretch")
 
 
+def catalog_dataframe() -> pd.DataFrame:
+    rows: dict[str, dict[str, str]] = {}
+    for barcode, product_name in LAMBERTS_PRODUCTS.items():
+        attributes = core.extract_commercial_attributes(product_name)
+        rows[barcode] = {
+            "Barcode": barcode,
+            "Προϊόν": product_name,
+            "Μάρκα": "LAMBERTS",
+            "Περιεκτικότητα": attributes["strength"],
+            "Μορφή": attributes["dosage_form"],
+            "Συσκευασία": attributes["package_size"],
+            "Κατηγορία": "Συμπλήρωμα διατροφής",
+            "Πηγή": "Κατάλογος φαρμακείου",
+        }
+    products = read_products()
+    if not products.empty:
+        for _, item in products.iterrows():
+            barcode = clean(item.get("Barcode")) or clean(item.get("GTIN"))
+            if not barcode:
+                continue
+            rows[barcode] = {
+                "Barcode": barcode,
+                "Προϊόν": clean(item.get("ProductName")),
+                "Μάρκα": clean(item.get("Brand")),
+                "Περιεκτικότητα": clean(item.get("Strength")),
+                "Μορφή": clean(item.get("DosageForm")),
+                "Συσκευασία": "",
+                "Κατηγορία": clean(item.get("Category")),
+                "Πηγή": "Δική σου βάση",
+            }
+    return pd.DataFrame(rows.values()).sort_values(["Μάρκα", "Προϊόν", "Barcode"], ignore_index=True)
+
+
+def catalog_tab() -> None:
+    st.subheader("📚 Κατάλογος προϊόντων")
+    st.caption("Γνωστά προϊόντα και barcode. Η εμφάνιση εδώ δεν σημαίνει ότι υπάρχει ποσότητα στο stock.")
+    catalog = catalog_dataframe()
+    query = st.text_input("Αναζήτηση καταλόγου", placeholder="όνομα, barcode, μάρκα...")
+    if query:
+        needle = clean(query).casefold()
+        mask = catalog.astype(str).apply(lambda column: column.str.casefold().str.contains(needle, regex=False)).any(axis=1)
+        catalog = catalog[mask]
+    st.metric("Γνωστά προϊόντα", len(catalog))
+    st.dataframe(catalog, hide_index=True, width="stretch")
+
+
 def main() -> None:
     st.set_page_config(page_title="Αποθήκη Φαρμακείου", page_icon="💊", layout="wide")
     st.title("💊 Αποθήκη Φαρμακείου")
@@ -642,11 +688,13 @@ def main() -> None:
             st.error(f"Δεν συνδέθηκε το Google Sheet: {exc}")
         st.stop()
 
-    tab_scan, tab_invoice, tab_stock = st.tabs(["📷 Barcode", "🧾 Τιμολόγια", "📦 Stock"])
+    tab_scan, tab_invoice, tab_catalog, tab_stock = st.tabs(["📷 Barcode", "🧾 Τιμολόγια", "📚 Κατάλογος", "📦 Stock"])
     with tab_scan:
         scan_tab()
     with tab_invoice:
         invoice_tab()
+    with tab_catalog:
+        catalog_tab()
     with tab_stock:
         stock_tab()
 
