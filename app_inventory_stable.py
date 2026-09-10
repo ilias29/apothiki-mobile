@@ -206,6 +206,20 @@ def validated_live_barcode(raw_value: Any) -> str:
     return value if candidate.get("valid") else ""
 
 
+def accept_detected_barcode(detected: str) -> bool:
+    """Synchronize scanner and manual widget state, clearing stale products."""
+    detected = clean(detected)
+    if not detected:
+        return False
+    changed = detected != clean(st.session_state.get("active_barcode"))
+    st.session_state["active_barcode"] = detected
+    st.session_state["manual_barcode"] = detected
+    if changed:
+        st.session_state.pop("lookup_candidates", None)
+        st.session_state.pop("selected_candidate_index", None)
+    return changed
+
+
 def _clear_scan_state() -> None:
     for key in [
         "active_barcode",
@@ -291,8 +305,7 @@ def scan_tab() -> None:
             if live_value:
                 detected = validated_live_barcode(live_value)
                 if detected:
-                    st.session_state["active_barcode"] = detected
-                    st.session_state.pop("lookup_candidates", None)
+                    accept_detected_barcode(detected)
                     st.success(f"Διαβάστηκε: {detected}")
                 else:
                     st.warning("Διαβάστηκε κωδικός αλλά απέτυχε ο έλεγχος εγκυρότητας. Ξαναστόχευσε.")
@@ -309,8 +322,7 @@ def scan_tab() -> None:
                     detected = detect_barcode_from_camera(camera)
                 st.session_state["last_camera_hash"] = camera_hash
                 if detected:
-                    st.session_state["active_barcode"] = detected
-                    st.session_state.pop("lookup_candidates", None)
+                    accept_detected_barcode(detected)
                 else:
                     fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
                     if fallback.get("reason") == "missing_openai_api_key":
