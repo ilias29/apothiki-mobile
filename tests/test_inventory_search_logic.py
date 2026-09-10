@@ -845,6 +845,58 @@ def test_live_lookup_uses_only_two_primary_epharmacies():
     assert providers == ["ofarmakopoiosmou.gr", "pharmacy295.gr"]
 
 
+@pytest.mark.parametrize("shield", [
+    "Please wait while we validate that you are human. Advanced bot shield protection by TrustServers",
+    "<title>Just a moment...</title><script src='/challenge-platform/x.js'></script>",
+    "Checking your browser before accessing the shop - cf-chl-bypass",
+])
+def test_current_shop_bot_shields_are_detected(shield):
+    assert app.is_bot_shield_page(shield)
+
+
+def test_provider_bot_shield_stops_before_product_detail_requests(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "Please wait while we validate that you are human. TrustServers"
+        url = "https://www.ofarmakopoiosmou.gr/search"
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    found, debug = app._lookup_greek_provider(
+        "ofarmakopoiosmou.gr",
+        "https://www.ofarmakopoiosmou.gr/search?s=5200421900551",
+        "5200421900551",
+    )
+    assert found == []
+    assert debug["error"] == "blocked"
+    assert len(calls) == 1
+
+
+def test_two_primary_providers_run_in_parallel(monkeypatch):
+    import time
+
+    app.online_lookup_candidates.clear()
+    monkeypatch.setattr(app, "_greek_search_urls", lambda code, _name="": [
+        ("first.gr", f"https://first.gr/{code}"),
+        ("second.gr", f"https://second.gr/{code}"),
+    ])
+
+    def slow_lookup(domain, _url, _code):
+        time.sleep(0.15)
+        return [], {"provider": domain}
+
+    monkeypatch.setattr(app, "_lookup_greek_provider", slow_lookup)
+    started = time.monotonic()
+    app.online_lookup_candidates("5200421900551", "")
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.27
+
+
 @pytest.mark.parametrize("status", [403, 429, 500])
 def test_timeout_403_429_5xx_does_not_crash_app(monkeypatch, status):
     class FakeResponse:
