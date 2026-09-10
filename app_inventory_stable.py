@@ -21,6 +21,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
+APP_VERSION = "2026.09.10.1"
 
 
 def clean(value: Any) -> str:
@@ -288,6 +289,11 @@ def scan_tab() -> None:
 
     st.subheader("📷 Σκανάρισμα barcode")
     st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
+    st.caption(f"Έκδοση εφαρμογής: {APP_VERSION}")
+
+    if st.button("🧹 Καθαρισμός προηγούμενης σάρωσης", width="stretch"):
+        _clear_scan_state()
+        st.rerun()
 
     scan_method = st.segmented_control(
         "Τρόπος σάρωσης",
@@ -343,6 +349,15 @@ def scan_tab() -> None:
         st.session_state["active_barcode"] = code
         st.session_state.pop("lookup_candidates", None)
 
+    with st.expander("🛠️ Διαγνωστικά barcode", expanded=False):
+        st.write({
+            "app_version": APP_VERSION,
+            "scanner_barcode": clean(st.session_state.get("active_barcode")),
+            "manual_barcode": clean(manual_code),
+            "effective_barcode": code,
+            "catalog_product": lookup_starter_product(code),
+        })
+
     c1, c2 = st.columns(2)
     search_clicked = c1.button("🔎 Βρες προϊόν", type="primary", width="stretch", disabled=not code)
     online_clicked = c2.button("🌐 Ψάξε ξανά online", width="stretch", disabled=not code)
@@ -365,6 +380,13 @@ def scan_tab() -> None:
         return
 
     selected = render_candidate_picker(candidates)
+    with st.expander("🛠️ Διαγνωστικά αποτελέσματος", expanded=False):
+        st.write({
+            "effective_barcode": code,
+            "product_name": clean(selected.get("product_name")),
+            "source": clean(selected.get("source")),
+            "confidence": selected.get("confidence", ""),
+        })
     context = hashlib.sha256((code + clean(selected.get("product_name"))).encode()).hexdigest()[:10]
     product_name = st.text_input(
         "Όνομα προϊόντος",
