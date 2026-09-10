@@ -235,6 +235,7 @@ def test_search_queries_are_ordered_primary_then_fallback_then_general():
     assert queries[0] == f'"{barcode}" site:pharmacy295.gr'
     assert queries[1] == f'"{barcode}" site:ofarmakopoiosmou.gr'
     assert "vita4you.gr" in queries[2]
+    assert "drugstore.gr" in queries[2]
     assert queries[-1] == f'"{barcode}"'
 
 
