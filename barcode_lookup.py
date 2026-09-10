@@ -22,6 +22,7 @@ PRIMARY_PHARMACY_DOMAINS = [
 ]
 
 FALLBACK_DOMAINS = [
+    "drugstore.gr",
     "vita4you.gr",
     "tofarmakeiomou.gr",
     "skroutz.gr",
