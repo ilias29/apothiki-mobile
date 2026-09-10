@@ -21,7 +21,8 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.10.1"
+APP_VERSION = "2026.09.10.2"
+PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
 def clean(value: Any) -> str:
@@ -357,6 +358,12 @@ def scan_tab() -> None:
             "effective_barcode": code,
             "catalog_product": lookup_starter_product(code),
         })
+        st.caption("Το τεστ ελέγχει τις πηγές από τον server του Streamlit με 3 πραγματικά barcode.")
+        if st.button("🧪 Τεστ κάλυψης e-shops", key="provider_benchmark_button"):
+            with st.spinner("Ελέγχω τις πηγές — μπορεί να χρειαστεί έως ένα λεπτό..."):
+                st.session_state["provider_benchmark"] = core.benchmark_provider_coverage(PROVIDER_BENCHMARK_CODES)
+        if st.session_state.get("provider_benchmark"):
+            st.dataframe(st.session_state["provider_benchmark"], hide_index=True, width="stretch")
 
     c1, c2 = st.columns(2)
     search_clicked = c1.button("🔎 Βρες προϊόν", type="primary", width="stretch", disabled=not code)
