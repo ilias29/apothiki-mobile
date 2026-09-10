@@ -1794,6 +1794,10 @@ def lookup_traceability_exact(stock: pd.DataFrame, pc_code: str = "", serial_num
 GREEK_PROVIDER_DOMAINS = [
     "discountpharmacy.gr",
     "pharmacy295.gr",
+    "pharmasee.gr",
+    "pharmacydiscount.gr",
+    "greekpharm.gr",
+    "fullhealth.gr",
 ]
 
 GENERIC_PROVIDER_TITLES = {
@@ -2058,6 +2062,10 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
     return [
         ("discountpharmacy.gr", f"https://www.discountpharmacy.gr/search?search={quoted}"),
         ("pharmacy295.gr", f"https://www.pharmacy295.gr/search?controller=search&s={quoted}"),
+        ("pharmasee.gr", f"https://pharmasee.gr/?s={quoted}&post_type=product"),
+        ("pharmacydiscount.gr", f"https://www.pharmacydiscount.gr/search?search={quoted}"),
+        ("greekpharm.gr", f"https://greekpharm.gr/catalogsearch/result/?q={quoted}"),
+        ("fullhealth.gr", f"https://www.fullhealth.gr/index.php?route=product/search&search={quoted}"),
     ]
 
 
