@@ -73,6 +73,17 @@ def base_row(**overrides):
     return row
 
 
+def test_extracts_strength_form_and_pack_count_without_stock_quantity():
+    parsed = app.extract_commercial_attributes("Zinc Chelate 25 mg - 100 veg capsules")
+    assert parsed == {"strength": "25 MG", "dosage_form": "CAPS", "package_size": "100 CAPS"}
+    assert "quantity" not in parsed
+
+
+def test_extracts_liquid_strength_and_bottle_volume_separately():
+    parsed = app.extract_commercial_attributes("Vitamin D3 1000 IU liquid 30 ml")
+    assert parsed == {"strength": "1000 IU", "dosage_form": "LIQUID", "package_size": "30 ML"}
+
+
 def test_one_normal_ui_data_load_is_reused_in_cache():
     app.invalidate_data_cache()
     ws = FakeWorksheet(headers=app.COLUMNS, records=[base_row()])
