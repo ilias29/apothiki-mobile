@@ -81,3 +81,28 @@ def test_existing_sheet_product_still_has_priority_over_starter_catalog(monkeypa
     }])
     monkeypatch.setattr(stable, "read_products", lambda: products)
     assert stable.local_product_by_code("5055148407049")["product_name"] == "CUSTOM NAME"
+
+
+def test_new_scan_replaces_stale_manual_depon_barcode_and_product(monkeypatch):
+    monkeypatch.setattr(stable.st, "session_state", {
+        "active_barcode": "5200000000000",
+        "manual_barcode": "5200000000000",
+        "lookup_candidates": [{"product_name": "DEPON ODIS"}],
+        "selected_candidate_index": 0,
+    })
+    assert stable.accept_detected_barcode("5055148407049") is True
+    assert stable.st.session_state["active_barcode"] == "5055148407049"
+    assert stable.st.session_state["manual_barcode"] == "5055148407049"
+    assert "lookup_candidates" not in stable.st.session_state
+    assert "selected_candidate_index" not in stable.st.session_state
+
+
+def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
+    candidates = [{"product_name": "LAMBERTS VITAMIN C 1000 MG 30 TABS"}]
+    monkeypatch.setattr(stable.st, "session_state", {
+        "active_barcode": "5055148407049",
+        "manual_barcode": "5055148407049",
+        "lookup_candidates": candidates,
+    })
+    assert stable.accept_detected_barcode("5055148407049") is False
+    assert stable.st.session_state["lookup_candidates"] == candidates
