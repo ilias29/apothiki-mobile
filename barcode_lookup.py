@@ -8,6 +8,10 @@ import requests
 
 SEARCH_TIMEOUT = 8
 MAX_RESULTS = 8
+DDG_SEARCH_ENDPOINTS = (
+    ("post", "https://html.duckduckgo.com/html/"),
+    ("get", "https://lite.duckduckgo.com/lite/"),
+)
 
 # Κύριες online πηγές για barcode lookup. Πρώτα επιχειρούμε άμεση,
 # επιβεβαιωμένη αναζήτηση σε pharmacy e-shops και μόνο αν δεν βρεθεί
@@ -110,39 +114,63 @@ def _looks_like_product(title: str, snippet: str, barcode: str) -> bool:
     )
 
 
+def _parse_ddg_results(text: str) -> list[dict[str, str]]:
+    """Parse both DuckDuckGo HTML and Lite layouts.
+
+    DuckDuckGo serves different markup to cloud IPs. Supporting both layouts
+    avoids silently returning zero products when only the presentation changes.
+    """
+    anchors = list(re.finditer(
+        r'<a[^>]+(?:class=["\'][^"\']*(?:result__a|result-link)[^"\']*["\'][^>]+)?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        text,
+        flags=re.I | re.S,
+    ))
+    results: list[dict[str, str]] = []
+    seen = set()
+    for index, match in enumerate(anchors):
+        tag = match.group(0).lower()
+        if "result__a" not in tag and "result-link" not in tag:
+            continue
+        url = _unwrap_ddg_url(match.group(1))
+        title = _strip_tags(match.group(2))
+        if not url or not title or url in seen:
+            continue
+        next_start = anchors[index + 1].start() if index + 1 < len(anchors) else min(len(text), match.end() + 1500)
+        context = text[match.end():next_start]
+        snippet_match = re.search(
+            r'class=["\'][^"\']*(?:result__snippet|result-snippet)[^"\']*["\'][^>]*>(.*?)</(?:a|div|td)',
+            context,
+            flags=re.I | re.S,
+        )
+        snippet = _strip_tags(snippet_match.group(1)) if snippet_match else _strip_tags(context)[:500]
+        seen.add(url)
+        results.append({"title": title, "snippet": snippet, "url": url})
+        if len(results) >= MAX_RESULTS * 2:
+            break
+    return results
+
+
 def _search_ddg(query: str) -> list[dict[str, str]]:
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; PharmacyInventory/1.0)",
         "Accept-Language": "el-GR,el;q=0.9,en;q=0.7",
     }
-    response = requests.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers=headers,
-        timeout=SEARCH_TIMEOUT,
-    )
-    response.raise_for_status()
-    text = response.text
-
-    links = re.findall(
-        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-        text,
-        flags=re.I | re.S,
-    )
-    snippets = re.findall(
-        r'<(?:a|div)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>',
-        text,
-        flags=re.I | re.S,
-    )
-
-    results = []
-    for index, (raw_url, raw_title) in enumerate(links[: MAX_RESULTS * 2]):
-        url = _unwrap_ddg_url(raw_url)
-        title = _strip_tags(raw_title)
-        snippet = _strip_tags(snippets[index]) if index < len(snippets) else ""
-        if url and title:
-            results.append({"title": title, "snippet": snippet, "url": url})
-    return results
+    last_error = None
+    for method, endpoint in DDG_SEARCH_ENDPOINTS:
+        try:
+            kwargs = {"data": {"q": query}} if method == "post" else {"params": {"q": query}}
+            response = requests.request(method, endpoint, headers=headers, timeout=SEARCH_TIMEOUT, **kwargs)
+            response.raise_for_status()
+            if re.search(r"captcha|anomaly-modal|robot check", response.text, flags=re.I):
+                continue
+            results = _parse_ddg_results(response.text)
+            if results:
+                return results
+        except requests.RequestException as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return []
 
 
 def _search_queries(barcode: str) -> list[str]:
