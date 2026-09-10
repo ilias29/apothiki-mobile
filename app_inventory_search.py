@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import hashlib
 import re
 import calendar
@@ -2179,6 +2180,48 @@ def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[di
         reverse=True,
     )
     return ranked[:3], {"attempted": attempts, "total_results": len(ranked[:3]), "selected_result": ranked[0] if ranked else {}}
+
+
+def benchmark_provider_coverage(codes: list[str]) -> list[dict[str, Any]]:
+    """Measure provider coverage from the environment that actually runs the app."""
+    clean_codes = list(dict.fromkeys(clean(code) for code in codes if clean(code)))
+    jobs = [(code, domain, url) for code in clean_codes for domain, url in _greek_search_urls(code, "")]
+
+    def run(job: tuple[str, str, str]) -> dict[str, Any]:
+        code, domain, url = job
+        started = time.monotonic()
+        found, debug = _lookup_greek_provider(domain, url, code)
+        return {
+            "provider": domain,
+            "exact": any(bool(item.get("verified")) for item in found),
+            "search_ok": debug.get("search_status") == 200,
+            "error": clean(debug.get("error")) or clean(debug.get("rejection_reason")),
+            "seconds": round(time.monotonic() - started, 2),
+        }
+
+    attempts: list[dict[str, Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(jobs) or 1)) as executor:
+        futures = [executor.submit(run, job) for job in jobs]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                attempts.append(future.result())
+            except Exception as exc:
+                attempts.append({"provider": "unknown", "exact": False, "search_ok": False, "error": str(exc), "seconds": 0.0})
+
+    report: list[dict[str, Any]] = []
+    domains = [domain for domain, _url in _greek_search_urls(clean_codes[0] if clean_codes else "test", "")]
+    for domain in domains:
+        rows = [row for row in attempts if row["provider"] == domain]
+        errors = sorted({row["error"] for row in rows if row["error"]})
+        report.append({
+            "Πηγή": domain,
+            "Ακριβή barcode": sum(1 for row in rows if row["exact"]),
+            "Προσβάσιμες αναζητήσεις": sum(1 for row in rows if row["search_ok"]),
+            "Σύνολο τεστ": len(clean_codes),
+            "Μέσος χρόνος (sec)": round(sum(row["seconds"] for row in rows) / len(rows), 2) if rows else 0.0,
+            "Σφάλματα": ", ".join(errors[:3]),
+        })
+    return sorted(report, key=lambda row: (-row["Ακριβή barcode"], -row["Προσβάσιμες αναζητήσεις"], row["Μέσος χρόνος (sec)"]))
 
 
 def should_run_online_lookup(code: str, local_product: dict[str, Any] | None) -> bool:
