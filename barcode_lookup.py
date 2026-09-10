@@ -193,6 +193,7 @@ def _verified_provider_candidates(barcode: str) -> list[dict[str, Any]]:
             "gtin": barcode if is_gtin14 else "",
             "strength": clean(item.get("strength")),
             "dosage_form": clean(item.get("dosage_form")),
+            "package_size": clean(item.get("package_size")),
             "category": clean(item.get("category")) or "Άλλο",
             "source": clean(item.get("provider")) or "verified pharmacy",
             "url": clean(item.get("product_page_url")),
@@ -222,6 +223,10 @@ def _fallback_search_candidates(barcode: str) -> list[dict[str, Any]]:
             continue
 
     candidates = []
+    try:
+        import app_inventory_search as inventory_search
+    except Exception:
+        inventory_search = None
     for result in raw_results:
         title = _clean_title(result["title"], barcode)
         snippet = result["snippet"]
@@ -232,6 +237,10 @@ def _fallback_search_candidates(barcode: str) -> list[dict[str, Any]]:
         exact_barcode_visible = barcode in f"{result['title']} {snippet}"
         primary = any(domain.endswith(item) for item in PRIMARY_PHARMACY_DOMAINS)
         fallback = any(domain.endswith(item) for item in FALLBACK_DOMAINS)
+        parsed = (
+            inventory_search.extract_commercial_attributes(f"{title} {snippet}")
+            if inventory_search else {"strength": "", "dosage_form": "", "package_size": ""}
+        )
 
         confidence = 0.80 if exact_barcode_visible else 0.60
         if primary:
@@ -245,8 +254,9 @@ def _fallback_search_candidates(barcode: str) -> list[dict[str, Any]]:
                 "brand": "",
                 "barcode": barcode,
                 "gtin": "",
-                "strength": "",
-                "dosage_form": "",
+                "strength": parsed["strength"],
+                "dosage_form": parsed["dosage_form"],
+                "package_size": parsed["package_size"],
                 "category": "Άλλο",
                 "source": domain or "web",
                 "url": result["url"],
