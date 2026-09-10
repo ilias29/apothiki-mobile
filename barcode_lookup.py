@@ -1,4 +1,5 @@
 import html
+import concurrent.futures
 import re
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -241,15 +242,17 @@ def _verified_provider_candidates(barcode: str) -> list[dict[str, Any]]:
 def _fallback_search_candidates(barcode: str) -> list[dict[str, Any]]:
     raw_results: list[dict[str, str]] = []
     seen_urls = set()
-    for query in _search_queries(barcode):
-        try:
-            for result in _search_ddg(query):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(_search_queries(barcode))) as executor:
+        futures = [executor.submit(_search_ddg, query) for query in _search_queries(barcode)]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results = future.result()
+            except Exception:
+                continue
+            for result in results:
                 if result["url"] not in seen_urls:
                     seen_urls.add(result["url"])
                     raw_results.append(result)
-        except Exception:
-            # Ένα provider/search failure δεν πρέπει να ρίχνει ολόκληρο το lookup.
-            continue
 
     candidates = []
     try:
