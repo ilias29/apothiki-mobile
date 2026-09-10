@@ -61,3 +61,23 @@ def test_stale_internal_codex_model_is_repaired_for_openai_api(monkeypatch):
 def test_live_scanner_accepts_valid_ean13_and_rejects_bad_check_digit():
     assert stable.validated_live_barcode("5200421900551") == "5200421900551"
     assert stable.validated_live_barcode("5200421900552") == ""
+
+
+def test_pharmacy_starter_catalog_resolves_lamberts_without_online_lookup(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    product = stable.local_product_by_code("5055148407049")
+    assert product["product_name"] == "LAMBERTS VITAMIN C 1000 MG 30 TABS"
+    assert product["brand"] == "LAMBERTS"
+    assert product["strength"] == "1000 MG"
+    assert product["dosage_form"] == "TABS"
+    assert product["package_size"] == "30 TABS"
+    assert product["source"] == "Κατάλογος φαρμακείου"
+
+
+def test_existing_sheet_product_still_has_priority_over_starter_catalog(monkeypatch):
+    products = stable.pd.DataFrame([{
+        "Barcode": "5055148407049", "ProductName": "CUSTOM NAME", "Brand": "CUSTOM",
+        "Strength": "", "DosageForm": "", "Category": "Άλλο",
+    }])
+    monkeypatch.setattr(stable, "read_products", lambda: products)
+    assert stable.local_product_by_code("5055148407049")["product_name"] == "CUSTOM NAME"
