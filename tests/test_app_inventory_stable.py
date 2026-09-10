@@ -110,3 +110,12 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 def test_deployed_app_has_visible_diagnostic_version():
     assert stable.APP_VERSION == "2026.09.10.1"
+
+
+def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    product = stable.local_product_by_code("5055148400620")
+    assert product["product_name"] == "LAMBERTS COD LIVER OIL 1000 MG 180 CAPS"
+    assert product["strength"] == "1000 MG"
+    assert product["dosage_form"] == "CAPS"
+    assert product["package_size"] == "180 CAPS"
