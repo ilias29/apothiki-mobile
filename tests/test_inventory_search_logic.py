@@ -823,6 +823,23 @@ def test_online_lookup_result_is_cached_and_not_repeated_on_normal_rerun(monkeyp
     assert calls["n"] == len(app._greek_search_urls("5201234567890", ""))
 
 
+def test_provider_benchmark_ranks_exact_barcode_coverage_first(monkeypatch):
+    monkeypatch.setattr(app, "_greek_search_urls", lambda code, _name="": [
+        ("strong.gr", f"https://strong.gr/?q={code}"),
+        ("weak.gr", f"https://weak.gr/?q={code}"),
+    ])
+
+    def fake_lookup(domain, _url, code):
+        exact = domain == "strong.gr" or code == "A"
+        return ([{"verified": exact}], {"search_status": 200, "error": "", "rejection_reason": ""})
+
+    monkeypatch.setattr(app, "_lookup_greek_provider", fake_lookup)
+    report = app.benchmark_provider_coverage(["A", "B"])
+    assert report[0]["Πηγή"] == "strong.gr"
+    assert report[0]["Ακριβή barcode"] == 2
+    assert report[1]["Ακριβή barcode"] == 1
+
+
 @pytest.mark.parametrize("status", [403, 429, 500])
 def test_timeout_403_429_5xx_does_not_crash_app(monkeypatch, status):
     class FakeResponse:
