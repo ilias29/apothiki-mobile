@@ -4,6 +4,51 @@ import app_inventory_search
 import barcode_lookup
 
 
+def test_html_search_layout_parses_real_full_health_barcode_result():
+    barcode = "5200421900551"
+    html = f'''<div class="result">
+      <a class="result__a" href="https://pharmasee.gr/product/full-health-zinc-chelate-plus-copper-100-vcaps/">
+        Full Health Zinc Chelate Plus Copper 100 Vcaps
+      </a><div class="result__snippet">Κωδικός προϊόντος: {barcode}</div>
+    </div>'''
+    results = barcode_lookup._parse_ddg_results(html)
+    assert results[0]["title"] == "Full Health Zinc Chelate Plus Copper 100 Vcaps"
+    assert barcode in results[0]["snippet"]
+
+
+def test_lite_search_layout_parses_real_solgar_barcode_result():
+    barcode = "033984003972"
+    html = f'''<table><tr><td>
+      <a rel="nofollow" class="result-link" href="https://example-pharmacy.gr/solgar-b12">
+        Solgar Methylcobalamin B12 1000 μg 30 Nuggets
+      </a></td></tr><tr><td class="result-snippet">UPC {barcode}</td></tr></table>'''
+    results = barcode_lookup._parse_ddg_results(html)
+    assert "Solgar Methylcobalamin" in results[0]["title"]
+    assert barcode in results[0]["snippet"]
+
+
+def test_search_retries_with_lite_layout_when_cloud_html_is_blocked(monkeypatch):
+    calls = []
+
+    class Response:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url))
+        if "html.duckduckgo.com" in url:
+            return Response("anomaly-modal robot check")
+        return Response('<a class="result-link" href="https://shop.gr/product">Product 1000 mg</a>')
+
+    monkeypatch.setattr(barcode_lookup.requests, "request", fake_request)
+    results = barcode_lookup._search_ddg('"033984003972"')
+    assert results[0]["title"] == "Product 1000 mg"
+    assert [method for method, _url in calls] == ["post", "get"]
+
+
 def test_primary_pharmacy_exact_barcode_wins(monkeypatch):
     barcode = "3337875797597"
     monkeypatch.setattr(barcode_lookup, "_verified_provider_candidates", lambda _code: [])
