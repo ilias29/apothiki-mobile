@@ -46,7 +46,7 @@ WS_NAME = "Transactions"
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
 CATEGORIES = ["Φάρμακο", "Συμπλήρωμα", "Καλλυντικό", "Αναλώσιμο", "Άλλο"]
-GREEK_PROVIDER_TIMEOUT_SECONDS = 4
+GREEK_PROVIDER_TIMEOUT_SECONDS = 2.5
 GREEK_PROVIDER_CACHE_TTL_SECONDS = 600
 BACK_OCR_TIMEOUT_SECONDS = 8
 MAX_FRONT_OCR_CALLS = 0
@@ -1797,6 +1797,20 @@ GREEK_PROVIDER_DOMAINS = [
     "pharmacy295.gr",
 ]
 
+BOT_SHIELD_PATTERN = re.compile(
+    r"captcha|robot\s*check|verify\s+(?:that\s+)?you\s+are\s+human|"
+    r"validate\s+that\s+you\s+are\s+human|checking\s+your\s+browser|"
+    r"making\s+sure\s+your\s+connection\s+is\s+safe|just\s+a\s+moment|"
+    r"access\s+denied|cloudflare|trustservers|challenge-platform|cf-chl-",
+    flags=re.I,
+)
+
+
+def is_bot_shield_page(page_html: Any, page_title: Any = "") -> bool:
+    """Recognize anti-bot interstitials before parsing them as shop results."""
+    sample = f"{clean(page_title)}\n{clean(page_html)[:20000]}"
+    return bool(BOT_SHIELD_PATTERN.search(sample))
+
 GENERIC_PROVIDER_TITLES = {
     "pharmacy295",
     "discount pharmacy",
@@ -2085,10 +2099,12 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
             debug["error"] = f"http_{response.status_code}"
             return [], debug
         html = response.text
-        if re.search(r"captcha|access denied|cloudflare|robot check", html, flags=re.I):
+        if is_bot_shield_page(html, getattr(response, "title", "")):
             debug["error"] = "blocked"
             return [], debug
-        candidates = extract_provider_search_candidates(html, search_url, code, domain)[:2]
+        # A single exact-looking detail page is enough. Following more pages makes
+        # a failed scan unnecessarily slow and does not make the match safer.
+        candidates = extract_provider_search_candidates(html, search_url, code, domain)[:1]
         debug["candidate_detail_urls"] = candidates
         results: list[dict[str, Any]] = []
         for detail_url in candidates:
@@ -2100,7 +2116,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
                     inspected["rejection_reason"] = f"http_{detail_response.status_code}"
                     debug["detail_pages_inspected"].append(inspected)
                     continue
-                if re.search(r"captcha|access denied|cloudflare|robot check", detail_response.text, flags=re.I):
+                if is_bot_shield_page(detail_response.text, getattr(detail_response, "title", "")):
                     inspected["rejection_reason"] = "blocked"
                     debug["detail_pages_inspected"].append(inspected)
                     continue
