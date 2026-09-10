@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import requests
 
 
-SEARCH_TIMEOUT = 8
+SEARCH_TIMEOUT = 3
 MAX_RESULTS = 8
 DDG_SEARCH_ENDPOINTS = (
     ("post", "https://html.duckduckgo.com/html/"),
@@ -163,7 +163,12 @@ def _search_ddg(query: str) -> list[dict[str, str]]:
             kwargs = {"data": {"q": query}} if method == "post" else {"params": {"q": query}}
             response = requests.request(method, endpoint, headers=headers, timeout=SEARCH_TIMEOUT, **kwargs)
             response.raise_for_status()
-            if re.search(r"captcha|anomaly-modal|robot check", response.text, flags=re.I):
+            if re.search(
+                r"captcha|anomaly-modal|robot\s*check|verify\s+(?:that\s+)?you\s+are\s+human|"
+                r"checking\s+your\s+browser|just\s+a\s+moment|challenge-platform|cf-chl-",
+                response.text,
+                flags=re.I,
+            ):
                 continue
             results = _parse_ddg_results(response.text)
             if results:
