@@ -820,7 +820,7 @@ def test_online_lookup_result_is_cached_and_not_repeated_on_normal_rerun(monkeyp
     first, _ = app.online_lookup_candidates("5201234567890", "")
     second, _ = app.online_lookup_candidates("5201234567890", "")
     assert first == second
-    assert calls["n"] == 2  # one per provider only on first cached invocation
+    assert calls["n"] == len(app._greek_search_urls("5201234567890", ""))
 
 
 @pytest.mark.parametrize("status", [403, 429, 500])
