@@ -840,6 +840,11 @@ def test_provider_benchmark_ranks_exact_barcode_coverage_first(monkeypatch):
     assert report[1]["Ακριβή barcode"] == 1
 
 
+def test_live_lookup_uses_only_two_primary_epharmacies():
+    providers = [domain for domain, _url in app._greek_search_urls("5200421900551", "")]
+    assert providers == ["ofarmakopoiosmou.gr", "pharmacy295.gr"]
+
+
 @pytest.mark.parametrize("status", [403, 429, 500])
 def test_timeout_403_429_5xx_does_not_crash_app(monkeypatch, status):
     class FakeResponse:
