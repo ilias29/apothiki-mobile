@@ -109,7 +109,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.10.6"
+    assert stable.APP_VERSION == "2026.09.10.7"
 
 
 def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
@@ -137,3 +137,22 @@ def test_scanned_multi_guard_adr_60_resolves_locally(monkeypatch):
     assert product["brand"] == "LAMBERTS"
     assert product["dosage_form"] == "TABS"
     assert product["package_size"] == "60 TABS"
+
+
+def test_all_products_from_new_lamberts_invoice_are_in_catalog(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    expected = {
+        "5055148412708": "LAMBERTS MULTI-GUARD ADR 60 TABS",
+        "5055148412616": "LAMBERTS TURMERIC FAST RELEASE 60 TABS",
+        "5055148410544": "LAMBERTS VITAMIN D3 4000 IU 120 CAPS",
+        "5055148401351": "LAMBERTS MAXI HAIR NEW FORMULA 60 TABS",
+        "5055148414849": "LAMBERTS B-50 COMPLEX 120 TABS",
+        "5055148400217": "LAMBERTS B-50 COMPLEX 60 TABS",
+        "5055148408909": "LAMBERTS CO-Q10 30 MG 30 CAPS",
+        "5055148411008": "LAMBERTS L-METHIONINE 500 MG 60 CAPS",
+        "5055148410674": "LAMBERTS OMEGA 3 ULTRA 1300 MG 60 CAPS",
+    }
+    for barcode, name in expected.items():
+        product = stable.local_product_by_code(barcode)
+        assert product is not None
+        assert product["product_name"] == name
