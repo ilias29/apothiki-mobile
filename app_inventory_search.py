@@ -1793,14 +1793,8 @@ def lookup_traceability_exact(stock: pd.DataFrame, pc_code: str = "", serial_num
 
 
 GREEK_PROVIDER_DOMAINS = [
-    "discountpharmacy.gr",
-    "pharmacy295.gr",
     "ofarmakopoiosmou.gr",
-    "drugstore.gr",
-    "pharmasee.gr",
-    "pharmacydiscount.gr",
-    "greekpharm.gr",
-    "fullhealth.gr",
+    "pharmacy295.gr",
 ]
 
 GENERIC_PROVIDER_TITLES = {
@@ -2063,14 +2057,8 @@ def _greek_search_urls(code: str, product_name: str = "") -> list[tuple[str, str
         return []
     quoted = requests.utils.quote(query)
     return [
-        ("discountpharmacy.gr", f"https://www.discountpharmacy.gr/search?search={quoted}"),
-        ("pharmacy295.gr", f"https://www.pharmacy295.gr/search?controller=search&s={quoted}"),
         ("ofarmakopoiosmou.gr", f"https://www.ofarmakopoiosmou.gr/search?controller=search&s={quoted}"),
-        ("drugstore.gr", f"https://www.drugstore.gr/search?search={quoted}"),
-        ("pharmasee.gr", f"https://pharmasee.gr/?s={quoted}&post_type=product"),
-        ("pharmacydiscount.gr", f"https://www.pharmacydiscount.gr/search?search={quoted}"),
-        ("greekpharm.gr", f"https://greekpharm.gr/catalogsearch/result/?q={quoted}"),
-        ("fullhealth.gr", f"https://www.fullhealth.gr/index.php?route=product/search&search={quoted}"),
+        ("pharmacy295.gr", f"https://www.pharmacy295.gr/search?controller=search&s={quoted}"),
     ]
 
 
@@ -2100,7 +2088,7 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
         if re.search(r"captcha|access denied|cloudflare|robot check", html, flags=re.I):
             debug["error"] = "blocked"
             return [], debug
-        candidates = extract_provider_search_candidates(html, search_url, code, domain)[:5]
+        candidates = extract_provider_search_candidates(html, search_url, code, domain)[:2]
         debug["candidate_detail_urls"] = candidates
         results: list[dict[str, Any]] = []
         for detail_url in candidates:
@@ -2164,8 +2152,19 @@ def _lookup_greek_provider(domain: str, search_url: str, code: str) -> tuple[lis
 def online_lookup_candidates(code: str, product_name: str = "") -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     attempts = []
-    for provider_order, (domain, url) in enumerate(_greek_search_urls(code, product_name)):
+    providers = _greek_search_urls(code, product_name)
+
+    def run_provider(job: tuple[int, tuple[str, str]]) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
+        provider_order, (domain, url) = job
         found, info = _lookup_greek_provider(domain, url, code)
+        return provider_order, found, info
+
+    completed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(providers) or 1)) as executor:
+        futures = [executor.submit(run_provider, job) for job in enumerate(providers)]
+        for future in concurrent.futures.as_completed(futures):
+            completed.append(future.result())
+    for provider_order, found, info in sorted(completed, key=lambda item: item[0]):
         info["provider_order"] = provider_order
         attempts.append(info)
         candidates.extend(found)
