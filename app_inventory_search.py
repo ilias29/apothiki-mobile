@@ -166,6 +166,57 @@ def normalize_strength(value: Any) -> str:
     return text
 
 
+DOSAGE_FORM_PATTERNS = [
+    ("CAPS", r"capsules?|caps?|softgels?|κάψουλες?"),
+    ("TABS", r"tablets?|tabs?|δισκία"),
+    ("SACHETS", r"sachets?|φακελάκια"),
+    ("AMPOULES", r"ampoules?|αμπούλες"),
+    ("LIQUID", r"oral\s+solution|liquid|υγρό|πόσιμο\s+διάλυμα"),
+    ("SYRUP", r"syrup|σιρόπι"),
+    ("SPRAY", r"spray|σπρέι"),
+    ("DROPS", r"drops?|σταγόνες"),
+    ("CREAM", r"cream|κρέμα"),
+    ("GEL", r"gel|γέλη"),
+    ("SHAMPOO", r"shampoo|σαμπουάν"),
+]
+
+
+def extract_commercial_attributes(value: Any) -> dict[str, str]:
+    """Extract label attributes, never inventory quantity, from product text."""
+    text = normalize_spaces(value)
+    result = {"strength": "", "dosage_form": "", "package_size": ""}
+    strength = re.search(
+        r"\b\d+(?:[.,]\d+)?\s*(?:mcg|μg|ug|mg|g|iu|i\.u\.|cfu|%)"
+        r"(?:\s*/\s*\d+(?:[.,]\d+)?\s*(?:ml|g))?\b",
+        text,
+        flags=re.I,
+    )
+    if strength:
+        result["strength"] = normalize_strength(strength.group(0).replace(",", "."))
+
+    for canonical, pattern in DOSAGE_FORM_PATTERNS:
+        if re.search(rf"\b(?:{pattern})\b", text, flags=re.I):
+            result["dosage_form"] = canonical
+            count = re.search(
+                rf"\b(\d{{1,4}})\s*(?:x\s*)?(?:veg(?:etable)?\s+)?(?:{pattern})\b",
+                text,
+                flags=re.I,
+            )
+            if count:
+                result["package_size"] = f"{count.group(1)} {canonical}"
+            break
+
+    if not result["package_size"] and result["dosage_form"] in {
+        "LIQUID", "SYRUP", "SPRAY", "DROPS", "CREAM", "GEL", "SHAMPOO"
+    }:
+        measures = list(re.finditer(r"\b\d+(?:[.,]\d+)?\s*(?:ml|g)\b", text, flags=re.I))
+        for measure in reversed(measures):
+            if not strength or measure.span() != strength.span():
+                result["package_size"] = normalize_strength(measure.group(0).replace(",", "."))
+                break
+    return result
+
+
 def normalize_product_fields(fields: dict[str, Any]) -> dict[str, str]:
     return {
         "product_name": normalize_spaces(fields.get("product_name", "")).upper(),
@@ -1946,6 +1997,10 @@ def extract_provider_detail_product(detail_html: str, detail_url: str, code: str
                 if match:
                     product[field] = match.group(1)
                     break
+    parsed = extract_commercial_attributes(f"{product.get('product_name', '')} {text}")
+    for field in ["strength", "dosage_form", "package_size"]:
+        if not clean(product.get(field, "")):
+            product[field] = parsed[field]
     product["identifiers_found"] = _extract_provider_identifiers(detail_html)
     product["barcode_found"] = product["identifiers_found"][0] if product["identifiers_found"] else ""
     product["product_name"] = strip_provider_title_suffix(product.get("product_name", ""), provider)
