@@ -109,7 +109,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.10.7"
+    assert stable.APP_VERSION == "2026.09.10.8"
 
 
 def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
@@ -156,3 +156,12 @@ def test_all_products_from_new_lamberts_invoice_are_in_catalog(monkeypatch):
         product = stable.local_product_by_code(barcode)
         assert product is not None
         assert product["product_name"] == name
+
+
+def test_new_maxi_hair_packaging_barcode_resolves_locally(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    product = stable.local_product_by_code("5055148411252")
+    assert product["product_name"] == "LAMBERTS MAXI-HAIR 60 TABS"
+    assert product["brand"] == "LAMBERTS"
+    assert product["dosage_form"] == "TABS"
+    assert product["package_size"] == "60 TABS"
