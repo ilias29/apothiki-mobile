@@ -246,9 +246,9 @@ def test_one_search_failure_does_not_abort_other_sources(monkeypatch):
 
     def flaky_search(query):
         calls["count"] += 1
-        if calls["count"] == 1:
+        if "site:pharmacy295.gr" in query:
             raise RuntimeError("temporary search failure")
-        if calls["count"] == 2:
+        if "site:ofarmakopoiosmou.gr" in query:
             return [
                 {
                     "title": "La Roche-Posay Anthelios Fluid SPF50+ 50ml",
@@ -264,6 +264,10 @@ def test_one_search_failure_does_not_abort_other_sources(monkeypatch):
     assert calls["count"] == 4
     assert results
     assert results[0]["source"] == "ofarmakopoiosmou.gr"
+
+
+def test_search_timeout_is_short_enough_for_counter_use():
+    assert barcode_lookup.SEARCH_TIMEOUT <= 3
 
 
 def test_exact_fallback_can_beat_primary_result_without_barcode_evidence(monkeypatch):
