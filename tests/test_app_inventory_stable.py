@@ -109,7 +109,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.10.3"
+    assert stable.APP_VERSION == "2026.09.10.4"
 
 
 def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
