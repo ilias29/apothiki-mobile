@@ -14,6 +14,7 @@ import ai_inventory
 import app_inventory_search as core
 import inventory_base as base_db
 from barcode_lookup import lookup_barcode_online
+from starter_catalog import lookup_starter_product
 
 
 LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος Όροφος"}
@@ -60,27 +61,42 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
     if not code:
         return None
     products = read_products()
-    if products.empty:
-        return None
-    for column in ["Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC"]:
-        if column not in products.columns:
-            continue
-        match = products[products[column].astype(str).str.strip().eq(code)]
-        if not match.empty:
-            row = match.iloc[0]
-            return {
-                "product_name": clean(row.get("ProductName")),
-                "brand": clean(row.get("Brand")),
-                "barcode": clean(row.get("Barcode")) or code,
-                "gtin": clean(row.get("GTIN")),
-                "strength": clean(row.get("Strength")),
-                "dosage_form": clean(row.get("DosageForm")),
-                "package_size": "",
-                "category": clean(row.get("Category")) or DEFAULT_CATEGORY,
-                "source": "Δική σου επιβεβαιωμένη βάση",
-                "url": "",
-                "confidence": 1.0,
-            }
+    if not products.empty:
+        for column in ["Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC"]:
+            if column not in products.columns:
+                continue
+            match = products[products[column].astype(str).str.strip().eq(code)]
+            if not match.empty:
+                row = match.iloc[0]
+                return {
+                    "product_name": clean(row.get("ProductName")),
+                    "brand": clean(row.get("Brand")),
+                    "barcode": clean(row.get("Barcode")) or code,
+                    "gtin": clean(row.get("GTIN")),
+                    "strength": clean(row.get("Strength")),
+                    "dosage_form": clean(row.get("DosageForm")),
+                    "package_size": "",
+                    "category": clean(row.get("Category")) or DEFAULT_CATEGORY,
+                    "source": "Δική σου επιβεβαιωμένη βάση",
+                    "url": "",
+                    "confidence": 1.0,
+                }
+    product_name = lookup_starter_product(code)
+    if product_name:
+        attributes = core.extract_commercial_attributes(product_name)
+        return {
+            "product_name": product_name,
+            "brand": "LAMBERTS",
+            "barcode": code,
+            "gtin": "",
+            "strength": attributes["strength"],
+            "dosage_form": attributes["dosage_form"],
+            "package_size": attributes["package_size"],
+            "category": "Συμπλήρωμα διατροφής",
+            "source": "Κατάλογος φαρμακείου",
+            "url": "",
+            "confidence": 1.0,
+        }
     return None
 
 
