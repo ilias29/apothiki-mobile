@@ -109,7 +109,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.10.5"
+    assert stable.APP_VERSION == "2026.09.10.6"
 
 
 def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
@@ -128,3 +128,12 @@ def test_catalog_tab_data_includes_zero_stock_starter_products(monkeypatch):
     row = catalog[catalog["Barcode"] == "5055148400620"].iloc[0]
     assert row["Προϊόν"] == "LAMBERTS COD LIVER OIL 1000 MG 180 CAPS"
     assert row["Πηγή"] == "Κατάλογος φαρμακείου"
+
+
+def test_scanned_multi_guard_adr_60_resolves_locally(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    product = stable.local_product_by_code("5055148412708")
+    assert product["product_name"] == "LAMBERTS MULTI-GUARD ADR 60 TABS"
+    assert product["brand"] == "LAMBERTS"
+    assert product["dosage_form"] == "TABS"
+    assert product["package_size"] == "60 TABS"
