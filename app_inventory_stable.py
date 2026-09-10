@@ -75,6 +75,7 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
                 "gtin": clean(row.get("GTIN")),
                 "strength": clean(row.get("Strength")),
                 "dosage_form": clean(row.get("DosageForm")),
+                "package_size": "",
                 "category": clean(row.get("Category")) or DEFAULT_CATEGORY,
                 "source": "Δική σου επιβεβαιωμένη βάση",
                 "url": "",
@@ -202,7 +203,7 @@ def _clear_scan_state() -> None:
     ]:
         st.session_state.pop(key, None)
     for key in list(st.session_state.keys()):
-        if key.startswith(("product_name_", "brand_", "strength_", "form_", "confirm_", "quantity_", "location_")):
+        if key.startswith(("product_name_", "brand_", "strength_", "form_", "package_", "confirm_", "quantity_", "location_")):
             st.session_state.pop(key, None)
 
 
@@ -225,6 +226,7 @@ def render_candidate_picker(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             "brand": "",
             "strength": "",
             "dosage_form": "",
+            "package_size": "",
             "category": DEFAULT_CATEGORY,
             "source": "Χειροκίνητη καταχώρηση",
             "url": "",
@@ -343,9 +345,15 @@ def scan_tab() -> None:
         help="Διόρθωσέ το χειροκίνητα αν χρειάζεται.",
     )
     brand = st.text_input("Μάρκα / εταιρεία", value=clean(selected.get("brand")), key=f"brand_{context}")
-    c3, c4 = st.columns(2)
+    c3, c4, c5 = st.columns(3)
     strength = c3.text_input("Περιεκτικότητα", value=clean(selected.get("strength")), key=f"strength_{context}")
-    dosage_form = c4.text_input("Μορφή / συσκευασία", value=clean(selected.get("dosage_form")), key=f"form_{context}")
+    dosage_form = c4.text_input("Μορφή", value=clean(selected.get("dosage_form")), key=f"form_{context}")
+    package_size = c5.text_input(
+        "Μέγεθος συσκευασίας",
+        value=clean(selected.get("package_size")),
+        key=f"package_{context}",
+        help="Π.χ. 60 CAPS ή 100 ML. Δεν είναι η ποσότητα stock.",
+    )
 
     confirmed = st.checkbox(
         f"OK, το barcode {code} αντιστοιχεί σε αυτό το προϊόν",
@@ -374,7 +382,10 @@ def scan_tab() -> None:
                 dosage_form=dosage_form,
                 category=clean(selected.get("category")) or DEFAULT_CATEGORY,
                 location_id=location_id,
-                note=f"source={clean(selected.get('source')) or 'manual'}; verified_by_user=true",
+                note=(
+                    f"source={clean(selected.get('source')) or 'manual'}; "
+                    f"package_size={clean(package_size)}; verified_by_user=true"
+                ),
             )
             st.success(f"Αποθηκεύτηκαν {int(quantity)} τεμάχια: {product_name}")
             st.session_state["_scan_reset_pending"] = True
