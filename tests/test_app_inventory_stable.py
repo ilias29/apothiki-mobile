@@ -106,3 +106,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
     })
     assert stable.accept_detected_barcode("5055148407049") is False
     assert stable.st.session_state["lookup_candidates"] == candidates
+
+
+def test_deployed_app_has_visible_diagnostic_version():
+    assert stable.APP_VERSION == "2026.09.10.1"
