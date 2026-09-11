@@ -13,7 +13,10 @@ except Exception:
 import ai_inventory
 import app_inventory_search as core
 import inventory_base as base_db
+import inventory_csa as csa
 from barcode_lookup import lookup_barcode_online
+from pharmacy_catalog import catalog_dataframe as pharmacy_catalog_dataframe
+from pharmacy_catalog import lookup_pharmacy_product
 from starter_catalog import LAMBERTS_PRODUCTS, lookup_starter_product
 
 
@@ -21,7 +24,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.10.8"
+APP_VERSION = "2026.09.11.2"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -83,6 +86,27 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
                     "url": "",
                     "confidence": 1.0,
                 }
+    catalog_match = lookup_pharmacy_product(code)
+    if catalog_match:
+        product_name = catalog_match["product_name"]
+        attributes = core.extract_commercial_attributes(product_name)
+        brand_match = next(
+            (brand for brand in ["AVENE", "LIERAC", "LAMBERTS"] if brand in product_name.upper()),
+            "",
+        )
+        return {
+            "product_name": product_name,
+            "brand": brand_match,
+            "barcode": code,
+            "gtin": "",
+            "strength": attributes["strength"],
+            "dosage_form": attributes["dosage_form"],
+            "package_size": attributes["package_size"],
+            "category": DEFAULT_CATEGORY,
+            "source": "Βάση προϊόντων φαρμακείου",
+            "url": "",
+            "confidence": 1.0,
+        }
     product_name = lookup_starter_product(code)
     if product_name:
         attributes = core.extract_commercial_attributes(product_name)
@@ -110,12 +134,15 @@ def save_inventory_item(
     brand: str = "",
     strength: str = "",
     dosage_form: str = "",
+    expiry_date: str = "",
+    lot_number: str = "",
     category: str = DEFAULT_CATEGORY,
     location_id: int = 0,
     note: str = "",
 ) -> None:
     code = clean(code)
     product_name = clean(product_name)
+    expiry_date = core.parse_expiry_date(clean(expiry_date)) if clean(expiry_date) else ""
     if not code:
         raise ValueError("Δεν υπάρχει barcode.")
     if not product_name:
@@ -138,6 +165,8 @@ def save_inventory_item(
         category=category or DEFAULT_CATEGORY,
         strength=strength,
         dosage_form=dosage_form,
+        expiry_date=expiry_date,
+        lot_number=lot_number,
         location_id=location_id,
         movement="Απογραφή / καταμέτρηση (+)",
         quantity=int(quantity),
@@ -235,7 +264,7 @@ def _clear_scan_state() -> None:
     ]:
         st.session_state.pop(key, None)
     for key in list(st.session_state.keys()):
-        if key.startswith(("product_name_", "brand_", "strength_", "form_", "package_", "confirm_", "quantity_", "location_")):
+        if key.startswith(("product_name_", "brand_", "strength_", "form_", "package_", "expiry_", "no_expiry_", "lot_", "confirm_", "quantity_", "location_")):
             st.session_state.pop(key, None)
 
 
@@ -356,7 +385,10 @@ def scan_tab() -> None:
             "scanner_barcode": clean(st.session_state.get("active_barcode")),
             "manual_barcode": clean(manual_code),
             "effective_barcode": code,
-            "catalog_product": lookup_starter_product(code),
+            "catalog_product": (
+                (lookup_pharmacy_product(code) or {}).get("product_name")
+                or lookup_starter_product(code)
+            ),
         })
         st.caption("Το τεστ ελέγχει τις πηγές από τον server του Streamlit με 3 πραγματικά barcode.")
         if st.button("🧪 Τεστ κάλυψης e-shops", key="provider_benchmark_button"):
@@ -421,6 +453,15 @@ def scan_tab() -> None:
         return
 
     quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
+    expiry_date = st.date_input(
+        "Ημερομηνία λήξης",
+        value=None,
+        format="DD/MM/YYYY",
+        key=f"expiry_{context}",
+        help="Θα εμφανιστεί προειδοποίηση όταν απομένουν 6 μήνες ή λιγότερο.",
+    )
+    no_expiry = st.checkbox("Δεν υπάρχει ημερομηνία λήξης", key=f"no_expiry_{context}")
+    lot_number = st.text_input("Παρτίδα (προαιρετικό)", key=f"lot_{context}")
     location_label = st.selectbox(
         "Τοποθεσία",
         [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
@@ -430,6 +471,8 @@ def scan_tab() -> None:
 
     if st.button("💾 Αποθήκευση", type="primary", width="stretch", key=f"save_{context}"):
         try:
+            if expiry_date is None and not no_expiry:
+                raise ValueError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι δεν υπάρχει.")
             save_inventory_item(
                 code=code,
                 product_name=product_name,
@@ -437,6 +480,8 @@ def scan_tab() -> None:
                 brand=brand,
                 strength=strength,
                 dosage_form=dosage_form,
+                expiry_date=expiry_date.isoformat() if expiry_date is not None else "",
+                lot_number=lot_number,
                 category=clean(selected.get("category")) or DEFAULT_CATEGORY,
                 location_id=location_id,
                 note=(
@@ -463,7 +508,7 @@ def _invoice_dataframe_from_upload(file) -> pd.DataFrame:
 
 def _normalize_invoice_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "OK"])
+        return pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "ExpiryDate", "NoExpiry", "OK"])
     lower = {str(col).strip().lower(): col for col in df.columns}
     name_col = next((lower[k] for k in lower if any(token in k for token in ["product", "προϊόν", "description", "περιγραφή", "item"])), None)
     qty_col = next((lower[k] for k in lower if any(token in k for token in ["quantity", "qty", "ποσότητα", "τεμάχ"])), None)
@@ -475,6 +520,8 @@ def _normalize_invoice_rows(df: pd.DataFrame) -> pd.DataFrame:
     out["ProductName"] = df[name_col].map(clean)
     out["Quantity"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(1).astype(int) if qty_col is not None else 1
     out["Barcode"] = ""
+    out["ExpiryDate"] = ""
+    out["NoExpiry"] = False
     out["OK"] = False
     return out[out["ProductName"].ne("") & out["Quantity"].gt(0)].reset_index(drop=True)
 
@@ -493,8 +540,8 @@ def _invoice_rows_from_ai(images: list[dict[str, Any]], api_key: str, model: str
         qty_value = pd.to_numeric(item.get("Quantity"), errors="coerce")
         qty = 1 if pd.isna(qty_value) else int(qty_value)
         if product and qty > 0:
-            rows.append({"ProductName": product, "Quantity": qty, "Barcode": "", "OK": False})
-    return pd.DataFrame(rows, columns=["ProductName", "Quantity", "Barcode", "OK"])
+            rows.append({"ProductName": product, "Quantity": qty, "Barcode": "", "ExpiryDate": "", "NoExpiry": False, "OK": False})
+    return pd.DataFrame(rows, columns=["ProductName", "Quantity", "Barcode", "ExpiryDate", "NoExpiry", "OK"])
 
 
 def invoice_tab() -> None:
@@ -543,15 +590,18 @@ def invoice_tab() -> None:
         if st.button("➕ Πρόσθεσε γραμμή", disabled=not clean(name)):
             rows = st.session_state.get("invoice_rows")
             if not isinstance(rows, pd.DataFrame):
-                rows = pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "OK"])
+                rows = pd.DataFrame(columns=["ProductName", "Quantity", "Barcode", "ExpiryDate", "NoExpiry", "OK"])
             st.session_state["invoice_rows"] = pd.concat(
-                [rows, pd.DataFrame([{"ProductName": clean(name), "Quantity": int(qty), "Barcode": "", "OK": False}])],
+                [rows, pd.DataFrame([{"ProductName": clean(name), "Quantity": int(qty), "Barcode": "", "ExpiryDate": "", "NoExpiry": False, "OK": False}])],
                 ignore_index=True,
             )
 
     rows = st.session_state.get("invoice_rows")
     if not isinstance(rows, pd.DataFrame) or rows.empty:
         return
+    for column, default in [("ExpiryDate", ""), ("NoExpiry", False), ("OK", False)]:
+        if column not in rows.columns:
+            rows[column] = default
 
     st.markdown("**Βάλε barcode σε κάθε γραμμή και τσέκαρε OK.**")
     edited = st.data_editor(
@@ -562,6 +612,8 @@ def invoice_tab() -> None:
             "ProductName": st.column_config.TextColumn("Προϊόν"),
             "Quantity": st.column_config.NumberColumn("Ποσότητα", min_value=1, step=1),
             "Barcode": st.column_config.TextColumn("Barcode"),
+            "ExpiryDate": st.column_config.TextColumn("Λήξη", help="MM/YYYY ή DD/MM/YYYY"),
+            "NoExpiry": st.column_config.CheckboxColumn("Χωρίς λήξη"),
             "OK": st.column_config.CheckboxColumn("OK"),
         },
         key="invoice_editor",
@@ -572,10 +624,19 @@ def invoice_tab() -> None:
     invalid = chosen[chosen["Barcode"].astype(str).str.strip().eq("")]
     if not invalid.empty:
         st.warning("Υπάρχουν επιβεβαιωμένες γραμμές χωρίς barcode. Αυτές δεν θα περάσουν.")
+    missing_expiry = chosen[
+        chosen["ExpiryDate"].astype(str).str.strip().eq("")
+        & ~chosen["NoExpiry"].fillna(False).astype(bool)
+    ]
+    if not missing_expiry.empty:
+        st.warning("Υπάρχουν επιβεβαιωμένες γραμμές χωρίς λήξη. Συμπλήρωσέ την ή τσέκαρε «Χωρίς λήξη».")
 
     location_label = st.selectbox("Παραλαβή σε", [f"{idx} - {name}" for idx, name in LOCATIONS.items()], key="invoice_location")
     location_id = int(location_label.split("-", 1)[0].strip())
-    valid = chosen[chosen["Barcode"].astype(str).str.strip().ne("")]
+    valid = chosen[
+        chosen["Barcode"].astype(str).str.strip().ne("")
+        & (chosen["ExpiryDate"].astype(str).str.strip().ne("") | chosen["NoExpiry"].fillna(False).astype(bool))
+    ]
 
     if st.button(
         f"💾 Πέρασε {len(valid)} επιβεβαιωμένες γραμμές στο stock",
@@ -587,11 +648,13 @@ def invoice_tab() -> None:
         errors = []
         for _, row in valid.iterrows():
             try:
+                normalized_expiry = core.parse_expiry_date(clean(row["ExpiryDate"])) if clean(row["ExpiryDate"]) else ""
                 save_inventory_item(
                     code=clean(row["Barcode"]),
                     product_name=clean(row["ProductName"]),
                     quantity=int(row["Quantity"]),
                     location_id=location_id,
+                    expiry_date=normalized_expiry,
                     note="source=invoice; verified_by_user=true",
                 )
                 saved += 1
@@ -619,19 +682,53 @@ def stock_tab() -> None:
     if stock.empty:
         st.info("Δεν υπάρχουν ακόμα κινήσεις stock.")
         return
+    snapshot = csa.stock_snapshot(data)
+    if not snapshot.empty:
+        expiry_view = core.add_expiry_columns(snapshot)
+        expired_count = int(expiry_view["ExpiryStatus"].eq("expired").sum())
+        six_month_count = int(expiry_view["ExpiryStatus"].eq("expiring_soon").sum())
+        c1, c2 = st.columns(2)
+        c1.metric("Ληγμένα", expired_count)
+        c2.metric("Λήγουν μέσα σε 6 μήνες", six_month_count)
+        alerts = expiry_view[expiry_view["ExpiryStatus"].isin(["expired", "expiring_soon"])]
+        if not alerts.empty:
+            st.warning("Υπάρχουν προϊόντα που έχουν λήξει ή πλησιάζουν το όριο των 6 μηνών.")
+            alert_columns = ["Προϊόν", "Barcode", "GTIN", "LotNumber", "ExpiryDate", "ExpiryWarning", "Stock", "Τοποθεσία"]
+            st.dataframe(alerts[[column for column in alert_columns if column in alerts]], hide_index=True, width="stretch")
     query = st.text_input("Αναζήτηση", placeholder="όνομα, barcode, μάρκα...")
     if query:
         stock, _ = core.search_stock(stock, query)
-    columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
+    columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "ExpiryDate", "ExpiryWarning", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
     available = [column for column in columns if column in stock.columns]
     st.dataframe(stock[available], hide_index=True, width="stretch")
 
 
 def catalog_dataframe() -> pd.DataFrame:
     rows: dict[str, dict[str, str]] = {}
-    for barcode, product_name in LAMBERTS_PRODUCTS.items():
+    pharmacy_catalog = pharmacy_catalog_dataframe()
+    for _, item in pharmacy_catalog.iterrows():
+        product_name = clean(item.get("ProductName"))
+        barcodes = clean(item.get("Barcodes")).replace("|", " | ")
         attributes = core.extract_commercial_attributes(product_name)
-        rows[barcode] = {
+        brand = next(
+            (candidate for candidate in ["AVENE", "LIERAC", "LAMBERTS"] if candidate in product_name.upper()),
+            "",
+        )
+        rows[f"catalog:{product_name.casefold()}"] = {
+            "Barcode": barcodes,
+            "Προϊόν": product_name,
+            "Μάρκα": brand,
+            "Περιεκτικότητα": attributes["strength"],
+            "Μορφή": attributes["dosage_form"],
+            "Συσκευασία": attributes["package_size"],
+            "Κατηγορία": DEFAULT_CATEGORY,
+            "Πηγή": "Βάση προϊόντων φαρμακείου",
+        }
+    for barcode, product_name in LAMBERTS_PRODUCTS.items():
+        if lookup_pharmacy_product(barcode):
+            continue
+        attributes = core.extract_commercial_attributes(product_name)
+        rows[f"starter:{barcode}"] = {
             "Barcode": barcode,
             "Προϊόν": product_name,
             "Μάρκα": "LAMBERTS",
@@ -647,7 +744,7 @@ def catalog_dataframe() -> pd.DataFrame:
             barcode = clean(item.get("Barcode")) or clean(item.get("GTIN"))
             if not barcode:
                 continue
-            rows[barcode] = {
+            rows[f"confirmed:{barcode}"] = {
                 "Barcode": barcode,
                 "Προϊόν": clean(item.get("ProductName")),
                 "Μάρκα": clean(item.get("Brand")),

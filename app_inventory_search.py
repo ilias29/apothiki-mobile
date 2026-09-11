@@ -763,10 +763,10 @@ def expiry_status(expiry: Any, today: date | None = None) -> str:
     if pd.isna(expiry_dt):
         return "without_expiry"
     expiry_date = expiry_dt.date()
-    days = (expiry_date - today).days
-    if days < 0:
+    if expiry_date < today:
         return "expired"
-    if days <= 90:
+    six_month_limit = (pd.Timestamp(today) + pd.DateOffset(months=6)).date()
+    if expiry_date <= six_month_limit:
         return "expiring_soon"
     return "valid"
 
@@ -781,7 +781,7 @@ def expiry_warning(expiry: Any, today: date | None = None) -> str:
     if status == "expired":
         return f"🔴 Έληξε στις {expiry_dt:%Y-%m-%d}"
     if status == "expiring_soon":
-        return f"🟠 Λήγει σε {days} ημέρες ({expiry_dt:%Y-%m-%d})"
+        return f"🟠 Λήγει μέσα στο επόμενο 6μηνο, σε {days} ημέρες ({expiry_dt:%Y-%m-%d})"
     return f"🟢 Ισχύει έως {expiry_dt:%Y-%m-%d}"
 
 
@@ -801,10 +801,13 @@ def expiry_reports(stock: pd.DataFrame, today: date | None = None) -> dict[str, 
     expiry_dates = pd.to_datetime(stock["ExpiryDate"].replace("", pd.NA), errors="coerce").dt.date
     in_30 = expiry_dates.notna() & (expiry_dates >= today) & (expiry_dates <= today + pd.Timedelta(days=30))
     in_90 = expiry_dates.notna() & (expiry_dates >= today) & (expiry_dates <= today + pd.Timedelta(days=90))
+    six_month_limit = (pd.Timestamp(today) + pd.DateOffset(months=6)).date()
+    in_six_months = expiry_dates.notna() & (expiry_dates >= today) & (expiry_dates <= six_month_limit)
     return {
         "expired products": stock[stock["ExpiryStatus"].eq("expired")],
         "expiring in 30 days": stock[in_30],
         "expiring in 90 days": stock[in_90],
+        "expiring in 6 months": stock[in_six_months],
         "A εξάμηνο": stock[stock["Semester"].str.startswith("A εξάμηνο", na=False)],
         "B εξάμηνο": stock[stock["Semester"].str.startswith("B εξάμηνο", na=False)],
         "products without expiry date": stock[stock["ExpiryStatus"].eq("without_expiry")],

@@ -109,7 +109,22 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.10.8"
+    assert stable.APP_VERSION == "2026.09.11.2"
+
+
+def test_excel_catalog_is_used_before_online_lookup(monkeypatch):
+    monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
+    monkeypatch.setattr(
+        stable,
+        "lookup_pharmacy_product",
+        lambda code: {"product_name": "AVENE TEST 40ML", "barcodes": "111|222"}
+        if code == "222"
+        else None,
+    )
+    product = stable.local_product_by_code("222")
+    assert product["product_name"] == "AVENE TEST 40ML"
+    assert product["brand"] == "AVENE"
+    assert product["source"] == "Βάση προϊόντων φαρμακείου"
 
 
 def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
@@ -124,7 +139,7 @@ def test_scanned_cod_liver_oil_is_in_pharmacy_catalog(monkeypatch):
 def test_catalog_tab_data_includes_zero_stock_starter_products(monkeypatch):
     monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
     catalog = stable.catalog_dataframe()
-    assert len(catalog) == len(stable.LAMBERTS_PRODUCTS)
+    assert len(catalog) >= len(stable.LAMBERTS_PRODUCTS)
     row = catalog[catalog["Barcode"] == "5055148400620"].iloc[0]
     assert row["Προϊόν"] == "LAMBERTS COD LIVER OIL 1000 MG 180 CAPS"
     assert row["Πηγή"] == "Κατάλογος φαρμακείου"

@@ -413,7 +413,8 @@ def test_expiry_status_rules_and_semester_labels():
     assert app.expiry_status("2026-06-15", today) == "expired"
     assert app.expiry_status("2026-07-16", today) == "expiring_soon"
     assert app.expiry_status("2026-09-14", today) == "expiring_soon"
-    assert app.expiry_status("2026-09-15", today) == "valid"
+    assert app.expiry_status("2026-12-16", today) == "expiring_soon"
+    assert app.expiry_status("2026-12-17", today) == "valid"
     assert app.expiry_status("", today) == "without_expiry"
     assert app.expiry_semester("2026-06-30") == "A εξάμηνο 2026"
     assert app.expiry_semester("2026-07-01") == "B εξάμηνο 2026"
@@ -443,6 +444,7 @@ def test_expiry_reports_return_requested_buckets():
     assert len(reports["expired products"]) == 1
     assert len(reports["expiring in 30 days"]) == 1
     assert len(reports["expiring in 90 days"]) == 2
+    assert len(reports["expiring in 6 months"]) == 2
     assert len(reports["A εξάμηνο"]) == 1
     assert len(reports["B εξάμηνο"]) == 3
     assert len(reports["products without expiry date"]) == 1
