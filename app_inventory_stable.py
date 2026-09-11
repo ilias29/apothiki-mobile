@@ -747,7 +747,7 @@ def catalog_dataframe() -> pd.DataFrame:
             "Μορφή": attributes["dosage_form"],
             "Συσκευασία": attributes["package_size"],
             "Κατηγορία": DEFAULT_CATEGORY,
-            "Πηγή": "Βάση προϊόντων φαρμακείου",
+            "Πηγή": "Κατάλογος φαρμακείου" if verified_names else "Βάση προϊόντων φαρμακείου",
         }
     for barcode, product_name in LAMBERTS_PRODUCTS.items():
         if lookup_pharmacy_product(barcode):
