@@ -781,7 +781,7 @@ def expiry_warning(expiry: Any, today: date | None = None) -> str:
     if status == "expired":
         return f"🔴 Έληξε στις {expiry_dt:%Y-%m-%d}"
     if status == "expiring_soon":
-        return f"🟠 Λήγει μέσα στο επόμενο 6μηνο, σε {days} ημέρες ({expiry_dt:%Y-%m-%d})"
+        return f"🟠 Λήγει σε {days} ημέρες, μέσα στο επόμενο 6μηνο ({expiry_dt:%Y-%m-%d})"
     return f"🟢 Ισχύει έως {expiry_dt:%Y-%m-%d}"
 
 
