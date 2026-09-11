@@ -86,6 +86,24 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
                     "url": "",
                     "confidence": 1.0,
                 }
+    # Explicitly verified pharmacy entries take precedence over the imported
+    # catalog, whose descriptions can be abbreviated or inconsistently spaced.
+    product_name = lookup_starter_product(code)
+    if product_name:
+        attributes = core.extract_commercial_attributes(product_name)
+        return {
+            "product_name": product_name,
+            "brand": "LAMBERTS",
+            "barcode": code,
+            "gtin": "",
+            "strength": attributes["strength"],
+            "dosage_form": attributes["dosage_form"],
+            "package_size": attributes["package_size"],
+            "category": "Συμπλήρωμα διατροφής",
+            "source": "Κατάλογος φαρμακείου",
+            "url": "",
+            "confidence": 1.0,
+        }
     catalog_match = lookup_pharmacy_product(code)
     if catalog_match:
         product_name = catalog_match["product_name"]
@@ -709,6 +727,13 @@ def catalog_dataframe() -> pd.DataFrame:
     for _, item in pharmacy_catalog.iterrows():
         product_name = clean(item.get("ProductName"))
         barcodes = clean(item.get("Barcodes")).replace("|", " | ")
+        verified_names = {
+            lookup_starter_product(value.strip())
+            for value in barcodes.split("|")
+            if lookup_starter_product(value.strip())
+        }
+        if verified_names:
+            product_name = sorted(verified_names)[0]
         attributes = core.extract_commercial_attributes(product_name)
         brand = next(
             (candidate for candidate in ["AVENE", "LIERAC", "LAMBERTS"] if candidate in product_name.upper()),
