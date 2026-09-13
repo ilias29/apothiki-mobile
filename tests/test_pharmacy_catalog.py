@@ -27,3 +27,24 @@ def test_real_avene_and_lierac_products_exist_in_catalog():
     lierac = pharmacy_catalog.lookup_pharmacy_product("3701436933524")
     assert avene["product_name"] == "AVENE CICALFATE EMULSION POST-ACTE TATTOO 40ML"
     assert lierac["product_name"] == "LIERAC COFFRET LIFT CR JOUR + RECH 25"
+
+
+def test_general_catalog_has_no_duplicate_barcode_mapping():
+    pharmacy_catalog.catalog_dataframe.cache_clear()
+    frame = pharmacy_catalog.catalog_dataframe()
+    codes = [
+        code.strip()
+        for value in frame["Barcodes"]
+        for code in str(value).split("|")
+        if code.strip()
+    ]
+    assert len(frame) >= 50_000
+    assert len(codes) >= 63_000
+    assert len(codes) == len(set(codes))
+
+
+def test_verified_solgar_name_is_preserved():
+    pharmacy_catalog.catalog_dataframe.cache_clear()
+    pharmacy_catalog.barcode_index.cache_clear()
+    product = pharmacy_catalog.lookup_pharmacy_product("033984003972")
+    assert product["product_name"] == "SOLGAR METHYLCOBALAMIN (B12) 1000 MCG"
