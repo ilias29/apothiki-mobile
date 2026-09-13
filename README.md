@@ -84,6 +84,16 @@ OPENAI_MODEL = "gpt-4.1-mini"
 
 Οι φωτογραφίες χρησιμοποιούνται για την άμεση ανάλυση και δεν αποθηκεύονται ως μόνιμα αρχεία από το app. Στην AI ροή αποστέλλονται στο OpenAI API μόνο όταν πατήσεις το κουμπί ανάλυσης.
 
+## Agent memory / self-improving workflow
+
+Το repository κρατά πλέον μόνιμη τεχνική μνήμη για coding agents:
+
+- `AGENTS.md` — υποχρεωτική ροή εργασίας: observe → investigate → verify → fix → re-verify → distill → record.
+- `STATE.md` — verified facts, regression targets, ανοιχτά προβλήματα και resume pointer για το επόμενο session.
+- `skills/pharmacy-inventory/SKILL.md` — επαναχρησιμοποιήσιμοι κανόνες για barcodes, deduplication, imports, expiry, FEFO, stock integrity και search.
+
+Κάθε σοβαρό bug fix πρέπει, όπου είναι εφικτό, να αφήνει πίσω του regression test. Κάθε νέο επιβεβαιωμένο failure mode που μπορεί να ξανασυμβεί πρέπει να καταγράφεται στο Skill και στο `STATE.md`, ώστε η επόμενη αλλαγή να μην ξεκινά από το μηδέν.
+
 ## Εγκατάσταση
 
 ```bash
