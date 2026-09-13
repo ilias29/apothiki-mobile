@@ -1,5 +1,8 @@
 """Fast local lookup for the pharmacy product/barcode catalogue."""
 
+import base64
+import gzip
+import io
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,12 @@ def clean_code(value: Any) -> str:
 def catalog_dataframe() -> pd.DataFrame:
     if not CATALOG_PATH.exists():
         return pd.DataFrame(columns=["ProductName", "Barcodes"])
-    return pd.read_csv(CATALOG_PATH, dtype=str, keep_default_na=False)
+    compressed = CATALOG_PATH.read_bytes()
+    # GitHub's text-file upload route stores the gzip as ASCII base64. Keep
+    # compatibility with older deployments that contain the binary gzip.
+    if not compressed.startswith(b"\x1f\x8b"):
+        compressed = base64.b64decode(compressed)
+    return pd.read_csv(io.BytesIO(gzip.decompress(compressed)), dtype=str, keep_default_na=False)
 
 
 @lru_cache(maxsize=1)
