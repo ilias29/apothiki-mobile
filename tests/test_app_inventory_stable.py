@@ -109,7 +109,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.11.2"
+    assert stable.APP_VERSION == "2026.09.13.1"
 
 
 def test_excel_catalog_is_used_before_online_lookup(monkeypatch):
