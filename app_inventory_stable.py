@@ -24,7 +24,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.11.2"
+APP_VERSION = "2026.09.13.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -109,7 +109,7 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
         product_name = catalog_match["product_name"]
         attributes = core.extract_commercial_attributes(product_name)
         brand_match = next(
-            (brand for brand in ["AVENE", "LIERAC", "LAMBERTS"] if brand in product_name.upper()),
+            (brand for brand in ["AVENE", "LIERAC", "LAMBERTS", "SOLGAR", "FREZYDERM", "KORRES", "VICHY", "LA ROCHE-POSAY", "BIODERMA", "FROIKA", "MUSTELA", "APIVITA", "EUCERIN"] if brand in product_name.upper()),
             "",
         )
         return {
@@ -736,7 +736,7 @@ def catalog_dataframe() -> pd.DataFrame:
             product_name = sorted(verified_names)[0]
         attributes = core.extract_commercial_attributes(product_name)
         brand = next(
-            (candidate for candidate in ["AVENE", "LIERAC", "LAMBERTS"] if candidate in product_name.upper()),
+            (candidate for candidate in ["AVENE", "LIERAC", "LAMBERTS", "SOLGAR", "FREZYDERM", "KORRES", "VICHY", "LA ROCHE-POSAY", "BIODERMA", "FROIKA", "MUSTELA", "APIVITA", "EUCERIN"] if candidate in product_name.upper()),
             "",
         )
         rows[f"catalog:{product_name.casefold()}"] = {
