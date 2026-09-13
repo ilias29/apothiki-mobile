@@ -3,6 +3,7 @@
 import base64
 import gzip
 import io
+import lzma
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,10 @@ def catalog_dataframe() -> pd.DataFrame:
     compressed = CATALOG_PATH.read_bytes()
     # GitHub's text-file upload route stores the gzip as ASCII base64. Keep
     # compatibility with older deployments that contain the binary gzip.
-    if not compressed.startswith(b"\x1f\x8b"):
+    if not compressed.startswith((b"\x1f\x8b", b"\xfd7zXZ")):
         compressed = base64.b64decode(compressed)
-    return pd.read_csv(io.BytesIO(gzip.decompress(compressed)), dtype=str, keep_default_na=False)
+    raw_csv = lzma.decompress(compressed) if compressed.startswith(b"\xfd7zXZ") else gzip.decompress(compressed)
+    return pd.read_csv(io.BytesIO(raw_csv), dtype=str, keep_default_na=False)
 
 
 @lru_cache(maxsize=1)
