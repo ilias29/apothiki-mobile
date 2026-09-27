@@ -109,7 +109,105 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.13.1"
+    assert stable.APP_VERSION == "2026.09.23.1"
+
+
+def test_live_scanner_emits_one_token_until_barcode_leaves_frame():
+    state = {}
+    first = stable.next_live_scan_token(state, "5055148407049")
+    assert first == "live:1:5055148407049"
+    assert stable.next_live_scan_token(state, "5055148407049") == ""
+
+    assert stable.next_live_scan_token(state, "") == ""
+    second = stable.next_live_scan_token(state, "5055148407049")
+    assert second == "live:2:5055148407049"
+
+
+def test_recognized_barcode_adds_exactly_one_once_per_scan(monkeypatch):
+    state = {}
+    saved = []
+    monkeypatch.setattr(
+        stable,
+        "local_product_by_code",
+        lambda code: {
+            "product_name": "LAMBERTS VITAMIN C 1000 MG 30 TABS",
+            "brand": "LAMBERTS",
+            "strength": "1000 MG",
+            "dosage_form": "TABS",
+            "category": "Συμπλήρωμα διατροφής",
+        },
+    )
+    monkeypatch.setattr(stable, "save_inventory_item", lambda **kwargs: saved.append(kwargs))
+
+    first = stable.auto_add_recognized_barcode(
+        "5055148407049", "live:1:5055148407049", state=state
+    )
+    duplicate = stable.auto_add_recognized_barcode(
+        "5055148407049", "live:1:5055148407049", state=state
+    )
+
+    assert first["status"] == "added"
+    assert duplicate["status"] == "duplicate"
+    assert len(saved) == 1
+    assert saved[0]["code"] == "5055148407049"
+    assert saved[0]["quantity"] == 1
+    assert saved[0]["location_id"] == 0
+    assert saved[0]["expiry_date"] == ""
+    assert saved[0]["transaction_id"].startswith("auto-scan-")
+
+
+def test_same_barcode_can_add_again_on_a_new_scan_event(monkeypatch):
+    state = {}
+    saved = []
+    monkeypatch.setattr(
+        stable,
+        "local_product_by_code",
+        lambda _code: {"product_name": "KNOWN PRODUCT", "category": "Άλλο"},
+    )
+    monkeypatch.setattr(stable, "save_inventory_item", lambda **kwargs: saved.append(kwargs))
+
+    stable.auto_add_recognized_barcode("5055148407049", "live:1:5055148407049", state=state)
+    stable.auto_add_recognized_barcode("5055148407049", "live:2:5055148407049", state=state)
+
+    assert [item["quantity"] for item in saved] == [1, 1]
+
+
+def test_unknown_barcode_is_not_auto_added(monkeypatch):
+    state = {}
+    monkeypatch.setattr(stable, "local_product_by_code", lambda _code: None)
+    monkeypatch.setattr(
+        stable,
+        "save_inventory_item",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not save")),
+    )
+
+    result = stable.auto_add_recognized_barcode("5201234567890", "photo:abc", state=state)
+
+    assert result["status"] == "unknown"
+    assert "last_auto_stock_scan_token" not in state
+
+
+def test_auto_scan_retry_reuses_transaction_id(monkeypatch):
+    state = {}
+    transaction_ids = []
+    monkeypatch.setattr(
+        stable,
+        "local_product_by_code",
+        lambda _code: {"product_name": "KNOWN PRODUCT", "category": "Άλλο"},
+    )
+
+    def flaky_save(**kwargs):
+        transaction_ids.append(kwargs["transaction_id"])
+        if len(transaction_ids) == 1:
+            raise RuntimeError("temporary failure")
+
+    monkeypatch.setattr(stable, "save_inventory_item", flaky_save)
+    first = stable.auto_add_recognized_barcode("5055148407049", "photo:abc", state=state)
+    retry = stable.auto_add_recognized_barcode("5055148407049", "photo:abc", state=state)
+
+    assert first["status"] == "error"
+    assert retry["status"] == "added"
+    assert transaction_ids[0] == transaction_ids[1]
 
 
 def test_excel_catalog_is_used_before_online_lookup(monkeypatch):
