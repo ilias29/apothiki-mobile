@@ -85,6 +85,7 @@ Add only confirmed, reusable lessons here.
 - **Duplicate catalog identity from alternate barcode**: when two barcodes belong to the same verified product, model this as aliases of one product rather than two products.
 - **Repeated import duplication**: derive stable transaction identifiers from stable source/batch/row identity and check them before writing again.
 - **Expiry warning off-by-one**: date thresholds need explicit boundary tests rather than visual inspection of the UI.
+- **Repeated Streamlit scanner rerun**: a scanner component can retain the same decoded value across reruns. Any automatic stock write must use a per-scan latch/token so one visible scan cannot create repeated movements; re-arm only after an empty or different scanner value.
 
 ## Anti-patterns
 
