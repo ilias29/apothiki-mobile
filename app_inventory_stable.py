@@ -1,5 +1,6 @@
 import hashlib
 import io
+import uuid
 from typing import Any
 
 import pandas as pd
@@ -24,7 +25,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.13.1"
+APP_VERSION = "2026.09.23.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -125,22 +126,6 @@ def local_product_by_code(code: str) -> dict[str, str] | None:
             "url": "",
             "confidence": 1.0,
         }
-    product_name = lookup_starter_product(code)
-    if product_name:
-        attributes = core.extract_commercial_attributes(product_name)
-        return {
-            "product_name": product_name,
-            "brand": "LAMBERTS",
-            "barcode": code,
-            "gtin": "",
-            "strength": attributes["strength"],
-            "dosage_form": attributes["dosage_form"],
-            "package_size": attributes["package_size"],
-            "category": "Συμπλήρωμα διατροφής",
-            "source": "Κατάλογος φαρμακείου",
-            "url": "",
-            "confidence": 1.0,
-        }
     return None
 
 
@@ -157,6 +142,7 @@ def save_inventory_item(
     category: str = DEFAULT_CATEGORY,
     location_id: int = 0,
     note: str = "",
+    transaction_id: str = "",
 ) -> None:
     code = clean(code)
     product_name = clean(product_name)
@@ -190,6 +176,7 @@ def save_inventory_item(
         quantity=int(quantity),
         delta=int(quantity),
         note=note or "source=barcode_inventory; verified_by_user=true",
+        transaction_id=clean(transaction_id) or None,
         movement_kind=core.NORMAL,
     )
     ws = core.worksheet()
@@ -269,6 +256,87 @@ def accept_detected_barcode(detected: str) -> bool:
     return changed
 
 
+def next_live_scan_token(state: Any, detected: str) -> str:
+    """Return one token per distinct live-scanner event.
+
+    Streamlit reruns while the scanner component can still contain its previous
+    value.  Treating every rerun as a scan would add stock repeatedly, so the
+    same visible value stays latched until the scanner reports an empty or a
+    different value.
+    """
+    detected = clean(detected)
+    if not detected:
+        state["last_live_scan_value"] = ""
+        return ""
+    if clean(state.get("last_live_scan_value")) == detected:
+        return ""
+    sequence = int(state.get("live_scan_sequence", 0)) + 1
+    state["live_scan_sequence"] = sequence
+    state["last_live_scan_value"] = detected
+    return f"live:{sequence}:{detected}"
+
+
+def auto_add_recognized_barcode(
+    code: str,
+    scan_token: str,
+    *,
+    state: Any = None,
+    location_id: int = 0,
+) -> dict[str, str]:
+    """Add exactly one item for a known barcode, once per scan event."""
+    state = st.session_state if state is None else state
+    code = clean(code)
+    scan_token = clean(scan_token)
+    if not code or not scan_token:
+        return {"status": "ignored", "product_name": ""}
+    if clean(state.get("last_auto_stock_scan_token")) == scan_token:
+        return {"status": "duplicate", "product_name": ""}
+
+    product = local_product_by_code(code)
+    product_name = clean((product or {}).get("product_name"))
+    if not product_name:
+        return {"status": "unknown", "product_name": ""}
+
+    if not clean(state.get("auto_scan_session_id")):
+        state["auto_scan_session_id"] = uuid.uuid4().hex
+    transaction_id = "auto-scan-" + hashlib.sha256(
+        f"{state['auto_scan_session_id']}|{scan_token}".encode("utf-8")
+    ).hexdigest()[:24]
+
+    try:
+        save_inventory_item(
+            code=code,
+            product_name=product_name,
+            quantity=1,
+            brand=clean(product.get("brand")),
+            strength=clean(product.get("strength")),
+            dosage_form=clean(product.get("dosage_form")),
+            expiry_date="",
+            lot_number="",
+            category=clean(product.get("category")) or DEFAULT_CATEGORY,
+            location_id=location_id,
+            transaction_id=transaction_id,
+            note=(
+                f"source=automatic_barcode_scan; scan_token={scan_token}; "
+                "quantity=1; expiry_not_captured=true"
+            ),
+        )
+    except Exception as exc:
+        return {"status": "error", "product_name": product_name, "error": str(exc)}
+
+    state["last_auto_stock_scan_token"] = scan_token
+    return {"status": "added", "product_name": product_name}
+
+
+def show_auto_add_result(result: dict[str, str]) -> None:
+    status = clean(result.get("status"))
+    if status == "added":
+        st.success(f"✅ Προστέθηκε αμέσως +1: {clean(result.get('product_name'))}")
+        st.caption("Η αυτόματη σάρωση προσθέτει στην Αποθήκη χωρίς ημερομηνία λήξης.")
+    elif status == "error":
+        st.error(f"Το barcode διαβάστηκε, αλλά το +1 δεν αποθηκεύτηκε: {clean(result.get('error'))}")
+
+
 def _clear_scan_state() -> None:
     for key in [
         "active_barcode",
@@ -279,6 +347,8 @@ def _clear_scan_state() -> None:
         "last_camera_hash",
         "barcode_camera",
         "product_name_reference_camera",
+        "last_live_scan_value",
+        "last_auto_stock_scan_token",
     ]:
         st.session_state.pop(key, None)
     for key in list(st.session_state.keys()):
@@ -356,13 +426,19 @@ def scan_tab() -> None:
             st.error("Ο ζωντανός scanner δεν εγκαταστάθηκε. Επίλεξε Φωτογραφία.")
         else:
             live_value = qrcode_scanner(key="live_barcode_scanner")
-            if live_value:
-                detected = validated_live_barcode(live_value)
-                if detected:
-                    accept_detected_barcode(detected)
-                    st.success(f"Διαβάστηκε: {detected}")
+            detected = validated_live_barcode(live_value) if live_value else ""
+            scan_token = next_live_scan_token(st.session_state, detected)
+            if detected:
+                accept_detected_barcode(detected)
+                if scan_token:
+                    result = auto_add_recognized_barcode(detected, scan_token)
+                    show_auto_add_result(result)
+                    if result["status"] == "unknown":
+                        st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
                 else:
-                    st.warning("Διαβάστηκε κωδικός αλλά απέτυχε ο έλεγχος εγκυρότητας. Ξαναστόχευσε.")
+                    st.success(f"Διαβάστηκε: {detected}")
+            elif live_value:
+                st.warning("Διαβάστηκε κωδικός αλλά απέτυχε ο έλεγχος εγκυρότητας. Ξαναστόχευσε.")
     else:
         camera = st.camera_input(
             "Φωτογράφισε το barcode",
@@ -377,6 +453,10 @@ def scan_tab() -> None:
                 st.session_state["last_camera_hash"] = camera_hash
                 if detected:
                     accept_detected_barcode(detected)
+                    result = auto_add_recognized_barcode(detected, f"photo:{camera_hash}")
+                    show_auto_add_result(result)
+                    if result["status"] == "unknown":
+                        st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
                 else:
                     fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
                     if fallback.get("reason") == "missing_openai_api_key":

@@ -1,6 +1,6 @@
 # Project state · apothiki-mobile
 
-Updated: 2026-09-13
+Updated: 2026-09-23
 
 ## Verified facts
 
@@ -40,6 +40,8 @@ Keep explicit regression coverage for:
 
 ## Last session
 
-2026-09-13 · Added the repository-level self-improving workflow: persistent state, agent operating rules, and reusable pharmacy-inventory skill.
+2026-09-23 · Added automatic `+1` stock movement for a recognized, locally known barcode from either the live scanner or a barcode photo. The movement targets location 0 (Αποθήκη), records that expiry/lot were not captured, and never fabricates them. A per-scan token prevents Streamlit reruns or the same photo from adding repeatedly; the same barcode can add again after a distinct scan event. Each event also gets a stable transaction id within the scanner session, so a retry cannot duplicate a movement after an uncertain response. Unknown barcodes continue to the existing matching form and are not auto-saved.
 
-Next: when the next functional change or bug fix is made, follow `AGENTS.md`, add the relevant regression test, and update this file with what was verified.
+Verified with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version: `2026.09.23.1`.
+
+Next: verify one known barcode and one unknown barcode in the deployed mobile Streamlit camera flow after the GitHub deployment finishes.
