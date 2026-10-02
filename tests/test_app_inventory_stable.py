@@ -372,6 +372,8 @@ def test_saved_lot_edit_refuses_stale_quantity(monkeypatch):
         delta=-2,
         lot_number="LOT-OLD",
         expiry_date="2028-12-31",
+        strength="",
+        dosage_form="TABS",
         transaction_id="later-sale",
     )
     ws.records.append(consumed)

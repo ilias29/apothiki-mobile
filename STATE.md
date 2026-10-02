@@ -11,6 +11,7 @@ Updated: 2026-10-02
 - Existing offline/manual imports are designed to use stable transaction identifiers so repeated saves do not duplicate already-written rows.
 - The Stock tab supports editing saved lots, including a visible editable expiry field and a confirmed action to zero only the selected lot. Corrections append movements, keep the barcode fixed, and preserve previous ledger rows.
 - Product master display details can be deliberately corrected while preserving its canonical ProductId and known barcode/GTIN aliases.
+- The Stock-tab editor uses distinct forms for zeroing and editing. Their confirmation checkboxes are validated on submission because form widgets do not update the server until a submit action.
 
 ## General rules
 
@@ -41,7 +42,7 @@ Keep explicit regression coverage for:
 
 ## Last session
 
-2026-10-02 · Fixed the reported Stock-tab controls. The selected-lot editor now always shows an editable expiry text field (DD/MM/YYYY or MM/YYYY; blank clears expiry) and has a separately confirmed button that sets only the selected lot to zero through a ledger movement. Added tests for date formatting/parsing and zeroing without deleting history; changed the edit regression to enter expiry as DD/MM/YYYY. `py_compile` and `git diff --check` pass. Local pytest is unavailable in this environment; GitHub Actions remains the full-suite check. Application version: `2026.10.02.2`.
+2026-10-02 · Fixed the reported Stock-tab controls. The selected-lot editor always shows an editable expiry text field (DD/MM/YYYY or MM/YYYY; blank clears expiry) and has a separately confirmed button that zeros only the selected lot through a ledger movement. Added tests for expiry formatting, setting zero without deleting history, and DD/MM/YYYY input. Local `py_compile` and `git diff --check` pass; local pytest is unavailable. The first GitHub full-suite run reported a stale-lot test fixture issue: its simulated sale omitted the lot's `DosageForm`, so it was treated as a different lot. The fixture now matches the original lot; rerun Actions on the follow-up commit. Application version: `2026.10.02.2`.
 
 Previous session: added a Stock-tab editor for saved lots. It fresh-checks the selected lot before changes, writes deterministic correction movements (the removal/replacement pair is batched when the replacement quantity is positive), keeps the previous movement history, and updates confirmed product details without changing ProductId or removing barcode aliases. Prior local `py_compile` and `git diff --check` passed; the full pytest suite could not run locally because pytest is missing. Application version then: `2026.10.02.1`.
 
@@ -49,4 +50,4 @@ Previous: 2026-09-23 · Added automatic `+1` stock movement for a recognized, lo
 
 Verified then with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version at that time: `2026.09.23.1`.
 
-Next: push the updated Stock controls to GitHub and confirm the inventory test workflow. In the deployed app, edit one test lot's expiry and zero another test lot.
+Next: confirm GitHub Actions passes on the follow-up test-fixture commit. In the deployed app, edit one test lot's expiry and zero another test lot.
