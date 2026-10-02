@@ -110,7 +110,14 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.10.02.1"
+    assert stable.APP_VERSION == "2026.10.02.2"
+
+
+def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
+    assert stable.expiry_input_value("2028-12-31") == "31/12/2028"
+    assert stable.expiry_input_value("12/2028") == "31/12/2028"
+    assert stable.expiry_input_value("") == ""
+    assert stable.expiry_input_value("unknown") == "unknown"
 
 
 def test_live_scanner_emits_one_token_until_barcode_leaves_frame():
@@ -278,7 +285,7 @@ def test_saved_lot_can_be_edited_without_deleting_history(monkeypatch):
         dosage_form="TABLETS",
         category="Συμπλήρωμα",
         quantity=5,
-        expiry_date="2029-03-31",
+        expiry_date="31/03/2029",
         lot_number="LOT-NEW",
         location_id=1,
         reason="Λάθος αρχική καταχώρηση",
@@ -297,6 +304,34 @@ def test_saved_lot_can_be_edited_without_deleting_history(monkeypatch):
     assert lots.iloc[0]["LotNumber"] == "LOT-NEW"
     assert lots.iloc[0]["ExpiryDate"] == "2029-03-31"
     assert stock.iloc[0]["Προϊόν"] == "MAXI-HAIR 60 TABLETS"
+
+
+def test_saved_lot_can_be_zeroed_without_deleting_history(monkeypatch):
+    ws, original, lot = _saved_lot_fixture()
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: True)
+
+    result = stable.edit_stock_lot(
+        ws,
+        lot,
+        product_name="MAXI-HAIR 60 TABS",
+        brand="LAMBERTS",
+        strength="",
+        dosage_form="TABS",
+        category="Συμπλήρωμα",
+        quantity=0,
+        expiry_date="31/12/2028",
+        lot_number="LOT-OLD",
+        location_id=0,
+        reason="Μηδενισμός stock από χρήστη",
+        edit_id="edit-zero-1",
+    )
+
+    corrected, _ = stable.core.load_data(ws)
+    assert result == "saved"
+    assert len(ws.records) == 2
+    assert ws.records[0]["TransactionId"] == original["TransactionId"]
+    assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 0) == 0
+    assert stable.csa.stock_snapshot(corrected).empty
 
 
 def test_saved_lot_edit_retry_does_not_duplicate_stock_movements(monkeypatch):

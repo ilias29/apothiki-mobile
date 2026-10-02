@@ -25,7 +25,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.10.02.1"
+APP_VERSION = "2026.10.02.2"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -38,6 +38,20 @@ def clean(value: Any) -> str:
     except Exception:
         pass
     return str(value).strip()
+
+
+def expiry_input_value(value: Any) -> str:
+    """Format a saved expiry for an always-visible, clearable text field."""
+    raw = clean(value)
+    if not raw:
+        return ""
+    try:
+        normalized = core.parse_expiry_date(raw)
+    except (core.InventoryError, ValueError):
+        return raw
+    if not normalized:
+        return ""
+    return pd.to_datetime(normalized).strftime("%d/%m/%Y")
 
 
 def configured_openai_model() -> str:
@@ -1019,7 +1033,7 @@ def stock_tab() -> None:
     editable_lots = snapshot[snapshot["LocationId"].isin(LOCATIONS)].copy()
     if editable_lots.empty:
         return
-    with st.expander("✏️ Επεξεργασία αποθηκευμένου προϊόντος", expanded=False):
+    with st.expander("✏️ Επεξεργασία / μηδενισμός παρτίδας", expanded=False):
         st.caption(
             "Διάλεξε συγκεκριμένη παρτίδα για να διορθώσεις στοιχεία, λήξη, ποσότητα ή θέση. "
             "Το barcode παραμένει ίδιο. Οι παλιές κινήσεις διατηρούνται στο ιστορικό."
@@ -1053,8 +1067,7 @@ def stock_tab() -> None:
         ).hexdigest()[:12]
         st.caption(f"Barcode / κωδικός: {clean(original.get('CodeValue'))}")
 
-        current_expiry_value = pd.to_datetime(clean(original.get("ExpiryDate")), errors="coerce")
-        current_expiry = None if pd.isna(current_expiry_value) else current_expiry_value.date()
+        current_expiry_text = expiry_input_value(original.get("ExpiryDate"))
         categories = list(core.CATEGORIES)
         current_category = clean(original.get("Κατηγορία")) or DEFAULT_CATEGORY
         if current_category not in categories:
@@ -1067,6 +1080,17 @@ def stock_tab() -> None:
         )
 
         pending_key = f"stock_edit_pending_{context}"
+        with st.form(f"stock_zero_form_{context}"):
+            st.caption("Μηδενίζει μόνο την επιλεγμένη παρτίδα. Η κίνηση παραμένει στο ιστορικό.")
+            zero_confirmed = st.checkbox(
+                "Επιβεβαιώνω τον μηδενισμό της ποσότητας",
+                key=f"stock_zero_confirm_{context}",
+            )
+            zero_submitted = st.form_submit_button(
+                "🧹 Μηδενισμός stock παρτίδας",
+                width="stretch",
+            )
+
         with st.form(f"stock_edit_form_{context}"):
             edited_name = st.text_input("Όνομα προϊόντος", value=clean(original.get("Προϊόν")), key=f"stock_edit_name_{context}")
             edited_brand = st.text_input("Μάρκα / εταιρεία", value=clean(original.get("Μάρκα")), key=f"stock_edit_brand_{context}")
@@ -1089,19 +1113,13 @@ def stock_tab() -> None:
                 key=f"stock_edit_quantity_{context}",
             )
             edited_lot = col_lot.text_input("Παρτίδα", value=clean(original.get("LotNumber")), key=f"stock_edit_lot_{context}")
-            has_expiry = st.checkbox(
-                "Υπάρχει ημερομηνία λήξης",
-                value=current_expiry is not None,
-                key=f"stock_edit_has_expiry_{context}",
+            edited_expiry = st.text_input(
+                "Ημερομηνία λήξης",
+                value=current_expiry_text,
+                placeholder="π.χ. 31/12/2028 ή 12/2028",
+                help="Γράψε DD/MM/YYYY ή MM/YYYY. Άφησέ το κενό για να αφαιρέσεις τη λήξη.",
+                key=f"stock_edit_expiry_{context}",
             )
-            edited_expiry = None
-            if has_expiry:
-                edited_expiry = st.date_input(
-                    "Ημερομηνία λήξης",
-                    value=current_expiry,
-                    format="DD/MM/YYYY",
-                    key=f"stock_edit_expiry_{context}",
-                )
             edited_location_label = st.selectbox(
                 "Τοποθεσία",
                 locations,
@@ -1110,19 +1128,34 @@ def stock_tab() -> None:
             )
             edit_reason = st.text_input("Αιτία αλλαγής (προαιρετικό)", key=f"stock_edit_reason_{context}")
             confirmed = st.checkbox("Επιβεβαιώνω τη διόρθωση", key=f"stock_edit_confirm_{context}")
-            submitted = st.form_submit_button("💾 Αποθήκευση αλλαγών", type="primary", disabled=not confirmed, width="stretch")
+            submitted = st.form_submit_button("💾 Αποθήκευση αλλαγών", type="primary", width="stretch")
 
-        if submitted:
-            if has_expiry and edited_expiry is None:
-                st.error("Διάλεξε ημερομηνία λήξης ή βγάλε την επιλογή «Υπάρχει ημερομηνία λήξης».")
+        if zero_submitted:
+            if not zero_confirmed:
+                st.warning("Επίλεξε πρώτα την επιβεβαίωση για να μηδενιστεί το stock.")
+                return
+            payload = (
+                clean(original.get("Προϊόν")), clean(original.get("Μάρκα")),
+                clean(original.get("Strength")), clean(original.get("DosageForm")),
+                clean(original.get("Κατηγορία")) or DEFAULT_CATEGORY, 0,
+                clean(original.get("ExpiryDate")), clean(original.get("LotNumber")),
+                int(original.get("LocationId", 0)), "Μηδενισμός stock από χρήστη",
+            )
+        elif submitted:
+            if not confirmed:
+                st.warning("Επίλεξε πρώτα την επιβεβαίωση για να αποθηκευτούν οι αλλαγές.")
                 return
             location_id = int(edited_location_label.split("-", 1)[0].strip())
             payload = (
                 clean(edited_name), clean(edited_brand), clean(edited_strength), clean(edited_form),
                 clean(edited_category), int(edited_quantity),
-                edited_expiry.isoformat() if has_expiry and edited_expiry else "",
+                clean(edited_expiry),
                 clean(edited_lot), location_id, clean(edit_reason),
             )
+        else:
+            return
+
+        if zero_submitted or submitted:
             pending = st.session_state.get(pending_key)
             if pending and pending.get("payload") != payload:
                 st.error("Μια διόρθωση εκκρεμεί. Κάνε ξανά αποθήκευση με τα ίδια στοιχεία πριν τα αλλάξεις.")
@@ -1161,6 +1194,8 @@ def stock_tab() -> None:
                     st.warning("Άλλαξε κίνηση stock την ίδια στιγμή. Αποτράπηκε αρνητικό υπόλοιπο· έλεγξε ξανά την ποσότητα μετά την ανανέωση.")
                 elif result == "duplicate":
                     st.info("Αυτή η διόρθωση είχε ήδη αποθηκευτεί.")
+                elif zero_submitted:
+                    st.success("Η ποσότητα της επιλεγμένης παρτίδας μηδενίστηκε. Η κίνηση διατηρήθηκε στο ιστορικό.")
                 else:
                     st.success("Οι αλλαγές αποθηκεύτηκαν. Το ιστορικό των προηγούμενων κινήσεων διατηρήθηκε.")
                 st.rerun()

@@ -88,6 +88,9 @@ Add only confirmed, reusable lessons here.
 - **Repeated import duplication**: derive stable transaction identifiers from stable source/batch/row identity and check them before writing again.
 - **Expiry warning off-by-one**: date thresholds need explicit boundary tests rather than visual inspection of the UI.
 - **Repeated Streamlit scanner rerun**: a scanner component can retain the same decoded value across reruns. Any automatic stock write must use a per-scan latch/token so one visible scan cannot create repeated movements; re-arm only after an empty or different scanner value.
+- **Conditional fields inside a form**: widgets inside `st.form` do not rerun the page as their values change. Do not hide an editable expiry field behind a form checkbox; keep it visible and let an empty value mean no expiry.
+- **Confirmation inside a form**: do not disable a form submit button using a checkbox in that same form. The checkbox cannot update the server until a submit occurs; keep submit available and validate the submitted checkbox value on the server.
+- **Zeroing saved stock**: provide an explicit, confirmed per-lot zero-stock action that appends a stock movement and preserves the existing ledger; do not delete rows or silently zero every lot for the product.
 
 ## Anti-patterns
 
