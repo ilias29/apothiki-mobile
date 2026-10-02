@@ -1067,9 +1067,6 @@ def stock_tab() -> None:
         )
 
         pending_key = f"stock_edit_pending_{context}"
-        state_key = f"stock_edit_form_{context}"
-        if state_key not in st.session_state:
-            st.session_state[state_key] = uuid.uuid4().hex
         with st.form(f"stock_edit_form_{context}"):
             edited_name = st.text_input("Όνομα προϊόντος", value=clean(original.get("Προϊόν")), key=f"stock_edit_name_{context}")
             edited_brand = st.text_input("Μάρκα / εταιρεία", value=clean(original.get("Μάρκα")), key=f"stock_edit_brand_{context}")
