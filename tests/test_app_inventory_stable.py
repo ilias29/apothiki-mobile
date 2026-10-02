@@ -110,7 +110,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.10.02.2"
+    assert stable.APP_VERSION == "2026.10.02.3"
 
 
 def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
@@ -118,6 +118,23 @@ def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
     assert stable.expiry_input_value("12/2028") == "31/12/2028"
     assert stable.expiry_input_value("") == ""
     assert stable.expiry_input_value("unknown") == "unknown"
+
+
+def test_inventory_expiry_text_is_normalized_before_saving():
+    assert stable.inventory_expiry_for_save("01/04/2031", False) == "2031-04-01"
+    assert stable.inventory_expiry_for_save("04/2031", False) == "2031-04-30"
+    assert stable.inventory_expiry_for_save("", True) == ""
+
+
+def test_inventory_expiry_requires_a_date_or_explicit_no_expiry_choice():
+    with pytest.raises(ValueError, match="Συμπλήρωσε ημερομηνία λήξης"):
+        stable.inventory_expiry_for_save("", False)
+    with pytest.raises(stable.core.InventoryError, match="δεν διαβάζεται"):
+        stable.inventory_expiry_for_save("not-a-date", False)
+    with pytest.raises(ValueError, match="Η ημερομηνία λήξης δεν είναι έγκυρη"):
+        stable.inventory_expiry_for_save("31/02/2031", False)
+    with pytest.raises(ValueError, match="όχι και τα δύο"):
+        stable.inventory_expiry_for_save("01/04/2031", True)
 
 
 def test_live_scanner_emits_one_token_until_barcode_leaves_frame():

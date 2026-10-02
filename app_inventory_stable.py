@@ -25,7 +25,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.10.02.2"
+APP_VERSION = "2026.10.02.3"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -52,6 +52,23 @@ def expiry_input_value(value: Any) -> str:
     if not normalized:
         return ""
     return pd.to_datetime(normalized).strftime("%d/%m/%Y")
+
+
+def inventory_expiry_for_save(value: Any, no_expiry: bool) -> str:
+    """Validate the receiving form's typed expiry and return its ISO value."""
+    raw = clean(value)
+    if raw and no_expiry:
+        raise ValueError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι δεν υπάρχει, όχι και τα δύο.")
+    if not raw:
+        if no_expiry:
+            return ""
+        raise ValueError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι δεν υπάρχει.")
+    try:
+        return core.parse_expiry_date(raw)
+    except ValueError as exc:
+        if isinstance(exc, core.InventoryError):
+            raise
+        raise ValueError("Η ημερομηνία λήξης δεν είναι έγκυρη.") from exc
 
 
 def configured_openai_model() -> str:
@@ -781,12 +798,11 @@ def scan_tab() -> None:
         return
 
     quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
-    expiry_date = st.date_input(
+    expiry_text = st.text_input(
         "Ημερομηνία λήξης",
-        value=None,
-        format="DD/MM/YYYY",
+        placeholder="π.χ. 01/04/2031 ή 04/2031",
         key=f"expiry_{context}",
-        help="Θα εμφανιστεί προειδοποίηση όταν απομένουν 6 μήνες ή λιγότερο.",
+        help="Γράψε DD/MM/YYYY ή MM/YYYY. Θα εμφανιστεί προειδοποίηση όταν απομένουν 6 μήνες ή λιγότερο.",
     )
     no_expiry = st.checkbox("Δεν υπάρχει ημερομηνία λήξης", key=f"no_expiry_{context}")
     lot_number = st.text_input("Παρτίδα (προαιρετικό)", key=f"lot_{context}")
@@ -799,8 +815,7 @@ def scan_tab() -> None:
 
     if st.button("💾 Αποθήκευση", type="primary", width="stretch", key=f"save_{context}"):
         try:
-            if expiry_date is None and not no_expiry:
-                raise ValueError("Συμπλήρωσε ημερομηνία λήξης ή επίλεξε ότι δεν υπάρχει.")
+            expiry_date = inventory_expiry_for_save(expiry_text, no_expiry)
             save_inventory_item(
                 code=code,
                 product_name=product_name,
@@ -808,7 +823,7 @@ def scan_tab() -> None:
                 brand=brand,
                 strength=strength,
                 dosage_form=dosage_form,
-                expiry_date=expiry_date.isoformat() if expiry_date is not None else "",
+                expiry_date=expiry_date,
                 lot_number=lot_number,
                 category=clean(selected.get("category")) or DEFAULT_CATEGORY,
                 location_id=location_id,
