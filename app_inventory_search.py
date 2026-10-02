@@ -731,7 +731,7 @@ def stock_table(df: pd.DataFrame) -> pd.DataFrame:
     data = data.copy()
     data["Timestamp_dt"] = pd.to_datetime(data["Timestamp"], errors="coerce")
     latest = (
-        data.sort_values("Timestamp_dt")
+        data.sort_values("Timestamp_dt", kind="stable")
         .groupby(identity, dropna=False)
         .tail(1)[identity + ["Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber", "ExpiryDate", "QRRawData", "DataMatrixRawData", "Μάρκα", "Προϊόν", "Κατηγορία", "Strength", "DosageForm"]]
     )

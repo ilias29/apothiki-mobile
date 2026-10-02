@@ -116,6 +116,29 @@ def test_same_barcode_different_lot_and_expiry_one_product():
     assert len(core.book.worksheet("Products").records) == 1
 
 
+def test_explicit_product_edit_updates_details_but_keeps_canonical_id_and_barcodes():
+    core = FakeCore()
+    base.ensure_base_sheets(core)
+    original = tx(
+        Barcode="5201234567890",
+        **{"Προϊόν": "OLD PRODUCT", "Μάρκα": "OLD BRAND", "Strength": "10 MG", "DosageForm": "TABS"},
+    )
+    assert base.upsert_product_from_transaction(core, original)
+    before = dict(core.book.worksheet("Products").records[0])
+
+    corrected = {**original, "TransactionId": "tx-corrected", "Προϊόν": "NEW PRODUCT", "Μάρκα": "NEW BRAND", "Strength": "20 MG", "DosageForm": "CAPS"}
+    assert base.update_product_details_from_transaction(core, corrected)
+
+    after = core.book.worksheet("Products").records[0]
+    assert after["ProductId"] == before["ProductId"]
+    assert after["Barcode"] == "5201234567890"
+    assert after["ProductName"] == "NEW PRODUCT"
+    assert after["Brand"] == "NEW BRAND"
+    assert after["Strength"] == "20 MG"
+    assert after["DosageForm"] == "CAPS"
+    assert "details_edited_from_stock" in after["Notes"]
+
+
 def test_product_rows_from_transactions_deduplicates_identifiers_added_later():
     frame = pd.DataFrame([
         tx(TransactionId="tx-a"),

@@ -172,8 +172,8 @@ def stock_snapshot(data: pd.DataFrame) -> pd.DataFrame:
         return frame
     frame["DeltaQty"] = pd.to_numeric(frame["DeltaQty"], errors="coerce").fillna(0).astype(int)
     group_cols = [
-        "CodeType", "CodeValue", "Barcode", "GTIN", "SerialNumber", "LotNumber",
-        "ExpiryDate", "Strength", "DosageForm", "Μάρκα", "Προϊόν", "Κατηγορία",
+        "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber",
+        "ExpiryDate", "QRRawData", "DataMatrixRawData", "Strength", "DosageForm", "Μάρκα", "Προϊόν", "Κατηγορία",
         "LocationId", "Τοποθεσία",
     ]
     for col in group_cols:

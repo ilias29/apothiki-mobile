@@ -25,7 +25,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.09.23.1"
+APP_VERSION = "2026.10.02.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -187,6 +187,222 @@ def save_inventory_item(
         pass
     core.invalidate_data_cache(ws)
     read_products.clear()
+
+
+def edit_stock_lot(
+    ws,
+    original: Any,
+    *,
+    product_name: str,
+    brand: str,
+    strength: str,
+    dosage_form: str,
+    category: str,
+    quantity: int,
+    expiry_date: str = "",
+    lot_number: str = "",
+    location_id: int = 0,
+    reason: str = "",
+    edit_id: str,
+) -> str:
+    """Correct one saved lot by appending auditable stock movements."""
+    product_name = clean(product_name)
+    if not product_name:
+        raise ValueError("Συμπλήρωσε το όνομα προϊόντος.")
+    if int(quantity) < 0:
+        raise ValueError("Η ποσότητα δεν μπορεί να είναι αρνητική.")
+    if int(location_id) not in LOCATIONS:
+        raise ValueError("Επίλεξε έγκυρη τοποθεσία.")
+    old_quantity = int(original.get("Stock", 0))
+    if old_quantity <= 0:
+        raise ValueError("Η επιλεγμένη παρτίδα δεν έχει διαθέσιμο υπόλοιπο.")
+    if clean(original.get("SerialNumber")) and int(quantity) > 1:
+        raise ValueError("Η συσκευασία έχει σειριακό αριθμό, επομένως η ποσότητα δεν μπορεί να ξεπερνά το 1.")
+
+    old_location = int(original.get("LocationId", 0))
+    expiry_date = core.parse_expiry_date(clean(expiry_date)) if clean(expiry_date) else ""
+    new_quantity = int(quantity)
+    original_fields = {
+        "product_name": clean(original.get("Προϊόν")),
+        "brand": clean(original.get("Μάρκα")),
+        "strength": clean(original.get("Strength")),
+        "dosage_form": clean(original.get("DosageForm")),
+        "category": clean(original.get("Κατηγορία")) or DEFAULT_CATEGORY,
+        "lot_number": clean(original.get("LotNumber")),
+        "expiry_date": clean(original.get("ExpiryDate")),
+    }
+    new_fields = {
+        "product_name": product_name,
+        "brand": clean(brand),
+        "strength": clean(strength),
+        "dosage_form": clean(dosage_form),
+        "category": clean(category) or DEFAULT_CATEGORY,
+        "lot_number": clean(lot_number),
+        "expiry_date": expiry_date,
+    }
+    if (
+        old_quantity == new_quantity
+        and old_location == int(location_id)
+        and all(new_fields[key] == value for key, value in original_fields.items())
+    ):
+        raise ValueError("Δεν έχει γίνει κάποια αλλαγή.")
+
+    code_type = clean(original.get("CodeType")) or "Barcode"
+    code_value = clean(original.get("CodeValue"))
+    if not code_value:
+        raise ValueError("Η εγγραφή δεν έχει κωδικό προϊόντος και δεν μπορεί να διορθωθεί εδώ.")
+    edit_key = hashlib.sha256(clean(edit_id).encode("utf-8")).hexdigest()[:24]
+    common = {
+        "code_type": code_type,
+        "code_value": code_value,
+        "barcode": clean(original.get("Barcode")),
+        "pc_code": clean(original.get("PCCode")),
+        "gtin": clean(original.get("GTIN")),
+        "serial_number": clean(original.get("SerialNumber")),
+        "qr_raw_data": clean(original.get("QRRawData")),
+        "datamatrix_raw_data": clean(original.get("DataMatrixRawData")),
+    }
+    edit_note = f"source=stock_edit; edit_id={edit_key}; reason={clean(reason) or 'διορθωση στοιχειων'}"
+    remove_row = core.make_transaction(
+        **common,
+        lot_number=clean(original.get("LotNumber")),
+        expiry_date=clean(original.get("ExpiryDate")),
+        strength=clean(original.get("Strength")),
+        dosage_form=clean(original.get("DosageForm")),
+        brand=clean(original.get("Μάρκα")),
+        product=clean(original.get("Προϊόν")),
+        category=clean(original.get("Κατηγορία")) or DEFAULT_CATEGORY,
+        location_id=old_location,
+        movement="Διόρθωση stock (-)",
+        quantity=old_quantity,
+        delta=-old_quantity,
+        note=f"{edit_note}; side=remove_previous_lot",
+        transaction_id=f"stock-edit-{edit_key}-out",
+        movement_kind=core.NORMAL,
+    )
+    add_row = core.make_transaction(
+        **common,
+        lot_number=new_fields["lot_number"],
+        expiry_date=new_fields["expiry_date"],
+        strength=new_fields["strength"],
+        dosage_form=new_fields["dosage_form"],
+        brand=new_fields["brand"],
+        product=new_fields["product_name"],
+        category=new_fields["category"],
+        location_id=int(location_id),
+        movement="Διόρθωση stock (+)",
+        quantity=new_quantity,
+        delta=new_quantity,
+        note=f"{edit_note}; side=save_corrected_lot",
+        transaction_id=f"stock-edit-{edit_key}-in",
+        movement_kind=core.NORMAL,
+    )
+    corrections = [remove_row] + ([add_row] if new_quantity else [])
+
+    fresh, _ = core.load_data(ws)
+    pending = [row for row in corrections if not core.transaction_exists(fresh, row["TransactionId"])]
+    # Guard against another sale or correction after the editor was opened.
+    # When retrying a partially/fully written edit, deterministic transaction
+    # IDs let us finish that same edit without applying its old quantity twice.
+    if len(pending) == len(corrections):
+        fresh_lots = csa.stock_snapshot(fresh)
+        lot_identity = [
+            "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber", "LotNumber",
+            "ExpiryDate", "QRRawData", "DataMatrixRawData", "Strength", "DosageForm",
+            "Μάρκα", "Προϊόν", "Κατηγορία", "LocationId",
+        ]
+        if fresh_lots.empty:
+            current_lot_quantity = 0
+        else:
+            current_mask = pd.Series(True, index=fresh_lots.index)
+            for column in lot_identity:
+                current_mask &= fresh_lots[column].astype(str).eq(clean(original.get(column)))
+            current_lot_quantity = int(fresh_lots.loc[current_mask, "Stock"].sum())
+        if current_lot_quantity != old_quantity:
+            raise core.InventoryError("Το υπόλοιπο της παρτίδας άλλαξε. Κάνε ανανέωση και ξαναδιάλεξέ την.")
+
+    pending_deltas: dict[tuple[str, str, int], int] = {}
+    for row in pending:
+        key = (row["CodeType"], row["CodeValue"], int(row["LocationId"]))
+        pending_deltas[key] = pending_deltas.get(key, 0) + int(row["DeltaQty"])
+    for (pending_type, pending_value, pending_location), delta in pending_deltas.items():
+        if core.current_stock(fresh, pending_type, pending_value, pending_location) + delta < 0:
+            raise core.InventoryError("Το διαθέσιμο stock άλλαξε. Κάνε ανανέωση και ξαναδιάλεξε την παρτίδα.")
+
+    # Update the confirmed product master after validation so a failed ledger
+    # request can be retried from the same form without losing the correction.
+    base_db.update_product_details_from_transaction(core, add_row)
+    read_products.clear()
+
+    if pending:
+        try:
+            if len(pending) > 1 and hasattr(ws, "append_rows"):
+                headers, _ = core.validate_and_migrate_headers(ws)
+                writable_headers = [header for header in headers if header not in core.DEPRECATED_COLUMNS]
+                values = [[row.get(header, "") for header in writable_headers] for row in pending]
+                ws.append_rows(values, value_input_option="RAW")
+            else:
+                for row in pending:
+                    core.append_row(ws, row)
+        except Exception:
+            core.invalidate_data_cache(ws)
+            raise
+        core.invalidate_data_cache(ws)
+
+    verified, _ = core.load_data(ws)
+    if any(not core.transaction_exists(verified, row["TransactionId"]) for row in corrections):
+        raise core.InventoryError("Η διόρθωση αποθηκεύτηκε μερικώς. Πάτησε ξανά αποθήκευση με τα ίδια στοιχεία.")
+
+    concurrent_change = False
+    for row in corrections:
+        if int(row["DeltaQty"]) >= 0:
+            continue
+        location = int(row["LocationId"])
+        balance = core.current_stock(verified, row["CodeType"], row["CodeValue"], location)
+        if balance >= 0:
+            continue
+        concurrent_change = True
+        compensation_delta = abs(balance)
+        compensation_base = f"stock-edit-{edit_key}-race-{location}"
+        compensation_id = compensation_base
+        suffix = 1
+        while core.transaction_exists(verified, compensation_id):
+            suffix += 1
+            compensation_id = f"{compensation_base}-{suffix}"
+        compensation = core.make_transaction(
+            code_type=row["CodeType"],
+            code_value=row["CodeValue"],
+            barcode=row["Barcode"],
+            pc_code=row.get("PCCode", ""),
+            gtin=row.get("GTIN", ""),
+            serial_number=row.get("SerialNumber", ""),
+            lot_number=row["LotNumber"],
+            expiry_date=row["ExpiryDate"],
+            qr_raw_data=row.get("QRRawData", ""),
+            datamatrix_raw_data=row.get("DataMatrixRawData", ""),
+            strength=row["Strength"],
+            dosage_form=row["DosageForm"],
+            brand=row["Μάρκα"],
+            product=row["Προϊόν"],
+            category=row["Κατηγορία"],
+            location_id=location,
+            movement="Αντιστάθμιση ταυτόχρονης αλλαγής (+)",
+            quantity=compensation_delta,
+            delta=compensation_delta,
+            note=f"source=stock_edit; edit_id={edit_key}; compensates={row['TransactionId']}",
+            transaction_id=compensation_id,
+            void_of=row["TransactionId"],
+            movement_kind=core.COMPENSATION,
+        )
+        core.append_stock_transaction(ws, compensation)
+        verified, _ = core.load_data(ws)
+        if core.current_stock(verified, row["CodeType"], row["CodeValue"], location) < 0:
+            raise core.InventoryError("Το stock άλλαξε ταυτόχρονα και χρειάζεται έλεγχος πριν συνεχίσεις.")
+
+    core.invalidate_data_cache(ws)
+    if concurrent_change:
+        return "race_compensated"
+    return "saved" if pending else "duplicate"
 
 
 def detect_barcode_from_camera(upload) -> str:
@@ -799,6 +1015,158 @@ def stock_tab() -> None:
     columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "ExpiryDate", "ExpiryWarning", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
     available = [column for column in columns if column in stock.columns]
     st.dataframe(stock[available], hide_index=True, width="stretch")
+
+    editable_lots = snapshot[snapshot["LocationId"].isin(LOCATIONS)].copy()
+    if editable_lots.empty:
+        return
+    with st.expander("✏️ Επεξεργασία αποθηκευμένου προϊόντος", expanded=False):
+        st.caption(
+            "Διάλεξε συγκεκριμένη παρτίδα για να διορθώσεις στοιχεία, λήξη, ποσότητα ή θέση. "
+            "Το barcode παραμένει ίδιο. Οι παλιές κινήσεις διατηρούνται στο ιστορικό."
+        )
+        editable_lots = editable_lots.reset_index(drop=True)
+        option_labels = []
+        for _, item in editable_lots.iterrows():
+            code = clean(item.get("Barcode")) or clean(item.get("GTIN")) or clean(item.get("CodeValue"))
+            lot = clean(item.get("LotNumber")) or "χωρίς παρτίδα"
+            expiry = clean(item.get("ExpiryDate")) or "χωρίς λήξη"
+            place = LOCATIONS.get(int(item.get("LocationId", 0)), "Άγνωστη θέση")
+            option_labels.append(
+                f"{clean(item.get('Προϊόν'))} · {code} · LOT {lot} · {expiry} · {place} · {int(item.get('Stock', 0))} τεμ."
+            )
+        selected_index = st.selectbox(
+            "Ποια εγγραφή θέλεις να αλλάξεις;",
+            options=range(len(option_labels)),
+            format_func=lambda index: option_labels[index],
+            key="stock_edit_selection",
+        )
+        original = editable_lots.iloc[int(selected_index)]
+        context = hashlib.sha256(
+            "|".join(
+                clean(original.get(column))
+                for column in [
+                    "CodeType", "CodeValue", "Barcode", "PCCode", "GTIN", "SerialNumber",
+                    "LotNumber", "ExpiryDate", "QRRawData", "DataMatrixRawData", "Strength",
+                    "DosageForm", "Μάρκα", "Προϊόν", "Κατηγορία", "LocationId", "Stock",
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        st.caption(f"Barcode / κωδικός: {clean(original.get('CodeValue'))}")
+
+        current_expiry_value = pd.to_datetime(clean(original.get("ExpiryDate")), errors="coerce")
+        current_expiry = None if pd.isna(current_expiry_value) else current_expiry_value.date()
+        categories = list(core.CATEGORIES)
+        current_category = clean(original.get("Κατηγορία")) or DEFAULT_CATEGORY
+        if current_category not in categories:
+            categories.append(current_category)
+        locations = [f"{index} - {name}" for index, name in LOCATIONS.items()]
+        current_location = int(original.get("LocationId", 0))
+        current_location_index = next(
+            (index for index, label in enumerate(locations) if int(label.split("-", 1)[0].strip()) == current_location),
+            0,
+        )
+
+        pending_key = f"stock_edit_pending_{context}"
+        state_key = f"stock_edit_form_{context}"
+        if state_key not in st.session_state:
+            st.session_state[state_key] = uuid.uuid4().hex
+        with st.form(f"stock_edit_form_{context}"):
+            edited_name = st.text_input("Όνομα προϊόντος", value=clean(original.get("Προϊόν")), key=f"stock_edit_name_{context}")
+            edited_brand = st.text_input("Μάρκα / εταιρεία", value=clean(original.get("Μάρκα")), key=f"stock_edit_brand_{context}")
+            col_strength, col_form = st.columns(2)
+            edited_strength = col_strength.text_input("Περιεκτικότητα", value=clean(original.get("Strength")), key=f"stock_edit_strength_{context}")
+            edited_form = col_form.text_input("Μορφή", value=clean(original.get("DosageForm")), key=f"stock_edit_dosage_{context}")
+            edited_category = st.selectbox(
+                "Κατηγορία",
+                categories,
+                index=categories.index(current_category),
+                key=f"stock_edit_category_{context}",
+            )
+            col_quantity, col_lot = st.columns(2)
+            edited_quantity = col_quantity.number_input(
+                "Σωστή ποσότητα",
+                min_value=0,
+                max_value=1 if clean(original.get("SerialNumber")) and int(original.get("Stock", 0)) <= 1 else None,
+                value=int(original.get("Stock", 0)),
+                step=1,
+                key=f"stock_edit_quantity_{context}",
+            )
+            edited_lot = col_lot.text_input("Παρτίδα", value=clean(original.get("LotNumber")), key=f"stock_edit_lot_{context}")
+            has_expiry = st.checkbox(
+                "Υπάρχει ημερομηνία λήξης",
+                value=current_expiry is not None,
+                key=f"stock_edit_has_expiry_{context}",
+            )
+            edited_expiry = None
+            if has_expiry:
+                edited_expiry = st.date_input(
+                    "Ημερομηνία λήξης",
+                    value=current_expiry,
+                    format="DD/MM/YYYY",
+                    key=f"stock_edit_expiry_{context}",
+                )
+            edited_location_label = st.selectbox(
+                "Τοποθεσία",
+                locations,
+                index=current_location_index,
+                key=f"stock_edit_location_{context}",
+            )
+            edit_reason = st.text_input("Αιτία αλλαγής (προαιρετικό)", key=f"stock_edit_reason_{context}")
+            confirmed = st.checkbox("Επιβεβαιώνω τη διόρθωση", key=f"stock_edit_confirm_{context}")
+            submitted = st.form_submit_button("💾 Αποθήκευση αλλαγών", type="primary", disabled=not confirmed, width="stretch")
+
+        if submitted:
+            if has_expiry and edited_expiry is None:
+                st.error("Διάλεξε ημερομηνία λήξης ή βγάλε την επιλογή «Υπάρχει ημερομηνία λήξης».")
+                return
+            location_id = int(edited_location_label.split("-", 1)[0].strip())
+            payload = (
+                clean(edited_name), clean(edited_brand), clean(edited_strength), clean(edited_form),
+                clean(edited_category), int(edited_quantity),
+                edited_expiry.isoformat() if has_expiry and edited_expiry else "",
+                clean(edited_lot), location_id, clean(edit_reason),
+            )
+            pending = st.session_state.get(pending_key)
+            if pending and pending.get("payload") != payload:
+                st.error("Μια διόρθωση εκκρεμεί. Κάνε ξανά αποθήκευση με τα ίδια στοιχεία πριν τα αλλάξεις.")
+                return
+            if not pending:
+                pending = {"payload": payload, "edit_id": uuid.uuid4().hex}
+                st.session_state[pending_key] = pending
+            try:
+                result = edit_stock_lot(
+                    ws,
+                    original,
+                    product_name=payload[0],
+                    brand=payload[1],
+                    strength=payload[2],
+                    dosage_form=payload[3],
+                    category=payload[4],
+                    quantity=payload[5],
+                    expiry_date=payload[6],
+                    lot_number=payload[7],
+                    location_id=payload[8],
+                    reason=payload[9],
+                    edit_id=pending["edit_id"],
+                )
+            except (ValueError, core.InventoryError) as exc:
+                message = str(exc)
+                if isinstance(exc, ValueError) or message.startswith((
+                    "Η ημερομηνία λήξης", "Το υπόλοιπο της παρτίδας άλλαξε", "Το διαθέσιμο stock άλλαξε",
+                )):
+                    st.session_state.pop(pending_key, None)
+                st.error(f"Δεν ολοκληρώθηκε η διόρθωση: {message}")
+            except Exception as exc:
+                st.error(f"Δεν ολοκληρώθηκε η διόρθωση: {exc}")
+            else:
+                st.session_state.pop(pending_key, None)
+                if result == "race_compensated":
+                    st.warning("Άλλαξε κίνηση stock την ίδια στιγμή. Αποτράπηκε αρνητικό υπόλοιπο· έλεγξε ξανά την ποσότητα μετά την ανανέωση.")
+                elif result == "duplicate":
+                    st.info("Αυτή η διόρθωση είχε ήδη αποθηκευτεί.")
+                else:
+                    st.success("Οι αλλαγές αποθηκεύτηκαν. Το ιστορικό των προηγούμενων κινήσεων διατηρήθηκε.")
+                st.rerun()
 
 
 def catalog_dataframe() -> pd.DataFrame:

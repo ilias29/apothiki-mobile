@@ -427,6 +427,48 @@ def upsert_product_from_transaction(core, row: dict[str, Any]) -> bool:
     return created or changed
 
 
+def update_product_details_from_transaction(core, row: dict[str, Any]) -> bool:
+    """Explicitly replace user-editable product details for a known identity.
+
+    Normal transaction upserts only fill missing product fields. This separate
+    operation is used by the stock editor when a user deliberately corrects a
+    saved product, while retaining its stable ProductId and identifiers.
+    """
+    candidate = transaction_row_to_product(row)
+    if not candidate["ProductName"] and not identifier_set(candidate):
+        return False
+
+    ws = ensure_worksheet(core, "Products", PRODUCT_COLUMNS)
+    existing = pd.DataFrame(ws.get_all_records())
+    for column in PRODUCT_COLUMNS:
+        if column not in existing.columns:
+            existing[column] = ""
+    existing = existing[PRODUCT_COLUMNS]
+    match_index = find_matching_product_index(existing, candidate)
+    if match_index is None:
+        return upsert_product_from_transaction(core, row)
+
+    product_row = {column: clean(existing.loc[match_index].get(column, "")) for column in PRODUCT_COLUMNS}
+    for column in ["ProductName", "Brand", "Category", "Strength", "DosageForm"]:
+        product_row[column] = clean(candidate.get(column, ""))
+    # Keep the existing canonical identity and every identifier already linked
+    # to it. An edit to display details must not detach aliases or packages.
+    for column in ["Barcode", "GTIN", "PC_GTIN", "DataMatrix_PC", "DataMatrix_SN"]:
+        if not product_row[column] and clean(candidate.get(column, "")):
+            product_row[column] = clean(candidate.get(column, ""))
+    if not product_row["ProductId"]:
+        product_row["ProductId"] = candidate["ProductId"]
+    if not product_row["CreatedAt"]:
+        product_row["CreatedAt"] = clean(candidate.get("CreatedAt")) or now_iso()
+    product_row["UpdatedAt"] = now_iso()
+    old_note = clean(existing.loc[match_index].get("Notes", ""))
+    marker = "details_edited_from_stock"
+    if marker not in old_note:
+        product_row["Notes"] = "; ".join(part for part in [old_note, marker] if part)
+    _write_product_row(ws, match_index + 2, product_row)
+    return True
+
+
 def sync_products_from_transactions(core, data: pd.DataFrame) -> dict[str, int]:
     ws = ensure_worksheet(core, "Products", PRODUCT_COLUMNS)
     package_ws = ensure_worksheet(core, "PackageIdentifiers", PACKAGE_IDENTIFIER_COLUMNS)

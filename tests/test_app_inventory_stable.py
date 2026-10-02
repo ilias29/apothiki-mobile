@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import app_inventory_stable as stable
 
@@ -109,7 +110,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.09.23.1"
+    assert stable.APP_VERSION == "2026.10.02.1"
 
 
 def test_live_scanner_emits_one_token_until_barcode_leaves_frame():
@@ -208,6 +209,198 @@ def test_auto_scan_retry_reuses_transaction_id(monkeypatch):
     assert first["status"] == "error"
     assert retry["status"] == "added"
     assert transaction_ids[0] == transaction_ids[1]
+
+
+class MemoryStockWorksheet:
+    def __init__(self):
+        self.headers = stable.core.COLUMNS.copy()
+        self.records = []
+        self.before_append = None
+
+    def row_values(self, _row):
+        return self.headers.copy()
+
+    def get_all_records(self):
+        return [dict(row) for row in self.records]
+
+    def append_rows(self, values, value_input_option=None):
+        if self.before_append:
+            callback, self.before_append = self.before_append, None
+            callback()
+        self.records.extend(dict(zip(self.headers, row)) for row in values)
+
+    def append_row(self, values, value_input_option=None):
+        if self.before_append:
+            callback, self.before_append = self.before_append, None
+            callback()
+        self.records.append(dict(zip(self.headers, values)))
+
+    def update(self, cell_range, values):
+        if cell_range == "A1":
+            self.headers = list(values[0])
+
+
+def _saved_lot_fixture():
+    ws = MemoryStockWorksheet()
+    original = stable.core.make_transaction(
+        code_type="Barcode",
+        code_value="5055148407049",
+        barcode="5055148407049",
+        brand="LAMBERTS",
+        product="MAXI-HAIR 60 TABS",
+        category="Συμπλήρωμα",
+        location_id=0,
+        movement="Παραλαβή (+)",
+        quantity=3,
+        delta=3,
+        strength="",
+        dosage_form="TABS",
+        expiry_date="2028-12-31",
+        lot_number="LOT-OLD",
+        transaction_id="original-receipt",
+    )
+    ws.records.append(original)
+    data, _ = stable.core.load_data(ws)
+    lot = stable.csa.stock_snapshot(data).iloc[0]
+    return ws, original, lot
+
+
+def test_saved_lot_can_be_edited_without_deleting_history(monkeypatch):
+    ws, original, lot = _saved_lot_fixture()
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: True)
+
+    result = stable.edit_stock_lot(
+        ws,
+        lot,
+        product_name="MAXI-HAIR 60 TABLETS",
+        brand="LAMBERTS",
+        strength="",
+        dosage_form="TABLETS",
+        category="Συμπλήρωμα",
+        quantity=5,
+        expiry_date="2029-03-31",
+        lot_number="LOT-NEW",
+        location_id=1,
+        reason="Λάθος αρχική καταχώρηση",
+        edit_id="edit-test-1",
+    )
+
+    corrected, _ = stable.core.load_data(ws)
+    lots = stable.csa.stock_snapshot(corrected)
+    stock = stable.core.stock_table(corrected)
+    assert result == "saved"
+    assert len(ws.records) == 3
+    assert ws.records[0]["TransactionId"] == original["TransactionId"]
+    assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 0) == 0
+    assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 1) == 5
+    assert lots.iloc[0]["Προϊόν"] == "MAXI-HAIR 60 TABLETS"
+    assert lots.iloc[0]["LotNumber"] == "LOT-NEW"
+    assert lots.iloc[0]["ExpiryDate"] == "2029-03-31"
+    assert stock.iloc[0]["Προϊόν"] == "MAXI-HAIR 60 TABLETS"
+
+
+def test_saved_lot_edit_retry_does_not_duplicate_stock_movements(monkeypatch):
+    ws, _original, lot = _saved_lot_fixture()
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: True)
+    edit = dict(
+        product_name="MAXI-HAIR 60 TABS",
+        brand="LAMBERTS",
+        strength="",
+        dosage_form="TABS",
+        category="Συμπλήρωμα",
+        quantity=4,
+        expiry_date="2028-12-31",
+        lot_number="LOT-OLD",
+        location_id=0,
+        edit_id="edit-test-retry",
+    )
+
+    assert stable.edit_stock_lot(ws, lot, **edit) == "saved"
+    assert stable.edit_stock_lot(ws, lot, **edit) == "duplicate"
+    corrected, _ = stable.core.load_data(ws)
+    assert len(ws.records) == 3
+    assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 0) == 4
+
+
+def test_saved_lot_edit_refuses_stale_quantity(monkeypatch):
+    ws, _original, lot = _saved_lot_fixture()
+    consumed = stable.core.make_transaction(
+        code_type="Barcode",
+        code_value="5055148407049",
+        barcode="5055148407049",
+        brand="LAMBERTS",
+        product="MAXI-HAIR 60 TABS",
+        category="Συμπλήρωμα",
+        location_id=0,
+        movement="Πώληση (-)",
+        quantity=2,
+        delta=-2,
+        lot_number="LOT-OLD",
+        expiry_date="2028-12-31",
+        transaction_id="later-sale",
+    )
+    ws.records.append(consumed)
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: True)
+
+    with pytest.raises(stable.core.InventoryError, match="υπόλοιπο της παρτίδας άλλαξε"):
+        stable.edit_stock_lot(
+            ws,
+            lot,
+            product_name="MAXI-HAIR 60 TABS",
+            brand="LAMBERTS",
+            strength="",
+            dosage_form="TABS",
+            category="Συμπλήρωμα",
+            quantity=4,
+            expiry_date="2028-12-31",
+            lot_number="LOT-OLD",
+            location_id=0,
+            edit_id="edit-stale",
+        )
+    assert len(ws.records) == 2
+
+
+def test_saved_lot_edit_compensates_if_concurrent_sale_would_go_negative(monkeypatch):
+    ws, _original, lot = _saved_lot_fixture()
+    concurrent_sale = stable.core.make_transaction(
+        code_type="Barcode",
+        code_value="5055148407049",
+        barcode="5055148407049",
+        brand="LAMBERTS",
+        product="MAXI-HAIR 60 TABS",
+        category="Συμπλήρωμα",
+        location_id=0,
+        movement="Πώληση (-)",
+        quantity=3,
+        delta=-3,
+        lot_number="LOT-OLD",
+        expiry_date="2028-12-31",
+        transaction_id="concurrent-sale",
+    )
+    ws.before_append = lambda: ws.records.append(concurrent_sale)
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: True)
+
+    result = stable.edit_stock_lot(
+        ws,
+        lot,
+        product_name="MAXI-HAIR 60 TABS",
+        brand="LAMBERTS",
+        strength="",
+        dosage_form="TABS",
+        category="Συμπλήρωμα",
+        quantity=0,
+        expiry_date="2028-12-31",
+        lot_number="LOT-OLD",
+        location_id=0,
+        edit_id="edit-race",
+    )
+
+    corrected, _ = stable.core.load_data(ws)
+    compensation_rows = corrected[corrected["MovementKind"].eq(stable.core.COMPENSATION)]
+    assert result == "race_compensated"
+    assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 0) == 0
+    assert len(compensation_rows) == 1
+    assert compensation_rows.iloc[0]["VoidOf"] == "stock-edit-" + stable.hashlib.sha256(b"edit-race").hexdigest()[:24] + "-out"
 
 
 def test_excel_catalog_is_used_before_online_lookup(monkeypatch):

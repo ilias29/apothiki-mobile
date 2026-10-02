@@ -1,6 +1,6 @@
 # Project state · apothiki-mobile
 
-Updated: 2026-09-23
+Updated: 2026-10-02
 
 ## Verified facts
 
@@ -9,6 +9,8 @@ Updated: 2026-09-23
 - The application supports barcode/QR lookup, stock by location, FEFO removal, negative-stock protection, and compensating ledger reversals.
 - AI-assisted receiving requires explicit user confirmation before stock is written.
 - Existing offline/manual imports are designed to use stable transaction identifiers so repeated saves do not duplicate already-written rows.
+- The Stock tab now supports editing a saved lot's product details, quantity, expiry, lot number, category, and location. Corrections append paired movements, keep the barcode fixed, and preserve the previous ledger rows.
+- Product master display details can be deliberately corrected while preserving its canonical ProductId and known barcode/GTIN aliases.
 
 ## General rules
 
@@ -40,8 +42,10 @@ Keep explicit regression coverage for:
 
 ## Last session
 
-2026-09-23 · Added automatic `+1` stock movement for a recognized, locally known barcode from either the live scanner or a barcode photo. The movement targets location 0 (Αποθήκη), records that expiry/lot were not captured, and never fabricates them. A per-scan token prevents Streamlit reruns or the same photo from adding repeatedly; the same barcode can add again after a distinct scan event. Each event also gets a stable transaction id within the scanner session, so a retry cannot duplicate a movement after an uncertain response. Unknown barcodes continue to the existing matching form and are not auto-saved.
+2026-10-02 · Added a Stock-tab editor for saved lots. It fresh-checks the selected lot before changes, writes deterministic correction movements (the removal/replacement pair is batched when the replacement quantity is positive), keeps the previous movement history, and updates the confirmed product details without changing ProductId or removing barcode aliases. Added regression tests for lot/expiry/quantity/location edits, retry idempotency, stale stock protection, and preservation of package identifiers. `py_compile` and `git diff --check` pass. Local pytest is unavailable in this environment (pytest and runtime app dependencies are not installed); GitHub Actions is the next full-suite check. Application version: `2026.10.02.1`.
 
-Verified with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version: `2026.09.23.1`.
+Previous: 2026-09-23 · Added automatic `+1` stock movement for a recognized, locally known barcode from either the live scanner or a barcode photo. The movement targets location 0 (Αποθήκη), records that expiry/lot were not captured, and never fabricates them. A per-scan token prevents Streamlit reruns or the same photo from adding repeatedly; the same barcode can add again after a distinct scan event. Each event also gets a stable transaction id within the scanner session, so a retry cannot duplicate a movement after an uncertain response. Unknown barcodes continue to the existing matching form and are not auto-saved.
 
-Next: verify one known barcode and one unknown barcode in the deployed mobile Streamlit camera flow after the GitHub deployment finishes.
+Verified then with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version at that time: `2026.09.23.1`.
+
+Next: confirm the inventory test workflow passes for the new stock edit feature, then exercise editing a test lot in the deployed Streamlit app.

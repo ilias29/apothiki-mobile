@@ -40,6 +40,8 @@ Use this skill for any change touching `app_inventory_stable.py`, catalog/import
 - Never permit a removal that creates negative stock.
 - Fresh-read and post-write validation are required where concurrent writes can race.
 - Use compensating movements for reversals. Do not erase transaction history.
+- Editing a saved lot must fresh-check that its exact identity and quantity have not changed since the editor opened. When the replacement quantity is positive, write a deterministic removal/replacement pair as one batch; retain the old rows and reuse those IDs on retry.
+- Preserve package identifiers and barcode aliases when changing product display details; package-level identifiers must not be regenerated just because a lot is edited.
 - Keep `VoidOf` / movement-kind relationships intact when touching reversal logic.
 
 ### Search and lookup

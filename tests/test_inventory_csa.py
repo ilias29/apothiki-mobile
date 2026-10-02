@@ -66,6 +66,18 @@ def test_document_reference_prevents_duplicate_seed_after_rephoto():
     assert a == b
 
 
+def test_stock_lot_snapshot_keeps_package_identifiers_for_later_edits():
+    row = _receipt(qty=2, lot="LOT-X", expiry="2098-10-31")
+    row["PCCode"] = "07640129622818"
+    row["QRRawData"] = "qr-content"
+    row["DataMatrixRawData"] = "datamatrix-content"
+    snapshot = csa.stock_snapshot(core.records_to_dataframe([row]))
+
+    assert snapshot.loc[0, "PCCode"] == "07640129622818"
+    assert snapshot.loc[0, "QRRawData"] == "qr-content"
+    assert snapshot.loc[0, "DataMatrixRawData"] == "datamatrix-content"
+
+
 def test_ai_normalization_keeps_identifier_as_text_and_quantity_integer():
     frame = csa.normalize_ai_items([
         {
