@@ -38,11 +38,11 @@ Keep explicit regression coverage for:
 
 ## Open failures / investigations
 
-- The receiving form showed a selected expiry date on mobile but submitted `None`; the save error is fixed by validated text entry and regression tests. Verify the deployed Streamlit app after GitHub Actions passes.
+- The receiving form showed a selected expiry date on mobile but submitted `None`; validated text entry is pushed and CI passed. The mobile Streamlit deployment has not yet been checked in a live session.
 
 ## Last session
 
-2026-10-02 · Fixed the reported Stock-tab controls. The selected-lot editor always shows an editable expiry text field (DD/MM/YYYY or MM/YYYY; blank clears expiry) and has a separately confirmed button that zeros only the selected lot through a ledger movement. The receiving form now uses validated expiry text entry because the mobile date widget showed a value but submitted `None`; added regression coverage for both accepted date formats, invalid input, and explicit no-expiry. CI status for this follow-up is pending. Application version: `2026.10.02.3`.
+2026-10-02 · Fixed the reported Stock-tab controls. The selected-lot editor always shows an editable expiry text field (DD/MM/YYYY or MM/YYYY; blank clears expiry) and has a separately confirmed button that zeros only the selected lot through a ledger movement. The receiving form now uses validated expiry text entry because the mobile date widget showed a value but submitted `None`; added regression coverage for both accepted date formats, invalid input, and explicit no-expiry. GitHub Actions passed: 150 tests and 4 subtests; compile check passed. Local pytest is unavailable. Application version: `2026.10.02.3`.
 
 Previous session: added a Stock-tab editor for saved lots. It fresh-checks the selected lot before changes, writes deterministic correction movements (the removal/replacement pair is batched when the replacement quantity is positive), keeps the previous movement history, and updates confirmed product details without changing ProductId or removing barcode aliases. Prior local `py_compile` and `git diff --check` passed; the full pytest suite could not run locally because pytest is missing. Application version then: `2026.10.02.1`.
 
