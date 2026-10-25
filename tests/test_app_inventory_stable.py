@@ -525,3 +525,32 @@ def test_new_maxi_hair_packaging_barcode_resolves_locally(monkeypatch):
     assert product["brand"] == "LAMBERTS"
     assert product["dosage_form"] == "TABS"
     assert product["package_size"] == "60 TABS"
+
+
+def test_bulk_zero_stock_uses_stable_ids_and_reports_results(monkeypatch):
+    import pandas as pd
+    import app_inventory_stable as app
+
+    calls = []
+    def fake_edit(ws, original, **kwargs):
+        calls.append((kwargs["edit_id"], kwargs["quantity"], kwargs["location_id"]))
+        return "saved"
+    monkeypatch.setattr(app, "edit_stock_lot", fake_edit)
+    lots = pd.DataFrame([
+        {"CodeType": "Barcode", "CodeValue": "123", "Stock": 3, "LocationId": 0, "Προϊόν": "TEST A"},
+        {"CodeType": "Barcode", "CodeValue": "456", "Stock": 2, "LocationId": 1, "Προϊόν": "TEST B"},
+    ])
+    result = app.bulk_zero_stock(object(), lots, job_id="job-1")
+    assert result == {"saved": 2, "duplicate": 0, "failed": []}
+    assert all(qty == 0 for _, qty, _ in calls)
+    original_ids = [item[0] for item in calls]
+    app.bulk_zero_stock(object(), lots, job_id="job-1")
+    assert original_ids == [item[0] for item in calls[2:]]
+
+
+def test_bulk_zero_stock_rejects_missing_job_id():
+    import pandas as pd
+    import pytest
+    import app_inventory_stable as app
+    with pytest.raises(ValueError):
+        app.bulk_zero_stock(object(), pd.DataFrame(), job_id="")
