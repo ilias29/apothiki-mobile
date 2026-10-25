@@ -1011,6 +1011,50 @@ def invoice_tab() -> None:
             st.rerun()
 
 
+
+def bulk_zero_stock(ws, lots: pd.DataFrame, *, job_id: str) -> dict[str, Any]:
+    """Zero a frozen selection of lots with deterministic, retry-safe movement IDs.
+
+    Returns per-lot results; a failed lot does not silently count as completed.
+    The original ledger rows and product catalogue remain intact.
+    """
+    if not clean(job_id):
+        raise ValueError("Απαιτείται αναγνωριστικό εργασίας.")
+    results: dict[str, Any] = {"saved": 0, "duplicate": 0, "failed": []}
+    if lots is None or lots.empty:
+        return results
+    for index, (_, lot) in enumerate(lots.iterrows()):
+        identity = "|".join(clean(lot.get(col)) for col in (
+            "CodeType", "CodeValue", "SerialNumber", "LotNumber", "ExpiryDate",
+            "LocationId", "Stock", "Προϊόν",
+        ))
+        edit_id = f"bulk-zero:{job_id}:{index}:{hashlib.sha256(identity.encode()).hexdigest()}"
+        try:
+            status = edit_stock_lot(
+                ws, lot,
+                product_name=clean(lot.get("Προϊόν")),
+                brand=clean(lot.get("Μάρκα")),
+                strength=clean(lot.get("Strength")),
+                dosage_form=clean(lot.get("DosageForm")),
+                category=clean(lot.get("Κατηγορία")) or DEFAULT_CATEGORY,
+                quantity=0,
+                expiry_date=clean(lot.get("ExpiryDate")),
+                lot_number=clean(lot.get("LotNumber")),
+                location_id=int(lot.get("LocationId", 0)),
+                reason=f"Μαζικός μηδενισμός · εργασία {job_id}",
+                edit_id=edit_id,
+            )
+            if status == "saved":
+                results["saved"] += 1
+            elif status == "duplicate":
+                results["duplicate"] += 1
+            else:
+                results["failed"].append((index, f"Χρειάζεται έλεγχος: {status}"))
+        except Exception as exc:
+            results["failed"].append((index, str(exc)))
+    return results
+
+
 def stock_tab() -> None:
     st.subheader("📦 Τρέχον stock")
     ws = core.worksheet()
@@ -1044,6 +1088,53 @@ def stock_tab() -> None:
     columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "ExpiryDate", "ExpiryWarning", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
     available = [column for column in columns if column in stock.columns]
     st.dataframe(stock[available], hide_index=True, width="stretch")
+
+
+    with st.expander("🧹 Μαζικός μηδενισμός αποθήκης", expanded=False):
+        st.warning("Η ενέργεια καταχωρίζει διορθωτικές κινήσεις. Δεν διαγράφει προϊόντα ή ιστορικό.")
+        scope = st.selectbox(
+            "Ποιες τοποθεσίες;",
+            ["Μόνο Αποθήκη", "Μόνο Κύριο Κτήριο", "Μόνο Πρώτος Όροφος", "Όλες οι τοποθεσίες"],
+            key="bulk_zero_scope",
+        )
+        selected_locations = {
+            "Μόνο Αποθήκη": [0], "Μόνο Κύριο Κτήριο": [1],
+            "Μόνο Πρώτος Όροφος": [2], "Όλες οι τοποθεσίες": list(LOCATIONS),
+        }[scope]
+        selected = snapshot[snapshot["LocationId"].isin(selected_locations)].copy()
+        selected = selected[selected["Stock"].astype(int) > 0].reset_index(drop=True)
+        st.write(f"Θα μηδενιστούν **{len(selected)} παρτίδες/εγγραφές**, συνολικά **{int(selected['Stock'].sum()) if not selected.empty else 0} τεμάχια**.")
+        job = st.session_state.get("bulk_zero_job")
+        if job is not None and job["scope"] != scope:
+            st.error("Υπάρχει εργασία σε εξέλιξη για άλλη επιλογή. Ολοκλήρωσέ την πρώτα.")
+        elif job is None:
+            with st.form("bulk_zero_confirm_form"):
+                phrase = st.text_input("Πληκτρολόγησε ΜΗΔΕΝΙΣΜΟΣ", key="bulk_zero_phrase")
+                acknowledged = st.checkbox("Καταλαβαίνω ότι οι ποσότητες θα μηδενιστούν.")
+                start = st.form_submit_button("🧹 Έναρξη μηδενισμού", disabled=selected.empty)
+            if start:
+                if phrase.strip() != "ΜΗΔΕΝΙΣΜΟΣ" or not acknowledged:
+                    st.error("Απαιτείται η ακριβής λέξη και η επιβεβαίωση.")
+                else:
+                    st.session_state["bulk_zero_job"] = {
+                        "id": uuid.uuid4().hex, "scope": scope,
+                        "lots": selected.to_dict("records"),
+                    }
+                    st.rerun()
+        else:
+            st.warning("Η εργασία έχει ξεκινήσει. Εάν διακόπηκε, μπορείς να συνεχίσεις χωρίς να ξαναπεράσουν οι ίδιες κινήσεις.")
+            if st.button("▶ Εκτέλεση / συνέχιση μηδενισμού", key="bulk_zero_execute"):
+                with st.spinner("Ελέγχονται και καταχωρίζονται οι κινήσεις..."):
+                    result = bulk_zero_stock(ws, pd.DataFrame(job["lots"]), job_id=job["id"])
+                st.session_state["bulk_zero_last_result"] = result
+                if result["failed"]:
+                    st.error(f"Ολοκληρώθηκαν {result['saved']} νέες κινήσεις, {result['duplicate']} ήδη υπήρχαν. Απέτυχαν {len(result['failed'])} εγγραφές. Δες τα σφάλματα και επανάλαβε.")
+                    for index, message in result["failed"][:20]:
+                        st.write(f"Εγγραφή {index + 1}: {message}")
+                else:
+                    st.session_state.pop("bulk_zero_job", None)
+                    st.success(f"Ο μηδενισμός ολοκληρώθηκε. Νέες κινήσεις: {result['saved']}, ήδη καταχωρισμένες: {result['duplicate']}.")
+                    st.rerun()
 
     editable_lots = snapshot[snapshot["LocationId"].isin(LOCATIONS)].copy()
     if editable_lots.empty:
@@ -1277,9 +1368,78 @@ def catalog_dataframe() -> pd.DataFrame:
     return pd.DataFrame(rows.values()).sort_values(["Μάρκα", "Προϊόν", "Barcode"], ignore_index=True)
 
 
+
+def create_manual_catalog_product(*, barcode: str, product_name: str, brand: str = "",
+                                  category: str = DEFAULT_CATEGORY, strength: str = "",
+                                  dosage_form: str = "", company: str = "",
+                                  notes: str = "") -> str:
+    """Add a catalog-only product, without creating any stock movement."""
+    barcode = clean(barcode)
+    product_name = clean(product_name)
+    if not barcode.isdigit() or not (8 <= len(barcode) <= 14):
+        raise ValueError("Το barcode πρέπει να έχει 8 έως 14 αριθμητικά ψηφία.")
+    if not product_name:
+        raise ValueError("Συμπλήρωσε όνομα προϊόντος.")
+    ws = base_db.ensure_worksheet(core, "Products", base_db.PRODUCT_COLUMNS)
+    existing = pd.DataFrame(ws.get_all_records())
+    for column in base_db.PRODUCT_COLUMNS:
+        if column not in existing:
+            existing[column] = ""
+    existing = existing[base_db.PRODUCT_COLUMNS]
+    for _, row in existing.iterrows():
+        if barcode in base_db.identifier_set(row):
+            raise ValueError("Αυτό το barcode υπάρχει ήδη στη βάση. Δεν δημιουργήθηκε διπλό προϊόν.")
+    candidate = base_db.transaction_row_to_product({
+        "Barcode": barcode if len(barcode) != 14 else "",
+        "GTIN": barcode if len(barcode) == 14 else "",
+        "Προϊόν": product_name, "Μάρκα": brand, "Κατηγορία": category,
+        "Strength": strength, "DosageForm": dosage_form,
+        "Company": company,
+    })
+    for _, row in existing.iterrows():
+        if base_db.product_names_compatible(row, candidate):
+            raise ValueError("Υπάρχει πιθανώς ήδη αυτό το προϊόν με άλλο barcode. Έλεγξέ το πριν το καταχωρίσεις.")
+    candidate["ProductId"] = "prd_manual_" + uuid.uuid4().hex
+    candidate["Notes"] = "; ".join(part for part in ["manual_catalog_entry", clean(notes)] if part)
+    ws.append_row([candidate.get(column, "") for column in base_db.PRODUCT_COLUMNS], value_input_option="RAW")
+    read_products.clear()
+    return candidate["ProductId"]
+
+
 def catalog_tab() -> None:
     st.subheader("📚 Κατάλογος προϊόντων")
     st.caption("Γνωστά προϊόντα και barcode. Η εμφάνιση εδώ δεν σημαίνει ότι υπάρχει ποσότητα στο stock.")
+
+    with st.expander("➕ Προσθήκη νέου παραφαρμάκου στη βάση", expanded=False):
+        st.caption("Αποθηκεύει προϊόν στον κατάλογο, χωρίς να αυξάνει το απόθεμα.")
+        with st.form("manual_catalog_product_form", clear_on_submit=True):
+            manual_barcode = st.text_input("Barcode (υποχρεωτικό)")
+            manual_name = st.text_input("Όνομα προϊόντος (υποχρεωτικό)")
+            manual_brand = st.text_input("Μάρκα")
+            manual_category = st.selectbox("Κατηγορία", ["Καλλυντικό", "Συμπλήρωμα", "Αναλώσιμο", "Άλλο", "Φάρμακο"])
+            manual_strength = st.text_input("Περιεκτικότητα")
+            manual_form = st.text_input("Μορφή")
+            manual_company = st.text_input("Εταιρεία")
+            manual_notes = st.text_input("Σημειώσεις")
+            manual_confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία του νέου προϊόντος")
+            manual_save = st.form_submit_button("💾 Προσθήκη στη βάση")
+        if manual_save:
+            if not manual_confirm:
+                st.error("Επιβεβαίωσε πρώτα τα στοιχεία.")
+            else:
+                try:
+                    created_id = create_manual_catalog_product(
+                        barcode=manual_barcode, product_name=manual_name,
+                        brand=manual_brand, category=manual_category,
+                        strength=manual_strength, dosage_form=manual_form,
+                        company=manual_company, notes=manual_notes,
+                    )
+                except Exception as exc:
+                    st.error(f"Δεν αποθηκεύτηκε: {exc}")
+                else:
+                    st.success(f"Το προϊόν προστέθηκε στη βάση (ID: {created_id}). Το απόθεμα δεν άλλαξε.")
+                    st.rerun()
+
     catalog = catalog_dataframe()
     query = st.text_input("Αναζήτηση καταλόγου", placeholder="όνομα, barcode, μάρκα...")
     if query:
