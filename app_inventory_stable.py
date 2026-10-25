@@ -1368,9 +1368,78 @@ def catalog_dataframe() -> pd.DataFrame:
     return pd.DataFrame(rows.values()).sort_values(["Μάρκα", "Προϊόν", "Barcode"], ignore_index=True)
 
 
+
+def create_manual_catalog_product(*, barcode: str, product_name: str, brand: str = "",
+                                  category: str = DEFAULT_CATEGORY, strength: str = "",
+                                  dosage_form: str = "", company: str = "",
+                                  notes: str = "") -> str:
+    """Add a catalog-only product, without creating any stock movement."""
+    barcode = clean(barcode)
+    product_name = clean(product_name)
+    if not barcode.isdigit() or not (8 <= len(barcode) <= 14):
+        raise ValueError("Το barcode πρέπει να έχει 8 έως 14 αριθμητικά ψηφία.")
+    if not product_name:
+        raise ValueError("Συμπλήρωσε όνομα προϊόντος.")
+    ws = base_db.ensure_worksheet(core, "Products", base_db.PRODUCT_COLUMNS)
+    existing = pd.DataFrame(ws.get_all_records())
+    for column in base_db.PRODUCT_COLUMNS:
+        if column not in existing:
+            existing[column] = ""
+    existing = existing[base_db.PRODUCT_COLUMNS]
+    for _, row in existing.iterrows():
+        if barcode in base_db.identifier_set(row):
+            raise ValueError("Αυτό το barcode υπάρχει ήδη στη βάση. Δεν δημιουργήθηκε διπλό προϊόν.")
+    candidate = base_db.transaction_row_to_product({
+        "Barcode": barcode if len(barcode) != 14 else "",
+        "GTIN": barcode if len(barcode) == 14 else "",
+        "Προϊόν": product_name, "Μάρκα": brand, "Κατηγορία": category,
+        "Strength": strength, "DosageForm": dosage_form,
+        "Company": company,
+    })
+    for _, row in existing.iterrows():
+        if base_db.product_names_compatible(row, candidate):
+            raise ValueError("Υπάρχει πιθανώς ήδη αυτό το προϊόν με άλλο barcode. Έλεγξέ το πριν το καταχωρίσεις.")
+    candidate["ProductId"] = "prd_manual_" + uuid.uuid4().hex
+    candidate["Notes"] = "; ".join(part for part in ["manual_catalog_entry", clean(notes)] if part)
+    ws.append_row([candidate.get(column, "") for column in base_db.PRODUCT_COLUMNS], value_input_option="RAW")
+    read_products.clear()
+    return candidate["ProductId"]
+
+
 def catalog_tab() -> None:
     st.subheader("📚 Κατάλογος προϊόντων")
     st.caption("Γνωστά προϊόντα και barcode. Η εμφάνιση εδώ δεν σημαίνει ότι υπάρχει ποσότητα στο stock.")
+
+    with st.expander("➕ Προσθήκη νέου παραφαρμάκου στη βάση", expanded=False):
+        st.caption("Αποθηκεύει προϊόν στον κατάλογο, χωρίς να αυξάνει το απόθεμα.")
+        with st.form("manual_catalog_product_form", clear_on_submit=True):
+            manual_barcode = st.text_input("Barcode (υποχρεωτικό)")
+            manual_name = st.text_input("Όνομα προϊόντος (υποχρεωτικό)")
+            manual_brand = st.text_input("Μάρκα")
+            manual_category = st.selectbox("Κατηγορία", ["Καλλυντικό", "Συμπλήρωμα", "Αναλώσιμο", "Άλλο", "Φάρμακο"])
+            manual_strength = st.text_input("Περιεκτικότητα")
+            manual_form = st.text_input("Μορφή")
+            manual_company = st.text_input("Εταιρεία")
+            manual_notes = st.text_input("Σημειώσεις")
+            manual_confirm = st.checkbox("Επιβεβαιώνω τα στοιχεία του νέου προϊόντος")
+            manual_save = st.form_submit_button("💾 Προσθήκη στη βάση")
+        if manual_save:
+            if not manual_confirm:
+                st.error("Επιβεβαίωσε πρώτα τα στοιχεία.")
+            else:
+                try:
+                    created_id = create_manual_catalog_product(
+                        barcode=manual_barcode, product_name=manual_name,
+                        brand=manual_brand, category=manual_category,
+                        strength=manual_strength, dosage_form=manual_form,
+                        company=manual_company, notes=manual_notes,
+                    )
+                except Exception as exc:
+                    st.error(f"Δεν αποθηκεύτηκε: {exc}")
+                else:
+                    st.success(f"Το προϊόν προστέθηκε στη βάση (ID: {created_id}). Το απόθεμα δεν άλλαξε.")
+                    st.rerun()
+
     catalog = catalog_dataframe()
     query = st.text_input("Αναζήτηση καταλόγου", placeholder="όνομα, barcode, μάρκα...")
     if query:
