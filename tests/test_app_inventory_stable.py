@@ -554,3 +554,30 @@ def test_bulk_zero_stock_rejects_missing_job_id():
     import app_inventory_stable as app
     with pytest.raises(ValueError):
         app.bulk_zero_stock(object(), pd.DataFrame(), job_id="")
+
+
+def test_manual_catalog_product_creates_without_stock(monkeypatch):
+    import app_inventory_stable as app
+    import pandas as pd
+    class FakeSheet:
+        def __init__(self): self.rows = []
+        def get_all_records(self): return []
+        def append_row(self, row, value_input_option): self.rows.append(row)
+    ws = FakeSheet()
+    monkeypatch.setattr(app.base_db, "ensure_worksheet", lambda *args: ws)
+    monkeypatch.setattr(app.read_products, "clear", lambda: None)
+    monkeypatch.setattr(app.core, "append_stock_transaction", lambda *args: (_ for _ in ()).throw(AssertionError("must not touch stock")))
+    pid = app.create_manual_catalog_product(barcode="5201234567890", product_name="TEST CREAM", brand="TEST")
+    assert pid.startswith("prd_manual_")
+    assert len(ws.rows) == 1
+
+
+def test_manual_catalog_product_rejects_duplicate_barcode(monkeypatch):
+    import app_inventory_stable as app
+    import pytest
+    class FakeSheet:
+        def get_all_records(self): return [{"ProductId":"p1", "Barcode":"5201234567890", "ProductName":"OLD"}]
+        def append_row(self, *args, **kwargs): raise AssertionError("duplicate write")
+    monkeypatch.setattr(app.base_db, "ensure_worksheet", lambda *args: FakeSheet())
+    with pytest.raises(ValueError, match="υπάρχει ήδη"):
+        app.create_manual_catalog_product(barcode="5201234567890", product_name="NEW")
