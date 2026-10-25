@@ -1011,6 +1011,50 @@ def invoice_tab() -> None:
             st.rerun()
 
 
+
+def bulk_zero_stock(ws, lots: pd.DataFrame, *, job_id: str) -> dict[str, Any]:
+    """Zero a frozen selection of lots with deterministic, retry-safe movement IDs.
+
+    Returns per-lot results; a failed lot does not silently count as completed.
+    The original ledger rows and product catalogue remain intact.
+    """
+    if not clean(job_id):
+        raise ValueError("Απαιτείται αναγνωριστικό εργασίας.")
+    results: dict[str, Any] = {"saved": 0, "duplicate": 0, "failed": []}
+    if lots is None or lots.empty:
+        return results
+    for index, (_, lot) in enumerate(lots.iterrows()):
+        identity = "|".join(clean(lot.get(col)) for col in (
+            "CodeType", "CodeValue", "SerialNumber", "LotNumber", "ExpiryDate",
+            "LocationId", "Stock", "Προϊόν",
+        ))
+        edit_id = f"bulk-zero:{job_id}:{index}:{hashlib.sha256(identity.encode()).hexdigest()}"
+        try:
+            status = edit_stock_lot(
+                ws, lot,
+                product_name=clean(lot.get("Προϊόν")),
+                brand=clean(lot.get("Μάρκα")),
+                strength=clean(lot.get("Strength")),
+                dosage_form=clean(lot.get("DosageForm")),
+                category=clean(lot.get("Κατηγορία")) or DEFAULT_CATEGORY,
+                quantity=0,
+                expiry_date=clean(lot.get("ExpiryDate")),
+                lot_number=clean(lot.get("LotNumber")),
+                location_id=int(lot.get("LocationId", 0)),
+                reason=f"Μαζικός μηδενισμός · εργασία {job_id}",
+                edit_id=edit_id,
+            )
+            if status == "saved":
+                results["saved"] += 1
+            elif status == "duplicate":
+                results["duplicate"] += 1
+            else:
+                results["failed"].append((index, f"Χρειάζεται έλεγχος: {status}"))
+        except Exception as exc:
+            results["failed"].append((index, str(exc)))
+    return results
+
+
 def stock_tab() -> None:
     st.subheader("📦 Τρέχον stock")
     ws = core.worksheet()
@@ -1044,6 +1088,53 @@ def stock_tab() -> None:
     columns = ["Προϊόν", "Μάρκα", "Barcode", "GTIN", "ExpiryDate", "ExpiryWarning", "Αποθήκη", "Κύριο Κτήριο", "Πρώτος Όροφος", "Σύνολο"]
     available = [column for column in columns if column in stock.columns]
     st.dataframe(stock[available], hide_index=True, width="stretch")
+
+
+    with st.expander("🧹 Μαζικός μηδενισμός αποθήκης", expanded=False):
+        st.warning("Η ενέργεια καταχωρίζει διορθωτικές κινήσεις. Δεν διαγράφει προϊόντα ή ιστορικό.")
+        scope = st.selectbox(
+            "Ποιες τοποθεσίες;",
+            ["Μόνο Αποθήκη", "Μόνο Κύριο Κτήριο", "Μόνο Πρώτος Όροφος", "Όλες οι τοποθεσίες"],
+            key="bulk_zero_scope",
+        )
+        selected_locations = {
+            "Μόνο Αποθήκη": [0], "Μόνο Κύριο Κτήριο": [1],
+            "Μόνο Πρώτος Όροφος": [2], "Όλες οι τοποθεσίες": list(LOCATIONS),
+        }[scope]
+        selected = snapshot[snapshot["LocationId"].isin(selected_locations)].copy()
+        selected = selected[selected["Stock"].astype(int) > 0].reset_index(drop=True)
+        st.write(f"Θα μηδενιστούν **{len(selected)} παρτίδες/εγγραφές**, συνολικά **{int(selected['Stock'].sum()) if not selected.empty else 0} τεμάχια**.")
+        job = st.session_state.get("bulk_zero_job")
+        if job is not None and job["scope"] != scope:
+            st.error("Υπάρχει εργασία σε εξέλιξη για άλλη επιλογή. Ολοκλήρωσέ την πρώτα.")
+        elif job is None:
+            with st.form("bulk_zero_confirm_form"):
+                phrase = st.text_input("Πληκτρολόγησε ΜΗΔΕΝΙΣΜΟΣ", key="bulk_zero_phrase")
+                acknowledged = st.checkbox("Καταλαβαίνω ότι οι ποσότητες θα μηδενιστούν.")
+                start = st.form_submit_button("🧹 Έναρξη μηδενισμού", disabled=selected.empty)
+            if start:
+                if phrase.strip() != "ΜΗΔΕΝΙΣΜΟΣ" or not acknowledged:
+                    st.error("Απαιτείται η ακριβής λέξη και η επιβεβαίωση.")
+                else:
+                    st.session_state["bulk_zero_job"] = {
+                        "id": uuid.uuid4().hex, "scope": scope,
+                        "lots": selected.to_dict("records"),
+                    }
+                    st.rerun()
+        else:
+            st.warning("Η εργασία έχει ξεκινήσει. Εάν διακόπηκε, μπορείς να συνεχίσεις χωρίς να ξαναπεράσουν οι ίδιες κινήσεις.")
+            if st.button("▶ Εκτέλεση / συνέχιση μηδενισμού", key="bulk_zero_execute"):
+                with st.spinner("Ελέγχονται και καταχωρίζονται οι κινήσεις..."):
+                    result = bulk_zero_stock(ws, pd.DataFrame(job["lots"]), job_id=job["id"])
+                st.session_state["bulk_zero_last_result"] = result
+                if result["failed"]:
+                    st.error(f"Ολοκληρώθηκαν {result['saved']} νέες κινήσεις, {result['duplicate']} ήδη υπήρχαν. Απέτυχαν {len(result['failed'])} εγγραφές. Δες τα σφάλματα και επανάλαβε.")
+                    for index, message in result["failed"][:20]:
+                        st.write(f"Εγγραφή {index + 1}: {message}")
+                else:
+                    st.session_state.pop("bulk_zero_job", None)
+                    st.success(f"Ο μηδενισμός ολοκληρώθηκε. Νέες κινήσεις: {result['saved']}, ήδη καταχωρισμένες: {result['duplicate']}.")
+                    st.rerun()
 
     editable_lots = snapshot[snapshot["LocationId"].isin(LOCATIONS)].copy()
     if editable_lots.empty:
