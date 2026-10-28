@@ -110,7 +110,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.10.02.3"
+    assert stable.APP_VERSION == "2026.10.28.1"
 
 
 def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
@@ -581,3 +581,15 @@ def test_manual_catalog_product_rejects_duplicate_barcode(monkeypatch):
     monkeypatch.setattr(app.base_db, "ensure_worksheet", lambda *args: FakeSheet())
     with pytest.raises(ValueError, match="υπάρχει ήδη"):
         app.create_manual_catalog_product(barcode="5201234567890", product_name="NEW")
+
+
+def test_scanner_expiry_month_year_format():
+    import app_inventory_stable as app
+    import pytest
+    assert app.scan_expiry_for_save("02.2028", False) == "2028-02-29"
+    assert app.scan_expiry_for_save("", True) == ""
+    for invalid in ("", "13.2028", "00.2028", "02/2028", "2.2028", "31.02.2028"):
+        with pytest.raises(ValueError):
+            app.scan_expiry_for_save(invalid, False)
+    with pytest.raises(ValueError):
+        app.scan_expiry_for_save("02.2028", True)
