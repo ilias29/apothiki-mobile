@@ -593,3 +593,22 @@ def test_scanner_expiry_month_year_format():
             app.scan_expiry_for_save(invalid, False)
     with pytest.raises(ValueError):
         app.scan_expiry_for_save("02.2028", True)
+
+
+def test_scan_payload_extracts_gs1_expiry_and_gtin():
+    import app_inventory_stable as app
+    code, expiry = app.scan_payload("(01)05201234567890(17)281231")
+    assert code == "05201234567890"
+    assert expiry == "2028-12-31"
+    assert app.scan_payload("5201234567890") == ("5201234567890", "")
+
+
+def test_scan_review_does_not_write_stock(monkeypatch):
+    import app_inventory_stable as app
+    monkeypatch.setattr(app.st, "session_state", {}, raising=False)
+    monkeypatch.setattr(app, "resolve_barcode", lambda code: [{"product_name": "TEST"}])
+    monkeypatch.setattr(app, "save_inventory_item", lambda **kw: (_ for _ in ()).throw(AssertionError("scan must not save")))
+    code = app.prepare_scanned_product("(01)05201234567890(17)281231")
+    assert code == "05201234567890"
+    assert app.st.session_state["scan_expiry_value"] == "12.2028"
+    assert app.st.session_state["lookup_candidates"][0]["product_name"] == "TEST"
