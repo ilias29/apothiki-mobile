@@ -79,7 +79,7 @@ def scan_expiry_for_save(value: Any, no_expiry: bool) -> str:
         if raw:
             raise ValueError("Συμπλήρωσε λήξη ή επίλεξε «Δεν υπάρχει», όχι και τα δύο.")
         return ""
-    if not re.fullmatch(r"(0[1-9]|1[0-2])\\.\\d{4}", raw):
+    if not re.fullmatch(r"(0[1-9]|1[0-2])\.\d{4}", raw):
         raise ValueError("Γράψε τη λήξη σε μορφή ΜΜ.ΕΕΕΕ, π.χ. 04.2028.")
     return core.parse_expiry_date(raw)
 
