@@ -1,5 +1,6 @@
 import hashlib
 import io
+import re
 import uuid
 from typing import Any
 
@@ -25,7 +26,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.10.02.3"
+APP_VERSION = "2026.10.28.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -69,6 +70,18 @@ def inventory_expiry_for_save(value: Any, no_expiry: bool) -> str:
         if isinstance(exc, core.InventoryError):
             raise
         raise ValueError("Η ημερομηνία λήξης δεν είναι έγκυρη.") from exc
+
+
+def scan_expiry_for_save(value: Any, no_expiry: bool) -> str:
+    """Validate scanner expiry as MM.YYYY; store last calendar day as ISO."""
+    raw = clean(value)
+    if no_expiry:
+        if raw:
+            raise ValueError("Συμπλήρωσε λήξη ή επίλεξε «Δεν υπάρχει», όχι και τα δύο.")
+        return ""
+    if not re.fullmatch(r"(0[1-9]|1[0-2])\\.\\d{4}", raw):
+        raise ValueError("Γράψε τη λήξη σε μορφή ΜΜ.ΕΕΕΕ, π.χ. 04.2028.")
+    return core.parse_expiry_date(raw)
 
 
 def configured_openai_model() -> str:
@@ -800,9 +813,9 @@ def scan_tab() -> None:
     quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
     expiry_text = st.text_input(
         "Ημερομηνία λήξης",
-        placeholder="π.χ. 01/04/2031 ή 04/2031",
+        placeholder="π.χ. 04.2028",
         key=f"expiry_{context}",
-        help="Γράψε DD/MM/YYYY ή MM/YYYY. Θα εμφανιστεί προειδοποίηση όταν απομένουν 6 μήνες ή λιγότερο.",
+        help="ΜΜ.ΕΕΕΕ (μήνας.έτος). Αποθηκεύεται ως η τελευταία ημέρα του μήνα για σωστές ειδοποιήσεις λήξης.",
     )
     no_expiry = st.checkbox("Δεν υπάρχει ημερομηνία λήξης", key=f"no_expiry_{context}")
     lot_number = st.text_input("Παρτίδα (προαιρετικό)", key=f"lot_{context}")
@@ -815,7 +828,7 @@ def scan_tab() -> None:
 
     if st.button("💾 Αποθήκευση", type="primary", width="stretch", key=f"save_{context}"):
         try:
-            expiry_date = inventory_expiry_for_save(expiry_text, no_expiry)
+            expiry_date = scan_expiry_for_save(expiry_text, no_expiry)
             save_inventory_item(
                 code=code,
                 product_name=product_name,
