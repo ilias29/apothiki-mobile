@@ -26,7 +26,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.10.28.1"
+APP_VERSION = "2026.10.29.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -536,6 +536,38 @@ def next_live_scan_token(state: Any, detected: str) -> str:
     return f"live:{sequence}:{detected}"
 
 
+def scan_payload(raw_value: Any) -> tuple[str, str]:
+    """Return product code and optional ISO expiry from GS1 (01)/(17) scan."""
+    raw = clean(raw_value)
+    if not raw:
+        return "", ""
+    # Only interpret GS1 when the payload explicitly begins with an AI 01.
+    normalized = raw.replace("(", "").replace(")", "")
+    if normalized.startswith("01") and len(normalized) >= 16 and normalized[2:16].isdigit():
+        try:
+            fields = core.parse_machine_readable_fields(raw)
+            return clean(fields.get("gtin")) or normalized[2:16], clean(fields.get("expiry_date"))
+        except (ValueError, core.InventoryError):
+            return normalized[2:16], ""
+    return raw, ""
+
+
+def prepare_scanned_product(raw_value: Any) -> str:
+    """Stage scanned data for review; never modify stock on scan."""
+    code, expiry = scan_payload(raw_value)
+    if not validated_live_barcode(code):
+        return ""
+    changed = accept_detected_barcode(code)
+    if changed:
+        st.session_state["lookup_candidates"] = resolve_barcode(code)
+        st.session_state.pop("scan_expiry_value", None)
+        st.session_state.pop("scan_lot_value", None)
+    if expiry:
+        month = pd.to_datetime(expiry).strftime("%m.%Y")
+        st.session_state["scan_expiry_value"] = month
+    return code
+
+
 def auto_add_recognized_barcode(
     code: str,
     scan_token: str,
@@ -609,6 +641,7 @@ def _clear_scan_state() -> None:
         "product_name_reference_camera",
         "last_live_scan_value",
         "last_auto_stock_scan_token",
+        "scan_expiry_value",
     ]:
         st.session_state.pop(key, None)
     for key in list(st.session_state.keys()):
@@ -666,7 +699,7 @@ def scan_tab() -> None:
         _clear_scan_state()
 
     st.subheader("📷 Σκανάρισμα barcode")
-    st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
+    st.caption("Σκανάρεις → εμφανίζεται το προϊόν και τυχόν λήξη GS1 → ελέγχεις ποσότητα/λήξη → αποθήκευση.")
     st.caption(f"Έκδοση εφαρμογής: {APP_VERSION}")
 
     if st.button("🧹 Καθαρισμός προηγούμενης σάρωσης", width="stretch"):
@@ -686,17 +719,10 @@ def scan_tab() -> None:
             st.error("Ο ζωντανός scanner δεν εγκαταστάθηκε. Επίλεξε Φωτογραφία.")
         else:
             live_value = qrcode_scanner(key="live_barcode_scanner")
-            detected = validated_live_barcode(live_value) if live_value else ""
-            scan_token = next_live_scan_token(st.session_state, detected)
+            detected = prepare_scanned_product(live_value) if live_value else ""
+            next_live_scan_token(st.session_state, detected)
             if detected:
-                accept_detected_barcode(detected)
-                if scan_token:
-                    result = auto_add_recognized_barcode(detected, scan_token)
-                    show_auto_add_result(result)
-                    if result["status"] == "unknown":
-                        st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
-                else:
-                    st.success(f"Διαβάστηκε: {detected}")
+                st.success(f"Διαβάστηκε: {detected}. Έλεγξε τα στοιχεία πριν αποθηκεύσεις.")
             elif live_value:
                 st.warning("Διαβάστηκε κωδικός αλλά απέτυχε ο έλεγχος εγκυρότητας. Ξαναστόχευσε.")
     else:
@@ -712,11 +738,11 @@ def scan_tab() -> None:
                     detected = detect_barcode_from_camera(camera)
                 st.session_state["last_camera_hash"] = camera_hash
                 if detected:
-                    accept_detected_barcode(detected)
-                    result = auto_add_recognized_barcode(detected, f"photo:{camera_hash}")
-                    show_auto_add_result(result)
-                    if result["status"] == "unknown":
-                        st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
+                    staged = prepare_scanned_product(detected)
+                    if staged:
+                        st.success(f"Διαβάστηκε: {staged}. Έλεγξε τα στοιχεία πριν αποθηκεύσεις.")
+                    else:
+                        st.warning("Δεν αναγνωρίστηκε έγκυρο barcode.")
                 else:
                     fallback = st.session_state.get("scan_debug", {}).get("ai_digit_fallback", {})
                     if fallback.get("reason") == "missing_openai_api_key":
@@ -736,6 +762,7 @@ def scan_tab() -> None:
     if code and code != clean(st.session_state.get("active_barcode")):
         st.session_state["active_barcode"] = code
         st.session_state.pop("lookup_candidates", None)
+        st.session_state.pop("scan_expiry_value", None)
 
     with st.expander("🛠️ Διαγνωστικά barcode", expanded=False):
         st.write({
@@ -807,13 +834,14 @@ def scan_tab() -> None:
         key=f"confirm_{context}",
     )
     if not confirmed:
-        st.info("Δεν αποθηκεύεται τίποτα πριν το OK.")
+        st.info("Έλεγξε το προϊόν και πάτησε OK για να εμφανιστούν τα πεδία καταχώρισης. Δεν έχει αλλάξει το stock.")
         return
 
     quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
     expiry_text = st.text_input(
         "Ημερομηνία λήξης",
         placeholder="π.χ. 04.2028",
+        value=clean(st.session_state.get("scan_expiry_value")),
         key=f"expiry_{context}",
         help="ΜΜ.ΕΕΕΕ (μήνας.έτος). Αποθηκεύεται ως η τελευταία ημέρα του μήνα για σωστές ειδοποιήσεις λήξης.",
     )
