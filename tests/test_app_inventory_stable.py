@@ -110,7 +110,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.10.02.3"
+    assert stable.APP_VERSION == "2026.10.29.1"
 
 
 def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
