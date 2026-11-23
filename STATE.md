@@ -1,6 +1,6 @@
 # Project state · apothiki-mobile
 
-Updated: 2026-10-02
+Updated: 2026-11-23
 
 ## Verified facts
 
@@ -38,9 +38,13 @@ Keep explicit regression coverage for:
 
 ## Open failures / investigations
 
-- The receiving form showed a selected expiry date on mobile but submitted `None`; validated text entry is pushed and CI passed. The mobile Streamlit deployment has not yet been checked in a live session.
+- The receiving form showed a selected expiry date on mobile but submitted `None`; validated text entry is pushed and tested. The mobile Streamlit deployment has not yet been checked in a live session.
+- GS1 DataMatrix/QR scan with expiry, lot and serial is covered by synthetic tests but not by a live scan of a physical package. Live scanner support depends on the camera component returning the complete GS1 payload.
+- Existing Google Sheets persistence remains non-transactional under simultaneous edits; do not bulk-zero real stock without a separate verified backup and operator confirmation.
 
 ## Last session
+
+2026-11-23 · Audited current main. Baseline 154 tests and 4 subtests passed; after fixes 160 tests and 4 subtests passed locally. Corrected GS1 scan handling so a complete, checksum-valid DataMatrix/QR payload carries verified expiry, lot, serial and raw payload into the stock movement; unknown products prefill expiry and lot for confirmation. Ambiguous variable fields are not guessed. Serialised packages with the same GTIN now generate distinct live scan events, while reruns of one payload stay latched. Moved product-master update after confirmed ledger movements so a failed stock write cannot prematurely rename a catalogue product. Added focused regression tests. Application version: `2026.11.23.1`. Next: inspect GitHub Actions result, then scan one real GS1 package on the deployed mobile app, verify expiry/lot/serial against the physical label and Google Sheet, and test a disposable lot's zeroing with a backup. Do not execute bulk zeroing on actual stock as a test.
 
 2026-10-02 · Fixed the reported Stock-tab controls. The selected-lot editor always shows an editable expiry text field (DD/MM/YYYY or MM/YYYY; blank clears expiry) and has a separately confirmed button that zeros only the selected lot through a ledger movement. The receiving form now uses validated expiry text entry because the mobile date widget showed a value but submitted `None`; added regression coverage for both accepted date formats, invalid input, and explicit no-expiry. GitHub Actions passed: 150 tests and 4 subtests; compile check passed. Local pytest is unavailable. Application version: `2026.10.02.3`.
 
@@ -50,4 +54,4 @@ Previous: 2026-09-23 · Added automatic `+1` stock movement for a recognized, lo
 
 Verified then with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version at that time: `2026.09.23.1`.
 
-Next: in the deployed app, edit one test lot's expiry and zero another test lot.
+Earlier next step (still open): in the deployed app, edit one test lot's expiry and zero another disposable test lot.

@@ -1,5 +1,6 @@
 import hashlib
 import io
+import re
 import uuid
 from typing import Any
 
@@ -25,7 +26,7 @@ LOCATIONS = {0: "Αποθήκη", 1: "Κύριο Κτήριο", 2: "Πρώτος
 DEFAULT_CATEGORY = "Άλλο"
 STOCK_CACHE_TTL_SECONDS = 30
 PRODUCT_CACHE_TTL_SECONDS = 60
-APP_VERSION = "2026.10.02.3"
+APP_VERSION = "2026.11.23.1"
 PROVIDER_BENCHMARK_CODES = ["5200421900551", "5055148400620", "033984003972"]
 
 
@@ -170,6 +171,9 @@ def save_inventory_item(
     dosage_form: str = "",
     expiry_date: str = "",
     lot_number: str = "",
+    serial_number: str = "",
+    datamatrix_raw_data: str = "",
+    qr_raw_data: str = "",
     category: str = DEFAULT_CATEGORY,
     location_id: int = 0,
     note: str = "",
@@ -202,6 +206,9 @@ def save_inventory_item(
         dosage_form=dosage_form,
         expiry_date=expiry_date,
         lot_number=lot_number,
+        serial_number=serial_number,
+        datamatrix_raw_data=datamatrix_raw_data,
+        qr_raw_data=qr_raw_data,
         location_id=location_id,
         movement="Απογραφή / καταμέτρηση (+)",
         quantity=int(quantity),
@@ -360,11 +367,6 @@ def edit_stock_lot(
         if core.current_stock(fresh, pending_type, pending_value, pending_location) + delta < 0:
             raise core.InventoryError("Το διαθέσιμο stock άλλαξε. Κάνε ανανέωση και ξαναδιάλεξε την παρτίδα.")
 
-    # Update the confirmed product master after validation so a failed ledger
-    # request can be retried from the same form without losing the correction.
-    base_db.update_product_details_from_transaction(core, add_row)
-    read_products.clear()
-
     if pending:
         try:
             if len(pending) > 1 and hasattr(ws, "append_rows"):
@@ -433,7 +435,60 @@ def edit_stock_lot(
     core.invalidate_data_cache(ws)
     if concurrent_change:
         return "race_compensated"
+    # A failed ledger write must not rename the product in the catalogue.
+    # Retrying the same edit ID safely completes this secondary update.
+    if new_quantity:
+        base_db.update_product_details_from_transaction(core, add_row)
+        read_products.clear()
     return "saved" if pending else "duplicate"
+
+
+def scan_details(raw_value: Any, code_type: str = "Barcode") -> dict[str, str]:
+    """Keep verified GS1 fields together; never infer variable fields without delimiters."""
+    raw = clean(raw_value)
+    result = {key: "" for key in (
+        "code", "expiry_date", "lot_number", "serial_number",
+        "datamatrix_raw_data", "qr_raw_data",
+    )}
+    if raw.isdigit() and not (raw.startswith("01") and len(raw) >= 16):
+        if core.classify_barcode_value("Barcode", raw).get("valid"):
+            result["code"] = raw
+        return result
+    fields = {}
+    if raw.startswith("(01)"):
+        fields = dict(re.findall(r"\((01|17|10|21)\)([^()]*)", raw))
+    else:
+        plain = raw.removeprefix("]d2")
+        if not re.match(r"^01\d{14}", plain):
+            return result
+        fields["01"] = plain[2:16]
+        remaining = plain[16:]
+        if remaining.startswith("17") and len(remaining) >= 8:
+            fields["17"] = remaining[2:8]
+            remaining = remaining[8:]
+        # GS1 variable-length fields require FNC1 (ASCII 29) to separate
+        # subsequent application identifiers. Without it, do not guess.
+        for segment in remaining.split("\x1d"):
+            if segment.startswith("10") and ("21" not in segment[2:] or "\x1d" in remaining):
+                fields["10"] = segment[2:]
+            elif segment.startswith("21"):
+                fields["21"] = segment[2:]
+        if "\x1d" not in remaining and "10" in fields and "21" in fields["10"]:
+            fields.pop("10", None)
+    gtin = fields.get("01", "")
+    if not core.classify_barcode_value("Barcode", gtin).get("valid") or len(gtin) != 14:
+        return result
+    try:
+        expiry = core.parse_expiry_date(fields["17"]) if fields.get("17") else ""
+    except (ValueError, core.InventoryError):
+        return result
+    result.update(code=gtin, expiry_date=expiry,
+                  lot_number=fields.get("10", ""), serial_number=fields.get("21", ""))
+    if code_type == "DataMatrix":
+        result["datamatrix_raw_data"] = raw
+    elif code_type == "QR":
+        result["qr_raw_data"] = raw
+    return result
 
 
 def detect_barcode_from_camera(upload) -> str:
@@ -444,9 +499,14 @@ def detect_barcode_from_camera(upload) -> str:
         return ""
     detected_type, detected_value, debug = core.detect_code(None, image)
     value = clean(detected_value)
+    st.session_state.pop("scan_fields", None)
     if detected_type in {"DataMatrix", "QR"} and value:
-        parsed = core.parse_machine_readable_fields(value)
-        value = clean(parsed.get("gtin")) or value
+        details = scan_details(value, detected_type)
+        if details["code"]:
+            st.session_state["scan_fields"] = details
+            value = details["code"]
+        elif value.startswith(("01", "(01)", "]d2")):
+            value = ""
     if not value:
         api_key = clean(st.secrets.get("OPENAI_API_KEY", ""))
         model = configured_openai_model()
@@ -529,6 +589,7 @@ def auto_add_recognized_barcode(
     *,
     state: Any = None,
     location_id: int = 0,
+    scan_fields: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Add exactly one item for a known barcode, once per scan event."""
     state = st.session_state if state is None else state
@@ -543,6 +604,9 @@ def auto_add_recognized_barcode(
     product_name = clean((product or {}).get("product_name"))
     if not product_name:
         return {"status": "unknown", "product_name": ""}
+    details = scan_fields or {}
+    if details and clean(details.get("code")) != code:
+        return {"status": "error", "product_name": product_name, "error": "Τα στοιχεία σάρωσης δεν αντιστοιχούν στο barcode."}
 
     if not clean(state.get("auto_scan_session_id")):
         state["auto_scan_session_id"] = uuid.uuid4().hex
@@ -558,28 +622,31 @@ def auto_add_recognized_barcode(
             brand=clean(product.get("brand")),
             strength=clean(product.get("strength")),
             dosage_form=clean(product.get("dosage_form")),
-            expiry_date="",
-            lot_number="",
+            expiry_date=clean(details.get("expiry_date")),
+            lot_number=clean(details.get("lot_number")),
+            serial_number=clean(details.get("serial_number")),
+            datamatrix_raw_data=clean(details.get("datamatrix_raw_data")),
+            qr_raw_data=clean(details.get("qr_raw_data")),
             category=clean(product.get("category")) or DEFAULT_CATEGORY,
             location_id=location_id,
             transaction_id=transaction_id,
             note=(
                 f"source=automatic_barcode_scan; scan_token={scan_token}; "
-                "quantity=1; expiry_not_captured=true"
+                f"quantity=1; expiry_not_captured={not bool(details.get('expiry_date'))}"
             ),
         )
     except Exception as exc:
         return {"status": "error", "product_name": product_name, "error": str(exc)}
 
     state["last_auto_stock_scan_token"] = scan_token
-    return {"status": "added", "product_name": product_name}
+    return {"status": "added", "product_name": product_name, "expiry_date": clean(details.get("expiry_date"))}
 
 
 def show_auto_add_result(result: dict[str, str]) -> None:
     status = clean(result.get("status"))
     if status == "added":
         st.success(f"✅ Προστέθηκε αμέσως +1: {clean(result.get('product_name'))}")
-        st.caption("Η αυτόματη σάρωση προσθέτει στην Αποθήκη χωρίς ημερομηνία λήξης.")
+        st.caption(f"Λήξη από κωδικό: {result['expiry_date']}" if result.get("expiry_date") else "Δεν βρέθηκε λήξη στον κωδικό· έλεγξε τη συσκευασία.")
     elif status == "error":
         st.error(f"Το barcode διαβάστηκε, αλλά το +1 δεν αποθηκεύτηκε: {clean(result.get('error'))}")
 
@@ -653,7 +720,7 @@ def scan_tab() -> None:
         _clear_scan_state()
 
     st.subheader("📷 Σκανάρισμα barcode")
-    st.caption("Σκανάρεις → βρίσκω όνομα → εσύ λες OK → βάζεις ποσότητα → αποθήκευση.")
+    st.caption("Γνωστό barcode: αυτόματο +1. Νέο barcode: ελέγχεις προϊόν, λήξη και ποσότητα πριν την αποθήκευση.")
     st.caption(f"Έκδοση εφαρμογής: {APP_VERSION}")
 
     if st.button("🧹 Καθαρισμός προηγούμενης σάρωσης", width="stretch"):
@@ -673,12 +740,20 @@ def scan_tab() -> None:
             st.error("Ο ζωντανός scanner δεν εγκαταστάθηκε. Επίλεξε Φωτογραφία.")
         else:
             live_value = qrcode_scanner(key="live_barcode_scanner")
-            detected = validated_live_barcode(live_value) if live_value else ""
-            scan_token = next_live_scan_token(st.session_state, detected)
+            details = scan_details(live_value, "DataMatrix" if "01" in clean(live_value)[:5] else "Barcode") if live_value else {}
+            detected = clean(details.get("code"))
+            # Serialised packages share a GTIN; use the complete payload to
+            # distinguish them while still latching reruns of one scan.
+            scan_identity = clean(details.get("datamatrix_raw_data")) or detected
+            scan_token = next_live_scan_token(st.session_state, scan_identity)
             if detected:
                 accept_detected_barcode(detected)
+                if details.get("datamatrix_raw_data"):
+                    st.session_state["scan_fields"] = details
+                else:
+                    st.session_state.pop("scan_fields", None)
                 if scan_token:
-                    result = auto_add_recognized_barcode(detected, scan_token)
+                    result = auto_add_recognized_barcode(detected, scan_token, scan_fields=details)
                     show_auto_add_result(result)
                     if result["status"] == "unknown":
                         st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
@@ -700,7 +775,7 @@ def scan_tab() -> None:
                 st.session_state["last_camera_hash"] = camera_hash
                 if detected:
                     accept_detected_barcode(detected)
-                    result = auto_add_recognized_barcode(detected, f"photo:{camera_hash}")
+                    result = auto_add_recognized_barcode(detected, f"photo:{camera_hash}", scan_fields=st.session_state.get("scan_fields"))
                     show_auto_add_result(result)
                     if result["status"] == "unknown":
                         st.info("Το barcode είναι νέο. Κάνε αντιστοίχιση προϊόντος μία φορά στην παρακάτω φόρμα.")
@@ -723,6 +798,7 @@ def scan_tab() -> None:
     if code and code != clean(st.session_state.get("active_barcode")):
         st.session_state["active_barcode"] = code
         st.session_state.pop("lookup_candidates", None)
+        st.session_state.pop("scan_fields", None)
 
     with st.expander("🛠️ Διαγνωστικά barcode", expanded=False):
         st.write({
@@ -771,7 +847,9 @@ def scan_tab() -> None:
             "source": clean(selected.get("source")),
             "confidence": selected.get("confidence", ""),
         })
-    context = hashlib.sha256((code + clean(selected.get("product_name"))).encode()).hexdigest()[:10]
+    scanned_raw = st.session_state.get("scan_fields") or {}
+    scan_identity = clean(scanned_raw.get("datamatrix_raw_data")) or clean(scanned_raw.get("qr_raw_data"))
+    context = hashlib.sha256((code + clean(selected.get("product_name")) + scan_identity).encode()).hexdigest()[:10]
     product_name = st.text_input(
         "Όνομα προϊόντος",
         value=clean(selected.get("product_name")),
@@ -798,14 +876,20 @@ def scan_tab() -> None:
         return
 
     quantity = st.number_input("Ποσότητα", min_value=1, value=1, step=1, key=f"quantity_{context}")
+    scan_fields = st.session_state.get("scan_fields") or {}
+    if clean(scan_fields.get("code")) != code:
+        scan_fields = {}
     expiry_text = st.text_input(
         "Ημερομηνία λήξης",
+        value=expiry_input_value(scan_fields.get("expiry_date")),
         placeholder="π.χ. 01/04/2031 ή 04/2031",
         key=f"expiry_{context}",
         help="Γράψε DD/MM/YYYY ή MM/YYYY. Θα εμφανιστεί προειδοποίηση όταν απομένουν 6 μήνες ή λιγότερο.",
     )
     no_expiry = st.checkbox("Δεν υπάρχει ημερομηνία λήξης", key=f"no_expiry_{context}")
-    lot_number = st.text_input("Παρτίδα (προαιρετικό)", key=f"lot_{context}")
+    lot_number = st.text_input("Παρτίδα (προαιρετικό)", value=clean(scan_fields.get("lot_number")), key=f"lot_{context}")
+    if scan_fields.get("serial_number"):
+        st.caption(f"Σειριακό από κωδικό: {scan_fields['serial_number']}")
     location_label = st.selectbox(
         "Τοποθεσία",
         [f"{idx} - {name}" for idx, name in LOCATIONS.items()],
@@ -825,6 +909,9 @@ def scan_tab() -> None:
                 dosage_form=dosage_form,
                 expiry_date=expiry_date,
                 lot_number=lot_number,
+                serial_number=clean(scan_fields.get("serial_number")),
+                datamatrix_raw_data=clean(scan_fields.get("datamatrix_raw_data")),
+                qr_raw_data=clean(scan_fields.get("qr_raw_data")),
                 category=clean(selected.get("category")) or DEFAULT_CATEGORY,
                 location_id=location_id,
                 note=(
