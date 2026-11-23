@@ -92,6 +92,8 @@ Add only confirmed, reusable lessons here.
 - **Confirmation inside a form**: do not disable a form submit button using a checkbox in that same form. The checkbox cannot update the server until a submit occurs; keep submit available and validate the submitted checkbox value on the server.
 - **Zeroing saved stock**: provide an explicit, confirmed per-lot zero-stock action that appends a stock movement and preserves the existing ledger; do not delete rows or silently zero every lot for the product.
 - **Mobile expiry picker submits blank**: if a selected date picker value reaches the save handler as `None`, use an editable text field with strict `parse_expiry_date` validation for stock receiving, and test both accepted formats and the explicit no-expiry path.
+- **GS1 scan loses package fields**: do not reduce a DataMatrix/QR payload to GTIN before retaining verified expiry, lot, serial and raw data. Parse variable fields only when explicit application identifiers or FNC1 delimiters make their boundaries unambiguous; leave uncertain fields blank. Validate GTIN checksum and expiry before automatic stock entry.
+- **Catalogue changed before ledger confirmation**: a stock correction must commit and verify its movements before updating product display details. On a retry, deterministic movement IDs prevent duplicate stock changes while allowing the pending catalogue update to finish.
 
 ## Anti-patterns
 

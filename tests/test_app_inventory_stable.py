@@ -64,6 +64,47 @@ def test_live_scanner_accepts_valid_ean13_and_rejects_bad_check_digit():
     assert stable.validated_live_barcode("5200421900552") == ""
 
 
+def test_scan_extracts_verified_gs1_expiry_lot_and_serial():
+    raw = "(01)01234567890128(17)280630(10)LOT123(21)SER456"
+    details = stable.scan_details(raw, "DataMatrix")
+    assert details == {
+        "code": "01234567890128", "expiry_date": "2028-06-30",
+        "lot_number": "LOT123", "serial_number": "SER456",
+        "datamatrix_raw_data": raw, "qr_raw_data": "",
+    }
+    assert stable.scan_details("(01)01234567890129(17)280630", "DataMatrix")["code"] == ""
+    numeric_gs1 = stable.scan_details("010123456789012817280630", "DataMatrix")
+    assert numeric_gs1["code"] == "01234567890128"
+    assert numeric_gs1["expiry_date"] == "2028-06-30"
+
+
+def test_scan_does_not_guess_variable_fields_without_separator():
+    details = stable.scan_details("01012345678901281728063010LOT1721SER", "DataMatrix")
+    assert details["code"] == "01234567890128"
+    assert details["expiry_date"] == "2028-06-30"
+    assert details["lot_number"] == ""
+    assert details["serial_number"] == ""
+
+
+def test_distinct_serialized_packages_get_distinct_live_events():
+    state = {}
+    first = "(01)01234567890128(17)280630(21)SER1"
+    second = "(01)01234567890128(17)280630(21)SER2"
+    assert stable.next_live_scan_token(state, first)
+    assert stable.next_live_scan_token(state, first) == ""
+    assert stable.next_live_scan_token(state, second)
+
+
+def test_camera_scan_keeps_verified_datamatrix_fields(monkeypatch):
+    raw = "(01)01234567890128(17)280630(10)LOT123(21)SER456"
+    monkeypatch.setattr(stable.core, "to_img", lambda _upload: np.zeros((50, 100, 3), dtype=np.uint8))
+    monkeypatch.setattr(stable.core, "detect_code", lambda *_args: ("DataMatrix", raw, {}))
+    monkeypatch.setattr(stable.st, "session_state", {})
+    assert stable.detect_barcode_from_camera(FakeUpload()) == "01234567890128"
+    assert stable.st.session_state["scan_fields"]["expiry_date"] == "2028-06-30"
+    assert stable.st.session_state["scan_fields"]["serial_number"] == "SER456"
+
+
 def test_pharmacy_starter_catalog_resolves_lamberts_without_online_lookup(monkeypatch):
     monkeypatch.setattr(stable, "read_products", lambda: stable.pd.DataFrame())
     product = stable.local_product_by_code("5055148407049")
@@ -110,7 +151,7 @@ def test_repeated_same_scan_does_not_clear_current_lookup(monkeypatch):
 
 
 def test_deployed_app_has_visible_diagnostic_version():
-    assert stable.APP_VERSION == "2026.10.02.3"
+    assert stable.APP_VERSION == "2026.11.23.1"
 
 
 def test_expiry_input_value_is_editable_and_never_fabricates_a_date():
@@ -179,6 +220,19 @@ def test_recognized_barcode_adds_exactly_one_once_per_scan(monkeypatch):
     assert saved[0]["location_id"] == 0
     assert saved[0]["expiry_date"] == ""
     assert saved[0]["transaction_id"].startswith("auto-scan-")
+
+
+def test_recognized_gs1_scan_preserves_expiry_lot_serial(monkeypatch):
+    saved = []
+    monkeypatch.setattr(stable, "local_product_by_code", lambda _code: {"product_name": "KNOWN", "category": "Φάρμακο"})
+    monkeypatch.setattr(stable, "save_inventory_item", lambda **kwargs: saved.append(kwargs))
+    details = stable.scan_details("(01)01234567890128(17)280630(10)LOT123(21)SER456", "DataMatrix")
+    result = stable.auto_add_recognized_barcode(details["code"], "photo:one", state={}, scan_fields=details)
+    assert result["status"] == "added"
+    assert {key: saved[0][key] for key in ("expiry_date", "lot_number", "serial_number", "datamatrix_raw_data")} == {
+        "expiry_date": "2028-06-30", "lot_number": "LOT123", "serial_number": "SER456",
+        "datamatrix_raw_data": "(01)01234567890128(17)280630(10)LOT123(21)SER456",
+    }
 
 
 def test_same_barcode_can_add_again_on_a_new_scan_event(monkeypatch):
@@ -372,6 +426,24 @@ def test_saved_lot_edit_retry_does_not_duplicate_stock_movements(monkeypatch):
     corrected, _ = stable.core.load_data(ws)
     assert len(ws.records) == 3
     assert stable.core.current_stock(corrected, "Barcode", "5055148407049", 0) == 4
+
+
+def test_failed_stock_write_does_not_change_product_master(monkeypatch):
+    ws, _original, lot = _saved_lot_fixture()
+    master_updates = []
+    monkeypatch.setattr(stable.base_db, "update_product_details_from_transaction", lambda *_args: master_updates.append(True))
+    def fail_append(*_args, **_kwargs):
+        raise RuntimeError("sheet unavailable")
+    ws.append_rows = fail_append
+    with pytest.raises(RuntimeError, match="sheet unavailable"):
+        stable.edit_stock_lot(
+            ws, lot, product_name="RENAMED", brand="LAMBERTS",
+            strength="", dosage_form="TABS", category="Συμπλήρωμα",
+            quantity=4, expiry_date="2028-12-31", lot_number="LOT-OLD",
+            location_id=0, edit_id="failed-master-update",
+        )
+    assert master_updates == []
+    assert len(ws.records) == 1
 
 
 def test_saved_lot_edit_refuses_stale_quantity(monkeypatch):
