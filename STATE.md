@@ -55,3 +55,13 @@ Previous: 2026-09-23 · Added automatic `+1` stock movement for a recognized, lo
 Verified then with `python -m pytest -q`: 140 tests and 4 subtests passed. Application version at that time: `2026.09.23.1`.
 
 Earlier next step (still open): in the deployed app, edit one test lot's expiry and zero another disposable test lot.
+
+## Conversation handoff — 2026-11-26
+
+User requirements from October sessions (retain even if implementation differs):
+- Barcode scanning must immediately display the identified product without an extra confirmation just to see it. Scanning alone must not change stock; review quantity and expiry, then explicitly save. Unknown product identity requires confirmation.
+- Receiving expiry input/display requested as MM.YYYY (e.g. 04.2028); month-only manual entry uses month end for internal date calculations. If GS1 provides an exact day, preserve that exact date internally. Automatically prefill verified encoded expiry; never infer expiry from ordinary EAN or guess missing dates.
+- PR #29 merged 2026-10-25: confirmed bulk zero by selected locations or all, ledger history preserved, deterministic retry IDs; manual parapharmacy catalog entry with barcode and product details, no stock movement. Live Sheets integration and concurrency safety not verified. Do not test bulk zero against real stock.
+- PR #30 (MM.YYYY) remains open; initial CI failed only on stale version assertion (154 passed); corrected CI run 40788771880 succeeded. PR #31 (review before save and GS1 prefill) remains open; combined CI not verified. PR #32 merged 2026-11-23 and overlaps GS1 handling; reconcile against current main before implementing or merging older PRs. Do not assume #32 fulfills explicit-save requirement.
+- User requires durable project knowledge in GitHub/Obsidian, not reliance on chat memory. At session start read current main STATE.md, AGENTS.md and skill even when working on an older branch. Record decisions, failed approaches, actual test outcomes, open issues and resume point. Do not merge stale code merely to synchronize documentation.
+- Obsidian local sync has not been independently verified. Physical scanner and disposable Google Sheets end-to-end checks remain outstanding.
