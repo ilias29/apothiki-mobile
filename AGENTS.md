@@ -51,3 +51,7 @@ A non-trivial change is done only when:
 - no known related test is failing,
 - reusable lessons are written into the skill,
 - and `STATE.md` has an accurate resume pointer.
+
+## Cross-branch memory and Obsidian handoff
+
+Before working on any branch, fetch and read the latest canonical `main` versions of STATE.md, AGENTS.md and skills/pharmacy-inventory/SKILL.md, then compare the branch's own state and code. Branch-local notes may be stale. User requirements in the canonical handoff are acceptance criteria, not proof of implementation. Record new decisions and verified results in the canonical project memory, retaining branch and PR references. Never overwrite historical notes or merge stale production code solely to synchronize memory. Do not claim Obsidian sync without checking the actual vault.
